@@ -14,23 +14,20 @@ import (
 	"bytes"
 	"time"
 
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bkmonitorbeat/define"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bkmonitorbeat/tasks"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/logger"
 )
 
-// FormatOutput : format prom line data
-func FormatOutput(out []byte, ts int64, offsetTime time.Duration, timestampUnit string) (map[int64]map[string]tasks.PromEvent, error) {
-	// map[timestamp]map[dimension_hash]PromEvent
-	aggreRst := make(map[int64]map[string]tasks.PromEvent)
-	scanner := bufio.NewScanner(bytes.NewBuffer(out))
-
-	// 获取时间戳处理器，支持将ms转换为s，us，ns
-	handler, err := tasks.GetTimestampHandler(timestampUnit)
-	if err != nil {
-		logger.Errorf("use timestamp unit:%s to get timestamp handler failed,error:%s", timestampUnit, err)
-		return nil, err
+// FormatOutput 解析 Prom 格式数据，输出结构化数据，同时输出失败记录
+func FormatOutput(out []byte, ts int64, offsetTime time.Duration, handler tasks.TimestampHandler) (map[int64]map[string]tasks.PromEvent, error) {
+	aggRst := make(map[int64]map[string]tasks.PromEvent)
+	if len(bytes.TrimSpace(out)) == 0 {
+		return aggRst, define.ErrNoScriptOutput
 	}
 
+	var outputErr error
+	scanner := bufio.NewScanner(bytes.NewBuffer(out))
 	for scanner.Scan() {
 		line := scanner.Text()
 		if len(line) == 0 || line[0] == '#' {
@@ -39,27 +36,27 @@ func FormatOutput(out []byte, ts int64, offsetTime time.Duration, timestampUnit 
 
 		promEvent, err := tasks.NewPromEvent(line, ts, offsetTime, handler)
 		if err != nil {
-			logger.Warnf("parse line=>(%s) failed,error:%s", line, err)
+			logger.Warnf("parse line=>(%s) failed: %s", line, err)
+			outputErr = err
 			continue
 		}
 
-		promEvent.AggreValue[promEvent.Key] = promEvent.Value
-		subRst, tsExist := aggreRst[promEvent.TS]
+		promEvent.AggValue[promEvent.Key] = promEvent.Value
+		subRst, tsExist := aggRst[promEvent.TS]
 		if tsExist {
 			p, dmExist := subRst[promEvent.HashKey]
 			if dmExist {
-				p.AggreValue[promEvent.Key] = promEvent.Value
+				p.AggValue[promEvent.Key] = promEvent.Value
 				subRst[promEvent.HashKey] = p
 			} else {
 				subRst[promEvent.HashKey] = promEvent
 			}
-			aggreRst[promEvent.TS] = subRst
+			aggRst[promEvent.TS] = subRst
 		} else {
-			subRst = make(map[string]tasks.PromEvent, 0)
+			subRst = make(map[string]tasks.PromEvent)
 			subRst[promEvent.HashKey] = promEvent
-			aggreRst[promEvent.TS] = subRst
+			aggRst[promEvent.TS] = subRst
 		}
 	}
-
-	return aggreRst, nil
+	return aggRst, outputErr
 }

@@ -32,28 +32,24 @@ const (
 	InfluxDBRouterPrefixConfigPath = "influxdb.router.prefix"
 
 	// VmTimeoutConfigPath 配置
-	VmAddressConfigPath = "victoria_metrics.address"
-	VmUriPathConfigPath = "victoria_metrics.uri_path"
 	VmTimeoutConfigPath = "victoria_metrics.timeout"
 
 	VmContentTypeConfigPath = "victoria_metrics.content_type"
 
-	VmCodeConfigPath            = "victoria_metrics.code"
-	VmSecretConfigPath          = "victoria_metrics.secret"
-	VmTokenConfigPath           = "victoria_metrics.token"
 	VmMaxConditionNumConfigPath = "victoria_metrics.max_condition_num"
-
-	VmAuthenticationMethodConfigPath = "victoria_metrics.authentication_method"
 
 	VmInfluxCompatibleConfigPath = "victoria_metrics.influx_compatible"
 	VmUseNativeOrConfigPath      = "victoria_metrics.use_native_or"
 
-	// OfflineDataArchive 配置
-	OfflineDataArchiveAddressConfigPath = "offline_data_archive.address"
-	OfflineDataArchiveTimeoutConfigPath = "offline_data_archive.timeout"
+	// BkSql 配置
+	BkSqlTimeoutConfigPath     = "bk_sql.timeout"
+	BkSqlLimitConfigPath       = "bk_sql.limit"
+	BkSqlToleranceConfigPath   = "bk_sql.tolerance"
+	BkSqlContentTypeConfigPath = "bk_sql.content_type"
 
-	OfflineDataArchiveGrpcMaxCallRecvMsgSizeConfigPath = "offline_data_archive.grpc_max_call_recv_msg_size"
-	OfflineDataArchiveGrpcMaxCallSendMsgSizeConfigPath = "offline_data_archive.grpc_max_call_send_msg_size"
+	EsTimeoutConfigPath    = "elasticsearch.timeout"
+	EsMaxRoutingConfigPath = "elasticsearch.max_routing"
+	EsMaxSizeConfigPath    = "elasticsearch.max_size"
 )
 
 var (
@@ -73,29 +69,22 @@ var (
 
 	InfluxDBRouterPrefix string
 
-	// victoriaMetrics 配置
+	// bksql 配置
+	BkSqlTimeout     time.Duration
+	BkSqlLimit       int
+	BkSqlTolerance   int
+	BkSqlContentType string
 
 	// victoriaMetrics 配置
-	VmAddress string
 	VmTimeout time.Duration
-	VmUriPath string
 
-	VmAuthenticationMethod string
-	VmContentType          string
-	VmMaxConditionNum      int
-
-	VmCode   string
-	VmSecret string
-	VmToken  string
-
-	AuthenticationMethod string
+	VmContentType     string
+	VmMaxConditionNum int
 
 	VmInfluxCompatible bool
 	VmUseNativeOr      bool
 
-	OfflineDataArchiveAddress string
-	OfflineDataArchiveTimeout time.Duration
-
-	OfflineDataArchiveGrpcMaxCallRecvMsgSize int
-	OfflineDataArchiveGrpcMaxCallSendMsgSize int
+	EsTimeout    time.Duration
+	EsMaxRouting int
+	EsMaxSize    int
 )

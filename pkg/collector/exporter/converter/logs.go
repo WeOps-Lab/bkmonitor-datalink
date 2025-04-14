@@ -10,6 +10,8 @@
 package converter
 
 import (
+	"bytes"
+
 	"github.com/elastic/beats/libbeat/common"
 	"go.opentelemetry.io/collector/pdata/plog"
 
@@ -70,8 +72,13 @@ func (c logsConverter) Convert(record *define.Record, f define.GatherFunc) {
 }
 
 func (c logsConverter) Extract(ip string, logRecord plog.LogRecord, rsAttrs common.MapStr) (common.MapStr, error) {
+	timeUnix := logRecord.Timestamp()
+	if timeUnix <= 0 {
+		timeUnix = logRecord.ObservedTimestamp()
+	}
+
 	m := common.MapStr{
-		"time_unix":       logRecord.Timestamp() / 1000,
+		"time_unix":       timeUnix / 1000,
 		"span_id":         logRecord.SpanID().HexString(),
 		"trace_id":        logRecord.TraceID().HexString(),
 		"attributes":      CleanAttributesMap(logRecord.Attributes().AsRaw()),
@@ -81,13 +88,16 @@ func (c logsConverter) Extract(ip string, logRecord plog.LogRecord, rsAttrs comm
 		"severity_text":   logRecord.SeverityText(),
 		"resource":        rsAttrs,
 	}
-	content, err := json.Marshal(m)
-	if err != nil {
+
+	buf := &bytes.Buffer{}
+	enc := json.NewEncoder(buf)
+	enc.SetEscapeHTML(false) // Note: 兼容 HTML 转义逻辑
+	if err := enc.Encode(m); err != nil {
 		return nil, err
 	}
 
 	return common.MapStr{
-		"data":   string(content),
+		"data":   buf.String(),
 		"source": ip,
 	}, nil
 }

@@ -10,21 +10,23 @@
 package api
 
 import (
-	"encoding/json"
 	"net/http"
+	"sync"
 
 	"github.com/gin-gonic/gin"
-	oleltrace "go.opentelemetry.io/otel/trace"
+	ants "github.com/panjf2000/ants/v2"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/cmdb"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/cmdb/v1beta1"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/internal/json"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/log"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/trace"
 )
 
 // HandlerAPIRelationMultiResource
 // @Summary  query relation multi resource
-// @ID       api-relation-multi-resource
+// @ID       relation_multi_resource_query
 // @Produce  json
 // @Param    traceparent            header    string                          false  "TraceID" default(00-3967ac0f1648bf0216b27631730d7eb9-8e3c31d5109e78dd-01)
 // @Param    X-Bk-Scope-Space-Uid   header    string                          false  "空间UID" default(bkcc__2)
@@ -34,8 +36,8 @@ import (
 // @Router   /api/v1/relation/multi_resource [post]
 func HandlerAPIRelationMultiResource(c *gin.Context) {
 	var (
-		ctx  = c.Request.Context()
-		span oleltrace.Span
+		ctx = c.Request.Context()
+
 		user = metadata.GetUser(ctx)
 		err  error
 
@@ -44,10 +46,8 @@ func HandlerAPIRelationMultiResource(c *gin.Context) {
 		}
 	)
 
-	ctx, span = trace.IntoContext(ctx, trace.TracerName, "api-relation-multi-resource")
-	if span != nil {
-		defer span.End()
-	}
+	ctx, span := trace.NewSpan(ctx, "handler-api-relation-multi-resource")
+	defer span.End(&err)
 
 	request := new(cmdb.RelationMultiResourceRequest)
 	err = json.NewDecoder(c.Request.Body).Decode(request)
@@ -57,7 +57,8 @@ func HandlerAPIRelationMultiResource(c *gin.Context) {
 	}
 
 	paramsBody, _ := json.Marshal(request)
-	trace.InsertStringIntoSpan("params-body", string(paramsBody), span)
+	span.Set("handler-headers", c.Request.Header)
+	span.Set("handler-body", string(paramsBody))
 
 	model, err := v1beta1.GetModel(ctx)
 	if err != nil {
@@ -66,19 +67,118 @@ func HandlerAPIRelationMultiResource(c *gin.Context) {
 	}
 
 	data := new(cmdb.RelationMultiResourceResponse)
-	data.Data = make([]cmdb.RelationMultiResourceResponseData, 0, len(request.QueryList))
-	for _, qry := range request.QueryList {
-		d := cmdb.RelationMultiResourceResponseData{
-			Code: http.StatusOK,
-		}
+	data.TraceID = span.TraceID()
+	data.Data = make([]cmdb.RelationMultiResourceResponseData, len(request.QueryList))
 
-		d.SourceType, d.SourceInfo, d.TargetList, err = model.GetResourceMatcher(ctx, qry.LookBackDelta, user.SpaceUid, qry.Timestamp, qry.TargetType, qry.SourceInfo)
-		if err != nil {
-			d.Message = err.Error()
-			d.Code = http.StatusBadRequest
-		}
-		data.Data = append(data.Data, d)
+	var (
+		sendWg sync.WaitGroup
+		lock   sync.Mutex
+	)
+	p, _ := ants.NewPool(RelationMaxRouting)
+	defer p.Release()
+
+	for idx, qry := range request.QueryList {
+		idx := idx
+		qry := qry
+		sendWg.Add(1)
+		_ = p.Submit(func() {
+			defer sendWg.Done()
+			d := cmdb.RelationMultiResourceResponseData{
+				Code: http.StatusOK,
+			}
+
+			d.SourceType, d.SourceInfo, d.Path, d.TargetList, err = model.QueryResourceMatcher(ctx, qry.LookBackDelta, user.SpaceUid, qry.Timestamp, qry.TargetType, qry.SourceType, qry.SourceInfo, qry.PathResource)
+			if err != nil {
+				d.Message = err.Error()
+				d.Code = http.StatusBadRequest
+			}
+			lock.Lock()
+			data.Data[idx] = d
+			lock.Unlock()
+		})
 	}
+	sendWg.Wait()
+
+	resp.success(ctx, data)
+}
+
+// HandlerAPIRelationMultiResourceRange
+// @Summary  query relation multi resource
+// @ID       relation_multi_resource_query_range
+// @Produce  json
+// @Param    traceparent            header    string                          false  "TraceID" default(00-3967ac0f1648bf0216b27631730d7eb9-8e3c31d5109e78dd-01)
+// @Param    X-Bk-Scope-Space-Uid   header    string                          false  "空间UID" default(bkcc__2)
+// @Param    data                  	body      cmdb.RelationMultiResourceRangeRequest			  true   "json data"
+// @Success  200                   	{object}  cmdb.RelationMultiResourceRangeResponse
+// @Failure  400                   	{object}  ErrResponse
+// @Router   /api/v1/relation/multi_resource_range [post]
+func HandlerAPIRelationMultiResourceRange(c *gin.Context) {
+	var (
+		ctx = c.Request.Context()
+
+		user = metadata.GetUser(ctx)
+		err  error
+
+		resp = &response{
+			c: c,
+		}
+	)
+
+	ctx, span := trace.NewSpan(ctx, "handler-api-relation-multi-resource-range")
+	defer span.End(&err)
+
+	request := new(cmdb.RelationMultiResourceRangeRequest)
+	err = json.NewDecoder(c.Request.Body).Decode(request)
+	if err != nil {
+		resp.failed(ctx, err)
+		return
+	}
+
+	paramsBody, _ := json.Marshal(request)
+	span.Set("handler-headers", c.Request.Header)
+	span.Set("handler-body", string(paramsBody))
+
+	model, err := v1beta1.GetModel(ctx)
+	if err != nil {
+		resp.failed(ctx, err)
+		return
+	}
+
+	data := new(cmdb.RelationMultiResourceRangeResponse)
+	data.TraceID = span.TraceID()
+	data.Data = make([]cmdb.RelationMultiResourceRangeResponseData, len(request.QueryList))
+
+	var (
+		sendWg sync.WaitGroup
+		lock   sync.Mutex
+	)
+	p, _ := ants.NewPool(RelationMaxRouting)
+	defer p.Release()
+
+	for idx, qry := range request.QueryList {
+		idx := idx
+		qry := qry
+		sendWg.Add(1)
+		_ = p.Submit(func() {
+			defer sendWg.Done()
+			d := cmdb.RelationMultiResourceRangeResponseData{
+				Code: http.StatusOK,
+			}
+
+			d.SourceType, d.SourceInfo, d.Path, d.TargetList, err = model.QueryResourceMatcherRange(ctx, qry.LookBackDelta, user.SpaceUid, qry.Step, qry.StartTs, qry.EndTs, qry.TargetType, qry.SourceType, qry.SourceInfo, qry.PathResource)
+			if err != nil {
+				log.Errorf(ctx, err.Error())
+
+				d.Message = err.Error()
+				d.Code = http.StatusBadRequest
+			}
+
+			lock.Lock()
+			data.Data[idx] = d
+			lock.Unlock()
+		})
+	}
+	sendWg.Wait()
 
 	resp.success(ctx, data)
 }

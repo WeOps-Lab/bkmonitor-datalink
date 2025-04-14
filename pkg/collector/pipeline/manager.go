@@ -27,7 +27,7 @@ func parseProcessors(typ string, conf *confengine.Config, subConfigs map[string]
 
 	for i := 0; i < len(processorConfigs); i++ {
 		pcf := processorConfigs[i]
-		logger.Infof("%s processor config: %+v", typ, pcf)
+		logger.Debugf("%s processor config: %+v", typ, pcf)
 	}
 
 	processors := map[string]processor.Instance{}
@@ -154,7 +154,7 @@ func parseReportV2Configs(configs []*confengine.Config) map[string][]processor.S
 
 	for _, items := range ps {
 		for _, item := range items {
-			logger.Infof("report_v2 processor: %+v", item)
+			logger.Debugf("report_v2 processor: %+v", item)
 		}
 	}
 	return ps
@@ -233,7 +233,7 @@ func parseProcessorSubConfigs(configs []*confengine.Config) map[string][]process
 
 	for _, items := range ps {
 		for _, item := range items {
-			logger.Infof("subconfig processor: %+v", item)
+			logger.Debugf("subconfig processor: %+v", item)
 		}
 	}
 	return ps
@@ -298,8 +298,9 @@ var defaultGetter Getter
 func GetDefaultGetter() Getter { return defaultGetter }
 
 const (
-	mainType     = "main"
-	PlatformType = "platform"
+	mainType       = "main"
+	PlatformType   = "platform"
+	PrivilegedType = "privileged"
 )
 
 func parseManagerConfig(conf *confengine.Config) (*Manager, error) {
@@ -331,7 +332,7 @@ func parseManagerConfig(conf *confengine.Config) (*Manager, error) {
 	}
 
 	// 解析合并：配置 = 主配置+子配置+平台配置（如果有的话）
-	platformConfig := confengine.LoadPlatformConfigs(apmConf.Patterns)
+	platformConfig := confengine.LoadConfigFromType(apmConf.Patterns, define.ConfigTypePlatform)
 	if platformConfig != nil {
 		if platformConfig.Has(define.ConfigFieldProcessor) {
 			platformProcessors, err := parseProcessors(PlatformType, platformConfig, processorSubConfigs)
@@ -347,6 +348,17 @@ func parseManagerConfig(conf *confengine.Config) (*Manager, error) {
 				return nil, err
 			}
 			finalPipelines = mergePipelines(finalPipelines, platformPipelines)
+		}
+	}
+	// 解析合并：配置 = 主配置+子配置+平台配置+高优配置（如果有的话）
+	privilegedConfig := confengine.LoadConfigFromType(apmConf.Patterns, define.ConfigTypePrivileged)
+	if privilegedConfig != nil {
+		if privilegedConfig.Has(define.ConfigFieldProcessor) {
+			privilegedProcessors, err := parseProcessors(PrivilegedType, privilegedConfig, processorSubConfigs)
+			if err != nil {
+				return nil, err
+			}
+			finalProcessors = mergeProcessors(finalProcessors, privilegedProcessors)
 		}
 	}
 
@@ -373,7 +385,8 @@ func (mgr *Manager) Reload(conf *confengine.Config) error {
 	}
 
 	// 清理 Processor
-	for _, p := range newManager.processors {
+	for name, p := range newManager.processors {
+		logger.Infof("manager clean %s processor", name)
 		p.Clean()
 	}
 

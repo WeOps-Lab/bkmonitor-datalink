@@ -10,357 +10,208 @@
 package victoriaMetrics
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/mock"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/tsdb"
-	"os"
-	"strings"
-	"sync"
+	"sort"
 	"testing"
 	"time"
 
+	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/curl"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/featureFlag"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/internal/json"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/log"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/mock"
 )
-
-const (
-	TestTime  = "2022-11-28 10:00:00"
-	ParseTime = "2006-01-02 15:04:05"
-)
-
-func mockData(ctx context.Context) {
-	metadata.SetExpand(ctx, &metadata.VmExpand{
-		ResultTableGroup: map[string][]string{
-			"container_cpu_system_seconds_total_value": {
-				"vm1",
-			},
-			"kube_pod_container_resource_limits_value": {
-				"vm1",
-			},
-		},
-	})
-}
 
 var (
-	once     sync.Once
-	instance tsdb.Instance
+	vmCondition metadata.VmCondition = `__name__="container_cpu_usage_seconds_total_value", result_table_id="2_bcs_prom_computation_result_table_00000", container="unify-query"`
+	vmRt        string               = "2_bcs_prom_computation_result_table_00000"
+
+	instance = &Instance{
+		url:     mock.VmUrl,
+		timeout: time.Minute * 5,
+		curl:    &curl.HttpCurl{},
+	}
 )
 
-func query(ctx context.Context, promql string, rts []string, data map[string]float64) error {
-	if len(rts) > 0 {
-		metadata.SetExpand(ctx, &metadata.VmExpand{
-			ResultTableGroup: map[string][]string{
-				"a": rts,
-			},
-		})
-		res, err := instance.Query(ctx, promql, time.Now())
-		if err != nil {
-			return err
-		}
-		if len(res) > 0 {
-			for _, r := range res {
-				var (
-					metric string
-					id     string
-				)
-				for _, l := range r.Metric {
-					switch {
-					case l.Name == "__name__":
-						metric = l.Value
-					case l.Name == "bcs_cluster_id":
-						id = l.Value
-					default:
-						panic(fmt.Sprintf("%s=%s", l.Name, l.Value))
-					}
-				}
+func TestInstance_DirectLabelValues(t *testing.T) {
+	testCases := map[string]struct {
+		name  string
+		limit int
 
-				if _, ok := data[metric+","+id]; !ok {
-					data[metric+","+id] = r.V
-				}
-			}
-
-			return nil
-		}
-	}
-	return fmt.Errorf("empty data in %+v", rts)
-}
-
-func TestPromQL(t *testing.T) {
-	ctx := mock.Init(context.Background())
-
-	once.Do(func() {
-		instance = &Instance{
-			ContentType:          "application/json",
-			Address:              "http://127.0.0.1",
-			UriPath:              "prod/v3/queryengine/query_sync",
-			Code:                 "bkmonitorv3",
-			Secret:               "",
-			Token:                "",
-			AuthenticationMethod: "token",
-			InfluxCompatible:     true,
-			UseNativeOr:          true,
-			Timeout:              time.Second * 30,
-			Curl: &curl.HttpCurl{
-				Log: log.OtLogger,
-			},
-		}
-	})
-
-	vectors := []string{
-		`kube_node_status_allocatable_cpu_cores_value`,
-		`kube_node_status_capacity_cpu_cores_value`,
-		//`kube_pod_container_resource_requests_value{resource="cpu"}`,
-		`kube_pod_container_resource_requests_cpu_cores_value`,
-		//`kube_pod_container_resource_limits_value{resource="cpu"}`,
-		`kube_pod_container_resource_limits_cpu_cores_value`,
-	}
-	dims := []string{
-		"bcs_cluster_id",
-		"__name__",
-	}
-
-	var (
-		data = make(map[string]float64)
-	)
-	f, err := os.Open("vmrt.list")
-	if err != nil {
-		panic(err)
-	}
-	defer f.Close()
-
-	batch := 100
-	br := bufio.NewReader(f)
-	rts := make([]string, 0, batch)
-	for {
-		rt, _, readErr := br.ReadLine()
-		if len(rt) > 0 {
-			rts = append(rts, string(rt))
-		}
-
-		if readErr != nil || len(rts) == batch {
-			promql := fmt.Sprintf(`sum({__name__=~"%s", result_table_id=~"%s"})`, strings.Join(vectors, "|"), strings.Join(rts, "|"))
-			if len(dims) > 0 {
-				promql = fmt.Sprintf(`%s by (%s)`, promql, strings.Join(dims, ", "))
-			}
-
-			err = query(ctx, promql, rts, data)
-			if err != nil {
-				log.Errorf(ctx, err.Error())
-			}
-			rts = rts[:0]
-		}
-
-		if readErr != nil {
-			break
-		}
-	}
-
-	file, err := os.Create("output.csv")
-	if err != nil {
-		return
-	}
-	defer file.Close()
-	for k, v := range data {
-		_, err = file.WriteString(fmt.Sprintf("%s,%.f\n", k, v))
-		if err != nil {
-			log.Errorf(ctx, err.Error())
-		}
-	}
-}
-
-func TestRealQueryRange(t *testing.T) {
-	log.InitTestLogger()
-
-	ctx := context.Background()
-	a := "a"
-	timeout := time.Minute
-	end := time.Now()
-	start := end.Add(time.Minute * -10)
-	step := time.Minute
-
-	fmt.Println(start, step)
-
-	flag := `{"vm-query-or":{"variations":{"vm":true,"influxdb":false},"defaultRule":{"percentage":{"vm":100,"influxdb":0}}}}`
-	featureFlag.MockFeatureFlag(ctx, flag)
-
-	ins := &Instance{
-		Ctx:                  ctx,
-		Address:              "http://127.0.0.1",
-		UriPath:              "api/bk-base/prod/v3/queryengine/query_sync",
-		Code:                 "bk_monitorv3",
-		Secret:               "",
-		AuthenticationMethod: "user",
-		Timeout:              timeout,
-		ContentType:          "application/json",
-		Token:                "token",
-
-		Curl: &curl.HttpCurl{Log: log.OtLogger},
-
-		InfluxCompatible: true,
-		UseNativeOr:      true,
-	}
-
-	testCase := map[string]struct {
-		q string
-		e *metadata.VmExpand
+		expected string
 	}{
 		"test_1": {
-			q: `count(a) by (ip, api)`,
-			e: &metadata.VmExpand{
-				ResultTableGroup: map[string][]string{
-					a: {"2_vm_pushgateway_unify_query_metrics"},
-				},
-				MetricAliasMapping: map[string]string{
-					a: "unify_query_api_request_total_value",
-				},
-				// condition 需要进行二次转义
+			name:     "pod",
+			expected: `["bk-datalink-unify-query-6459767d5f-5vsjr","bk-datalink-unify-query-6459767d5f-m9w6t","bk-datalink-unify-query-6459767d5f-nmx72","bk-datalink-unify-query-6459767d5f-qq8nq","bk-datalink-unify-query-778b5bdf95-7hpc9","bk-datalink-unify-query-778b5bdf95-dpkwm","bk-datalink-unify-query-778b5bdf95-x2wfd","bk-datalink-unify-query-778b5bdf95-xpq5z","bk-datalink-unify-query-7f4dd9fcf8-9g6kb","bk-datalink-unify-query-7f4dd9fcf8-9ggjq","bk-datalink-unify-query-7f4dd9fcf8-9x9bt","bk-datalink-unify-query-7f4dd9fcf8-rfhtb","bk-datalink-unify-query-8555c9f9b9-q7dct","bk-datalink-unify-query-8555c9f9b9-rhpvw","bk-datalink-unify-query-8555c9f9b9-vf8p6","bk-datalink-unify-query-8555c9f9b9-xspxj","bk-datalink-unify-query-85c54f79d8-6lfvd","bk-datalink-unify-query-85c54f79d8-dz9t7","bk-datalink-unify-query-85c54f79d8-nlzmc","bk-datalink-unify-query-85c54f79d8-qzqfz","bk-datalink-unify-query-b9c8f446d-8xk79","bk-datalink-unify-query-b9c8f446d-d48br","bk-datalink-unify-query-b9c8f446d-sch6k","bk-datalink-unify-query-b9c8f446d-tpdwn","bk-datalink-unify-query-test-66f7ccb78d-jf4m2","bk-datalink-unify-query-test-8445575f5d-mrppp","bk-datalink-unify-query-test-c8b988c78-xdcgq"]`,
+		},
+	}
+
+	mock.Init()
+	ctx := metadata.InitHashID(context.Background())
+
+	mock.Vm.Set(map[string]any{
+		`label_values:17301804581730184058pod{__name__="container_cpu_usage_seconds_total_value", result_table_id="2_bcs_prom_computation_result_table_00000", container="unify-query"}`: `{"result":true,"message":"成功","code":"00","data":{"result_table_scan_range":null,"cluster":"monitor-op","totalRecords":27,"resource_use_summary":{"cpu_time_mills":0,"memory_bytes":0,"processed_bytes":0,"processed_rows":0},"source":"","list":[{"status":"success","isPartial":false,"data":["bk-datalink-unify-query-6459767d5f-5vsjr","bk-datalink-unify-query-6459767d5f-m9w6t","bk-datalink-unify-query-6459767d5f-nmx72","bk-datalink-unify-query-6459767d5f-qq8nq","bk-datalink-unify-query-778b5bdf95-7hpc9","bk-datalink-unify-query-778b5bdf95-dpkwm","bk-datalink-unify-query-778b5bdf95-x2wfd","bk-datalink-unify-query-778b5bdf95-xpq5z","bk-datalink-unify-query-7f4dd9fcf8-9g6kb","bk-datalink-unify-query-7f4dd9fcf8-9ggjq","bk-datalink-unify-query-7f4dd9fcf8-9x9bt","bk-datalink-unify-query-7f4dd9fcf8-rfhtb","bk-datalink-unify-query-8555c9f9b9-q7dct","bk-datalink-unify-query-8555c9f9b9-rhpvw","bk-datalink-unify-query-8555c9f9b9-vf8p6","bk-datalink-unify-query-8555c9f9b9-xspxj","bk-datalink-unify-query-85c54f79d8-6lfvd","bk-datalink-unify-query-85c54f79d8-dz9t7","bk-datalink-unify-query-85c54f79d8-nlzmc","bk-datalink-unify-query-85c54f79d8-qzqfz","bk-datalink-unify-query-b9c8f446d-8xk79","bk-datalink-unify-query-b9c8f446d-d48br","bk-datalink-unify-query-b9c8f446d-sch6k","bk-datalink-unify-query-b9c8f446d-tpdwn","bk-datalink-unify-query-test-66f7ccb78d-jf4m2","bk-datalink-unify-query-test-8445575f5d-mrppp","bk-datalink-unify-query-test-c8b988c78-xdcgq"]}],"select_fields_order":[],"sql":"{__name__=\"container_cpu_usage_seconds_total_value\", result_table_id=\"2_bcs_prom_computation_result_table_00000\", container=\"unify-query\"}","total_record_size":3928,"timetaken":0.0,"bksql_call_elapsed_time":0,"device":"vm","result_table_ids":["2_bcs_prom_computation_result_table_00000"]},"errors":null,"trace_id":"00000000000000000000000000000000","span_id":"0000000000000000"}`,
+	})
+
+	start := time.Unix(1730180458, 0)
+	end := time.Unix(1730184058, 0)
+
+	for name, c := range testCases {
+		t.Run(name, func(t *testing.T) {
+			ctx = metadata.InitHashID(ctx)
+			matchers, _ := parser.ParseMetricSelector("a")
+			expand := &metadata.VmExpand{
+				ResultTableList: []string{"2_bcs_prom_computation_result_table_00000"},
 				MetricFilterCondition: map[string]string{
-					a: `ip=~"30\\.171\\.181\\.60", api!="/metrics"`,
+					"a": vmCondition.String(),
 				},
-			},
-		},
-	}
+			}
+			metadata.SetExpand(ctx, expand)
 
-	for n, c := range testCase {
-		t.Run(n, func(t *testing.T) {
-			metadata.SetExpand(ctx, c.e)
-			res, err := ins.Query(ctx, c.q, end)
+			res, err := instance.DirectLabelValues(ctx, c.name, start, end, c.limit, matchers...)
 			if err != nil {
-				panic(err)
+				log.Fatalf(ctx, err.Error())
+				return
 			}
-			fmt.Println(res)
+
+			actual, _ := json.Marshal(res)
+			assert.Equal(t, c.expected, string(actual))
 		})
 	}
 }
 
-func TestInstance_Query_Url(t *testing.T) {
-	log.InitTestLogger()
-
-	mockCurl := curl.NewMockCurl(map[string]string{
-		`http://127.0.0.1/api/query?query=count%28container_cpu_system_seconds_total_value%29&step=60&time=1669600800`:                                                          `{"status":"success","isPartial":false,"data":{"resultType":"vector","result":[{"metric":{},"value":[1669600800,"31949"]}]}}`,
-		`http://127.0.0.1/api/query?query=count+by+%28__bk_db__%2C+bk_biz_id%2C+bcs_cluster_id%29+%28container_cpu_system_seconds_total_value%7B%7D%29&step=60&time=1669600800`: `{"status":"success","isPartial":false,"data":{"resultType":"vector","result":[{"metric":{"__bk_db__":"mydb","bcs_cluster_id":"BCS-K8S-40949","bk_biz_id":"930"},"value":[1669600800,"31949"]}]}}`,
-		`http://127.0.0.1/api/query?query=sum%28111gggggggggggggggg11&step=60&time=1669600800`:                                                                                  `{"status":"error","errorType":"422","error":"error when executing query=\"sum(111gggggggggggggggg11\" for (time=1669600800000, step=60000): argList: unexpected token \"gggggggggggggggg11\"; want \",\", \")\"; unparsed data: \"gggggggggggggggg11\""}`,
-		`http://127.0.0.1/api/query?query=top%28sum%28kube_pod_container_resource_limits_value%29%29&step=60&time=1669600800`:                                                   `{"status":"error","errorType":"422","error":"unknown func \"top\""}`,
-	}, log.OtLogger)
-
-	ctx := context.Background()
-	ins := &Instance{
-		Ctx:     ctx,
-		Address: "http://127.0.0.1/api",
-		Curl:    mockCurl,
-	}
-	mockData(ctx)
-
-	endTime, _ := time.ParseInLocation(ParseTime, TestTime, time.Local)
-
+func TestInstance_DirectQueryRange(t *testing.T) {
 	testCases := map[string]struct {
 		promql   string
 		expected string
-		err      error
 	}{
-		"count": {
-			promql:   `count(container_cpu_system_seconds_total_value)`,
-			expected: `{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1669600800,"31949"]}]}}`,
-		},
-		"count rate metric": {
-			promql:   `count by (__bk_db__, bk_biz_id, bcs_cluster_id) (container_cpu_system_seconds_total_value{})`,
-			expected: `{"status":"success","data":{"resultType":"vector","result":[{"metric":{"__bk_db__":"mydb","bcs_cluster_id":"BCS-K8S-40949","bk_biz_id":"930"},"value":[1669600800,"31949"]}]}}`,
-		},
-		"error metric 1": {
-			promql: `sum(111gggggggggggggggg11`,
-			err:    errors.New(`error when executing query="sum(111gggggggggggggggg11" for (time=1669600800000, step=60000): argList: unexpected token "gggggggggggggggg11"; want ",", ")"; unparsed data: "gggggggggggggggg11"`),
-		},
-		"error metric 2": {
-			promql: `top(sum(kube_pod_container_resource_limits_value))`,
-			err:    errors.New(`unknown func "top"`),
+		"test_1": {
+			promql:   fmt.Sprintf(`sum(increase(%s[1m])) by (pod)`, vmCondition.ToMatch()),
+			expected: `[{"metric":{"pod":"bk-datalink-unify-query-6459767d5f-5vsjr"},"values":[[1730181358,"0.044650242"],[1730181658,"9.545676339999996"],[1730181958,"10.425697591999999"],[1730182258,"3.0199220649999887"],[1730182558,"6.747614702000007"],[1730182858,"6.133533471000021"],[1730183158,"8.81771028990002"],[1730183458,"10.132931282100003"],[1730183758,"3.5652613130999953"],[1730184058,"7.727230415000008"]]},{"metric":{"pod":"bk-datalink-unify-query-6459767d5f-m9w6t"},"values":[[1730181658,"12.404203941999995"],[1730181958,"5.875412668000003"],[1730182258,"5.044704286999988"],[1730182558,"8.997354142000006"],[1730182858,"7.50822000010001"],[1730183158,"5.585088850900007"],[1730183458,"9.202267196999998"],[1730183758,"5.616763429000031"],[1730184058,"6.6475119441000174"]]},{"metric":{"pod":"bk-datalink-unify-query-6459767d5f-nmx72"},"values":[[1730181358,"0.064899209"],[1730181658,"10.086907809000003"],[1730181958,"3.9349868299999997"],[1730182258,"7.714302543999992"],[1730182558,"5.458358707999992"],[1730182858,"9.634142672100012"],[1730183158,"6.135633479999996"],[1730183458,"8.975162369999993"],[1730183758,"5.904537907999952"],[1730184058,"6.029346786000019"]]},{"metric":{"pod":"bk-datalink-unify-query-6459767d5f-qq8nq"},"values":[[1730181658,"7.466532553"],[1730181958,"5.734228741999999"],[1730182258,"5.188748330999999"],[1730182558,"6.4631616860000065"],[1730182858,"6.180980588000011"],[1730183158,"5.984101682000016"],[1730183458,"6.966740698999985"],[1730183758,"5.611999492999985"],[1730184058,"4.7183045600000355"]]},{"metric":{"pod":"bk-datalink-unify-query-778b5bdf95-x2wfd"},"values":[[1730180458,"10.2905197900036"]]},{"metric":{"pod":"bk-datalink-unify-query-85c54f79d8-6lfvd"},"values":[[1730180758,"7.1915653179999985"],[1730181058,"4.9068547820000035"],[1730181358,"6.607650964000001"]]},{"metric":{"pod":"bk-datalink-unify-query-85c54f79d8-dz9t7"},"values":[[1730180758,"5.833707484999998"],[1730181058,"4.507901762000003"],[1730181358,"4.412351498000007"]]},{"metric":{"pod":"bk-datalink-unify-query-85c54f79d8-nlzmc"},"values":[[1730180758,"7.477196797999998"],[1730181058,"7.134382289999998"],[1730181358,"4.839466496"]]},{"metric":{"pod":"bk-datalink-unify-query-85c54f79d8-qzqfz"},"values":[[1730180758,"6.606840334000001"],[1730181058,"5.034415747000004"],[1730181358,"4.916271132000006"]]},{"metric":{"pod":"bk-datalink-unify-query-test-66f7ccb78d-jf4m2"},"values":[[1730180458,"3.661851597"],[1730180758,"0.3898651899999992"],[1730181058,"0.41139455499999933"]]}]`,
 		},
 	}
 
+	mock.Init()
+	ctx := metadata.InitHashID(context.Background())
+
+	mock.Vm.Set(map[string]any{
+		`query_range:17301804581730184058300sum(increase({__name__="container_cpu_usage_seconds_total_value", result_table_id="2_bcs_prom_computation_result_table_00000", container="unify-query"}[1m])) by (pod)`: `{"result":true,"message":"成功","code":"00","data":{"result_table_scan_range":null,"cluster":"monitor-op","totalRecords":10,"resource_use_summary":{"cpu_time_mills":0,"memory_bytes":0,"processed_bytes":0,"processed_rows":0},"source":"","list":[{"status":"success","isPartial":false,"data":{"resultType":"matrix","result":[{"metric":{"pod":"bk-datalink-unify-query-6459767d5f-5vsjr"},"values":[[1730181358,"0.044650242"],[1730181658,"9.545676339999996"],[1730181958,"10.425697591999999"],[1730182258,"3.0199220649999887"],[1730182558,"6.747614702000007"],[1730182858,"6.133533471000021"],[1730183158,"8.81771028990002"],[1730183458,"10.132931282100003"],[1730183758,"3.5652613130999953"],[1730184058,"7.727230415000008"]]},{"metric":{"pod":"bk-datalink-unify-query-6459767d5f-m9w6t"},"values":[[1730181658,"12.404203941999995"],[1730181958,"5.875412668000003"],[1730182258,"5.044704286999988"],[1730182558,"8.997354142000006"],[1730182858,"7.50822000010001"],[1730183158,"5.585088850900007"],[1730183458,"9.202267196999998"],[1730183758,"5.616763429000031"],[1730184058,"6.6475119441000174"]]},{"metric":{"pod":"bk-datalink-unify-query-6459767d5f-nmx72"},"values":[[1730181358,"0.064899209"],[1730181658,"10.086907809000003"],[1730181958,"3.9349868299999997"],[1730182258,"7.714302543999992"],[1730182558,"5.458358707999992"],[1730182858,"9.634142672100012"],[1730183158,"6.135633479999996"],[1730183458,"8.975162369999993"],[1730183758,"5.904537907999952"],[1730184058,"6.029346786000019"]]},{"metric":{"pod":"bk-datalink-unify-query-6459767d5f-qq8nq"},"values":[[1730181658,"7.466532553"],[1730181958,"5.734228741999999"],[1730182258,"5.188748330999999"],[1730182558,"6.4631616860000065"],[1730182858,"6.180980588000011"],[1730183158,"5.984101682000016"],[1730183458,"6.966740698999985"],[1730183758,"5.611999492999985"],[1730184058,"4.7183045600000355"]]},{"metric":{"pod":"bk-datalink-unify-query-778b5bdf95-x2wfd"},"values":[[1730180458,"10.2905197900036"]]},{"metric":{"pod":"bk-datalink-unify-query-85c54f79d8-6lfvd"},"values":[[1730180758,"7.1915653179999985"],[1730181058,"4.9068547820000035"],[1730181358,"6.607650964000001"]]},{"metric":{"pod":"bk-datalink-unify-query-85c54f79d8-dz9t7"},"values":[[1730180758,"5.833707484999998"],[1730181058,"4.507901762000003"],[1730181358,"4.412351498000007"]]},{"metric":{"pod":"bk-datalink-unify-query-85c54f79d8-nlzmc"},"values":[[1730180758,"7.477196797999998"],[1730181058,"7.134382289999998"],[1730181358,"4.839466496"]]},{"metric":{"pod":"bk-datalink-unify-query-85c54f79d8-qzqfz"},"values":[[1730180758,"6.606840334000001"],[1730181058,"5.034415747000004"],[1730181358,"4.916271132000006"]]},{"metric":{"pod":"bk-datalink-unify-query-test-66f7ccb78d-jf4m2"},"values":[[1730180458,"3.661851597"],[1730180758,"0.3898651899999992"],[1730181058,"0.41139455499999933"]]}]},"stats":{"seriesFetched":"14"}}],"select_fields_order":[],"sql":"sum (increase({__name__=\"container_cpu_usage_seconds_total_value\", result_table_id=\"2_bcs_prom_computation_result_table_00000\", container=\"unify-query\"}[1m])) by(pod)","total_record_size":13832,"timetaken":0.0,"bksql_call_elapsed_time":0,"device":"vm","result_table_ids":["2_bcs_prom_computation_result_table_00000"]},"errors":null,"trace_id":"00000000000000000000000000000000","span_id":"0000000000000000"}`,
+	})
+
+	instance := &Instance{
+		url:     mock.VmUrl,
+		timeout: time.Minute * 5,
+		curl:    &curl.HttpCurl{},
+	}
+	start := time.Unix(1730180458, 0)
+	end := time.Unix(1730184058, 0)
+	step := time.Minute * 5
+
 	for name, c := range testCases {
 		t.Run(name, func(t *testing.T) {
-			data, err := ins.Query(ctx, c.promql, endTime)
-			if c.err != nil {
-				assert.Equal(t, c.err, err)
-			} else {
-				assert.Nil(t, err)
-				res, err1 := json.Marshal(data)
-				assert.Nil(t, err1)
-				assert.Equal(t, c.expected, string(res))
+			ctx = metadata.InitHashID(ctx)
+
+			expand := &metadata.VmExpand{
+				ResultTableList: []string{"2_bcs_prom_computation_result_table_00000"},
+			}
+			metadata.SetExpand(ctx, expand)
+
+			res, err := instance.DirectQueryRange(ctx, c.promql, start, end, step)
+			if err != nil {
+				log.Fatalf(ctx, err.Error())
+				return
 			}
 
+			actual, _ := json.Marshal(res)
+			assert.Equal(t, c.expected, string(actual))
 		})
 	}
 }
 
-func TestInstance_QueryRange_Url(t *testing.T) {
-	log.InitTestLogger()
-	ctx := context.Background()
-
-	mockCurl := curl.NewMockCurl(map[string]string{
-		`http://127.0.0.1/api/query_range?end=1669600800&query=count%28kube_pod_container_resource_limits_value%29&start=1669600500&step=60`:                                                          `{"status":"success","isPartial":false,"data":{"resultType":"matrix","result":[{"metric":{},"values":[[1669600500,"61305"],[1669600560,"61305"],[1669600620,"61305"],[1669600680,"61311"],[1669600740,"61311"],[1669600800,"61314"]]}]}}`,
-		`http://127.0.0.1/api/query_range?end=1669600800&query=count+by+%28__bk_db__%2C+bk_biz_id%2C+bcs_cluster_id%29+%28container_cpu_system_seconds_total_value%7B%7D%29&start=1669600500&step=60`: `{"status":"success","isPartial":false,"data":{"resultType":"matrix","result":[{"metric":{"__bk_db__":"mydb","bcs_cluster_id":"BCS-K8S-40949","bk_biz_id":"930"},"values":[[1669600500,"31949"],[1669600560,"31949"],[1669600620,"31949"],[1669600680,"31949"],[1669600740,"31949"],[1669600800,"31949"]]}]}}`,
-		`http://127.0.0.1/api/query_range?end=1669600800&query=sum%28111gggggggggggggggg11&start=1669600500&step=60`:                                                                                  `{"status":"error","errorType":"422","error":"error when executing query=\"sum(111gggggggggggggggg11\" on the time range (start=1669600500000, end=1669600800000, step=60000): argList: unexpected token \"gggggggggggggggg11\"; want \",\", \")\"; unparsed data: \"gggggggggggggggg11\""}`,
-		`http://127.0.0.1/api/query_range?end=1669600800&query=top%28sum%28kube_pod_container_resource_limits_value%29%29&start=1669600500&step=60`:                                                   `{"status":"error","errorType":"422","error":"unknown func \"top\""}`,
-	}, log.OtLogger)
-
-	ins := &Instance{
-		Ctx:     ctx,
-		Address: "http://127.0.0.1/api",
-		Timeout: time.Minute,
-		Curl:    mockCurl,
-	}
-	mockData(ctx)
-
-	leftTime := time.Minute * -5
-
-	endTime, _ := time.ParseInLocation(ParseTime, TestTime, time.Local)
-	startTime := endTime.Add(leftTime)
-	stepTime := time.Minute
-
+func TestInstance_DirectQuery(t *testing.T) {
 	testCases := map[string]struct {
 		promql   string
 		expected string
-		err      error
 	}{
-		"count": {
-			promql:   `count(kube_pod_container_resource_limits_value)`,
-			expected: `[{"metric":{},"values":[[1669600500,"61305"],[1669600560,"61305"],[1669600620,"61305"],[1669600680,"61311"],[1669600740,"61311"],[1669600800,"61314"]]}]`,
-		},
-		"count rate metric": {
-			promql:   `count by (__bk_db__, bk_biz_id, bcs_cluster_id) (container_cpu_system_seconds_total_value{})`,
-			expected: `[{"metric":{"__bk_db__":"mydb","bcs_cluster_id":"BCS-K8S-40949","bk_biz_id":"930"},"values":[[1669600500,"31949"],[1669600560,"31949"],[1669600620,"31949"],[1669600680,"31949"],[1669600740,"31949"],[1669600800,"31949"]]}]`,
-		},
-		"error metric 1": {
-			promql: `sum(111gggggggggggggggg11`,
-			err:    errors.New(`error when executing query="sum(111gggggggggggggggg11" on the time range (start=1669600500000, end=1669600800000, step=60000): argList: unexpected token "gggggggggggggggg11"; want ",", ")"; unparsed data: "gggggggggggggggg11"`),
-		},
-		"error metric 2": {
-			promql: `top(sum(kube_pod_container_resource_limits_value))`,
-			err:    errors.New(`unknown func "top"`),
+		"test_1": {
+			promql:   fmt.Sprintf(`sum(increase(%s[1m])) by (pod)`, vmCondition.ToMatch()),
+			expected: `[{"metric":{"pod":"bk-datalink-unify-query-6459767d5f-5vsjr"},"value":[1730184058,"7.727230415000008"]},{"metric":{"pod":"bk-datalink-unify-query-6459767d5f-m9w6t"},"value":[1730184058,"6.6475119441000174"]},{"metric":{"pod":"bk-datalink-unify-query-6459767d5f-nmx72"},"value":[1730184058,"6.029346786000019"]},{"metric":{"pod":"bk-datalink-unify-query-6459767d5f-qq8nq"},"value":[1730184058,"4.7183045600000355"]}]`,
 		},
 	}
+
+	mock.Init()
+	ctx := metadata.InitHashID(context.Background())
+
+	mock.Vm.Set(map[string]any{
+		`query:1730184058sum(increase({__name__="container_cpu_usage_seconds_total_value", result_table_id="2_bcs_prom_computation_result_table_00000", container="unify-query"}[1m])) by (pod)`: `{"result":true,"message":"成功","code":"00","data":{"result_table_scan_range":null,"cluster":"monitor-op","totalRecords":4,"resource_use_summary":{"cpu_time_mills":0,"memory_bytes":0,"processed_bytes":0,"processed_rows":0},"source":"","list":[{"status":"success","isPartial":false,"data":{"resultType":"vector","result":[{"metric":{"pod":"bk-datalink-unify-query-6459767d5f-5vsjr"},"value":[1730184058,"7.727230415000008"]},{"metric":{"pod":"bk-datalink-unify-query-6459767d5f-m9w6t"},"value":[1730184058,"6.6475119441000174"]},{"metric":{"pod":"bk-datalink-unify-query-6459767d5f-nmx72"},"value":[1730184058,"6.029346786000019"]},{"metric":{"pod":"bk-datalink-unify-query-6459767d5f-qq8nq"},"value":[1730184058,"4.7183045600000355"]}]},"stats":{"seriesFetched":"4"}}],"select_fields_order":[],"sql":"sum (increase({__name__=\"container_cpu_usage_seconds_total_value\", result_table_id=\"2_bcs_prom_computation_result_table_00000\", container=\"unify-query\"}[1m])) by(pod)","total_record_size":3600,"timetaken":0.0,"bksql_call_elapsed_time":0,"device":"vm","result_table_ids":["2_bcs_prom_computation_result_table_00000"]},"errors":null,"trace_id":"00000000000000000000000000000000","span_id":"0000000000000000"}`,
+	})
+
+	end := time.Unix(1730184058, 0)
 
 	for name, c := range testCases {
 		t.Run(name, func(t *testing.T) {
-			data, err := ins.QueryRange(ctx, c.promql, startTime, endTime, stepTime)
-			if c.err != nil {
-				assert.Equal(t, c.err, err)
-			} else {
-				assert.Nil(t, err)
-				res, err1 := json.Marshal(data)
-				assert.Nil(t, err1)
-				assert.Equal(t, c.expected, string(res))
+			ctx = metadata.InitHashID(ctx)
+
+			expand := &metadata.VmExpand{
+				ResultTableList: []string{"2_bcs_prom_computation_result_table_00000"},
+			}
+			metadata.SetExpand(ctx, expand)
+
+			res, err := instance.DirectQuery(ctx, c.promql, end)
+			if err != nil {
+				log.Fatalf(ctx, err.Error())
+				return
 			}
 
+			actual, _ := json.Marshal(res)
+			assert.Equal(t, c.expected, string(actual))
 		})
 	}
+}
 
+func TestInstance_QueryLabelValues(t *testing.T) {
+	testCases := map[string]struct {
+		name     string
+		expected string
+	}{
+		"test_1": {
+			name:     "pod",
+			expected: `["bk-datalink-unify-query-6459767d5f-5vsjr","bk-datalink-unify-query-6459767d5f-m9w6t","bk-datalink-unify-query-6459767d5f-nmx72","bk-datalink-unify-query-6459767d5f-qq8nq","bk-datalink-unify-query-778b5bdf95-7hpc9","bk-datalink-unify-query-778b5bdf95-dpkwm","bk-datalink-unify-query-778b5bdf95-x2wfd","bk-datalink-unify-query-778b5bdf95-xpq5z","bk-datalink-unify-query-85c54f79d8-6lfvd","bk-datalink-unify-query-85c54f79d8-dz9t7","bk-datalink-unify-query-85c54f79d8-nlzmc","bk-datalink-unify-query-85c54f79d8-qzqfz","bk-datalink-unify-query-test-66f7ccb78d-jf4m2","bk-datalink-unify-query-test-8445575f5d-mrppp"]`,
+		},
+	}
+
+	mock.Init()
+	ctx := metadata.InitHashID(context.Background())
+
+	mock.Vm.Set(map[string]any{
+		`query_range:17301804581730184058360count({__name__="container_cpu_usage_seconds_total_value", result_table_id="2_bcs_prom_computation_result_table_00000", container="unify-query"}) by (pod)`: `{"result":true,"message":"成功","code":"00","data":{"result_table_scan_range":null,"cluster":"monitor-op","totalRecords":14,"resource_use_summary":{"cpu_time_mills":0,"memory_bytes":0,"processed_bytes":0,"processed_rows":0},"source":"","list":[{"status":"success","isPartial":false,"data":{"resultType":"matrix","result":[{"metric":{"pod":"bk-datalink-unify-query-6459767d5f-5vsjr"},"values":[[1730181538,"1"],[1730181898,"1"],[1730182258,"1"],[1730182618,"1"],[1730182978,"1"],[1730183338,"1"],[1730183698,"1"],[1730184058,"1"]]},{"metric":{"pod":"bk-datalink-unify-query-6459767d5f-m9w6t"},"values":[[1730181538,"1"],[1730181898,"1"],[1730182258,"1"],[1730182618,"1"],[1730182978,"1"],[1730183338,"1"],[1730183698,"1"],[1730184058,"1"]]},{"metric":{"pod":"bk-datalink-unify-query-6459767d5f-nmx72"},"values":[[1730181538,"1"],[1730181898,"1"],[1730182258,"1"],[1730182618,"1"],[1730182978,"1"],[1730183338,"1"],[1730183698,"1"],[1730184058,"1"]]},{"metric":{"pod":"bk-datalink-unify-query-6459767d5f-qq8nq"},"values":[[1730181538,"1"],[1730181898,"1"],[1730182258,"1"],[1730182618,"1"],[1730182978,"1"],[1730183338,"1"],[1730183698,"1"],[1730184058,"1"]]},{"metric":{"pod":"bk-datalink-unify-query-778b5bdf95-7hpc9"},"values":[[1730180458,"1"]]},{"metric":{"pod":"bk-datalink-unify-query-778b5bdf95-dpkwm"},"values":[[1730180458,"1"]]},{"metric":{"pod":"bk-datalink-unify-query-778b5bdf95-x2wfd"},"values":[[1730180458,"1"]]},{"metric":{"pod":"bk-datalink-unify-query-778b5bdf95-xpq5z"},"values":[[1730180458,"1"]]},{"metric":{"pod":"bk-datalink-unify-query-85c54f79d8-6lfvd"},"values":[[1730180818,"1"],[1730181178,"1"],[1730181538,"1"]]},{"metric":{"pod":"bk-datalink-unify-query-85c54f79d8-dz9t7"},"values":[[1730180818,"1"],[1730181178,"1"],[1730181538,"1"]]},{"metric":{"pod":"bk-datalink-unify-query-85c54f79d8-nlzmc"},"values":[[1730180818,"1"],[1730181178,"1"],[1730181538,"1"]]},{"metric":{"pod":"bk-datalink-unify-query-85c54f79d8-qzqfz"},"values":[[1730180818,"1"],[1730181178,"1"],[1730181538,"1"]]},{"metric":{"pod":"bk-datalink-unify-query-test-66f7ccb78d-jf4m2"},"values":[[1730180458,"1"],[1730180818,"1"],[1730181178,"1"],[1730181538,"1"]]},{"metric":{"pod":"bk-datalink-unify-query-test-8445575f5d-mrppp"},"values":[[1730180458,"1"]]}]},"stats":{"seriesFetched":"14"}}],"select_fields_order":[],"sql":"count ({__name__=\"container_cpu_usage_seconds_total_value\", result_table_id=\"2_bcs_prom_computation_result_table_00000\", container=\"unify-query\"}) by(pod)","total_record_size":13920,"timetaken":0.0,"bksql_call_elapsed_time":0,"device":"vm","result_table_ids":["2_bcs_prom_computation_result_table_00000"]},"errors":null,"trace_id":"00000000000000000000000000000000","span_id":"0000000000000000"}`,
+	})
+
+	start := time.Unix(1730180458, 0)
+	end := time.Unix(1730184058, 0)
+
+	for name, c := range testCases {
+		t.Run(name, func(t *testing.T) {
+			ctx = metadata.InitHashID(ctx)
+
+			query := &metadata.Query{
+				VmRt:        vmRt,
+				VmCondition: vmCondition,
+			}
+
+			res, err := instance.QueryLabelValues(ctx, query, c.name, start, end)
+			if err != nil {
+				log.Fatalf(ctx, err.Error())
+				return
+			}
+
+			sort.Strings(res)
+			actual, _ := json.Marshal(res)
+			assert.Equal(t, c.expected, string(actual))
+		})
+	}
 }

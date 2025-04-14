@@ -17,7 +17,6 @@ import (
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/eventbus"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/log"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/query/infos"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/query/promql"
 )
 
@@ -44,17 +43,25 @@ func setDefaultConfig() {
 	viper.SetDefault(TSQueryHandlePathConfigPath, "/query/ts")
 	viper.SetDefault(TSQueryExemplarHandlePathConfigPath, "/query/ts/exemplar")
 	viper.SetDefault(TSQueryPromQLHandlePathConfigPath, "/query/ts/promql")
+	viper.SetDefault(TSQueryReferenceQueryHandlePathConfigPath, "/query/ts/reference")
+	viper.SetDefault(TSQueryRawQueryHandlePathConfigPath, "/query/ts/raw")
+	viper.SetDefault(TSQueryRawMAXLimitConfigPath, 1e2)
 	viper.SetDefault(TSQueryInfoHandlePathConfigPath, "/query/ts/info")
 	viper.SetDefault(TSQueryStructToPromQLHandlePathConfigPath, "/query/ts/struct_to_promql")
 	viper.SetDefault(TSQueryPromQLToStructHandlePathConfigPath, "/query/ts/promql_to_struct")
 
 	viper.SetDefault(TSQueryLabelValuesPathConfigPath, "/query/ts/label/:label_name/values")
+	viper.SetDefault(TSQueryClusterMetricsPathConfigPath, "/query/ts/cluster_metrics")
 
 	viper.SetDefault(PrintHandlePathConfigPath, "/print")
 	viper.SetDefault(FeatureFlagHandlePathConfigPath, "/ff")
 	viper.SetDefault(SpacePrintHandlePathConfigPath, "/space_print")
 	viper.SetDefault(SpaceKeyPrintHandlePathConfigPath, "/space_key_print")
+	viper.SetDefault(TsDBPrintHandlePathConfigPath, "/tsdb_print")
 	viper.SetDefault(InfluxDBPrintHandlePathConfigPath, "/influxdb_print")
+
+	viper.SetDefault(CheckQueryTsConfigPath, "/check/query/ts")
+	viper.SetDefault(CheckQueryPromQLConfigPath, "/check/query/ts/promql")
 
 	viper.SetDefault(AlignInfluxdbResultConfigPath, true)
 	viper.SetDefault(InfoDefaultLimit, 100)
@@ -65,6 +72,9 @@ func setDefaultConfig() {
 	viper.SetDefault(SegmentedMinInterval, "5m")
 
 	viper.SetDefault(QueryMaxRoutingConfigPath, 2)
+
+	viper.SetDefault(ClusterMetricQueryPrefixConfigPath, "bkmonitor")
+	viper.SetDefault(ClusterMetricQueryTimeoutConfigPath, "30s")
 
 }
 
@@ -83,11 +93,15 @@ func LoadConfig() {
 	SingleflightTimeout = viper.GetDuration(SingleflightTimeoutConfigPath)
 	SlowQueryThreshold = viper.GetDuration(SlowQueryThresholdConfigPath)
 	DefaultQueryListLimit = viper.GetInt(DefaultQueryListLimitPath)
-	DefaultInfoLimit = viper.GetInt(InfoDefaultLimit)
 
 	QueryMaxRouting = viper.GetInt(QueryMaxRoutingConfigPath)
 
-	infos.SetDefaultLimit(DefaultInfoLimit)
+	ClusterMetricQueryPrefix = viper.GetString(ClusterMetricQueryPrefixConfigPath)
+	ClusterMetricQueryTimeout = viper.GetDuration(ClusterMetricQueryTimeoutConfigPath)
+
+	JwtPublicKey = viper.GetString(JwtPublicKeyConfigPath)
+	JwtBkAppCodeSpaces = viper.GetStringMapStringSlice(JwtBkAppCodeSpacesConfigPath)
+
 	promql.SetSegmented(&promql.Segmented{
 		Enable:      viper.GetBool(SegmentedEnable),
 		MaxRoutines: viper.GetInt(SegmentedMaxRoutines),

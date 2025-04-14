@@ -15,14 +15,16 @@ import (
 	"github.com/elastic/go-ucfg"
 	"github.com/elastic/go-ucfg/yaml"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/metacache"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/libgse/beat"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/logger"
 )
 
 var (
-	loadConfigSuccessTotal = prometheus.NewCounter(
+	loadConfigSuccessTotal = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: define.MonitoringNamespace,
 			Name:      "engine_load_config_success_total",
@@ -30,7 +32,7 @@ var (
 		},
 	)
 
-	loadConfigFailedTotal = prometheus.NewCounter(
+	loadConfigFailedTotal = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: define.MonitoringNamespace,
 			Name:      "engine_load_config_failed_total",
@@ -38,13 +40,6 @@ var (
 		},
 	)
 )
-
-func init() {
-	prometheus.MustRegister(
-		loadConfigSuccessTotal,
-		loadConfigFailedTotal,
-	)
-}
 
 var DefaultMetricMonitor = &metricMonitor{}
 
@@ -58,7 +53,7 @@ func (m *metricMonitor) IncLoadConfigFailedCounter() {
 	loadConfigFailedTotal.Inc()
 }
 
-func LoadPlatformConfigs(patterns []string) *Config {
+func LoadConfigFromType(patterns []string, typ string) *Config {
 	type T struct {
 		Type string `config:"type"`
 	}
@@ -75,7 +70,7 @@ func LoadPlatformConfigs(patterns []string) *Config {
 				logger.Errorf("failed to unpack config, err: %v", err)
 				continue
 			}
-			if subConf.Type == define.ConfigTypePlatform {
+			if subConf.Type == typ {
 				return c
 			}
 		}
@@ -125,7 +120,16 @@ func LoadConfigPath(path string) (*Config, error) {
 		return nil, err
 	}
 
-	logger.Infof("load config file '%v'", path)
+	var token define.Token
+	if err := config.Unpack(&token); err != nil {
+		logger.Warnf("failed to parse config (%s), err: %v", path, err)
+	}
+	if token.Original != "" {
+		logger.Debugf("metacache set token: %+v", token)
+		metacache.Set(token.Original, token)
+	}
+
+	logger.Debugf("load config file '%v'", path)
 	DefaultMetricMonitor.IncLoadConfigSuccessCounter()
 	return New((*beat.Config)(config)), err
 }

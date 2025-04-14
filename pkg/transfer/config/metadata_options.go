@@ -24,6 +24,10 @@ const (
 	PipelineConfigDimensionGroupName = "group_info"
 )
 
+const (
+	LogCleanFailedFlag = "__parse_failure"
+)
+
 // RT 类型
 const (
 	// ResultTableSchemaTypeFree :
@@ -65,6 +69,8 @@ const (
 	PipelineConfigOptTimestampPrecision        = "timestamp_precision"
 	PipelineConfigOptTimestampDefaultPrecision = "ms"
 
+	PipelineConfigOptKafkaInitialOffset = "kafka_initial_offset"
+
 	// 时序类
 	// PipelineConfigOptInjectLocalTime :  增加入库时间指标(bool)
 	PipelineConfigOptInjectLocalTime = "inject_local_time"
@@ -74,6 +80,10 @@ const (
 	PipelineConfigOptAllowDynamicMetricsAsFloat = "dynamic_metrics_as_float"
 	// PipelineConfigOptMaxQps 允许后端写入的最大的 QPS
 	PipelineConfigOptMaxQps = "max_qps"
+	// PipelineConfigDropEmptyMetrics 是否丢弃空 metrics
+	PipelineConfigDropEmptyMetrics = "drop_empty_metrics"
+	// PipelineConfigDisableMetricsReporter 是否关闭 metrics_reporter 特性
+	PipelineConfigDisableMetricsReporter = "disable_metrics_reporter"
 
 	// 日志类
 	// PipelineConfigOptSeparatorNode : "字段提取节点路径"
@@ -91,6 +101,10 @@ const (
 	PipelineConfigOptionIsLogData       = "is_log_data"
 	// PipelineConfigOptionRetainExtraJson : JSON清洗时, 未定义字段将会归到ext里
 	PipelineConfigOptionRetainExtraJson = "retain_extra_json"
+	// PipelineConfigOptionRetainContent 数据清洗失败时是否保留原始日志文本
+	PipelineConfigOptionRetainContent = "enable_retain_content"
+	// PipelineConfigOptionRetainContentKey 清洗失败后日志原始文本应该保存的 key
+	PipelineConfigOptionRetainContentKey = "retain_content_key"
 	// PipelineConfigOptEnableDimensionCmdbLevel : 开启层级组功能
 	PipelineConfigOptEnableDimensionCmdbLevel = "enable_dimension_cmdb_level"
 	// ResultTableListConfigOptMetricSplitLevel  : 描述需要拆解的层级内容
@@ -103,6 +117,8 @@ const (
 	ResultTableListConfigOptEnableDbmMeta = "enable_dbm_meta"
 	// ResultTableListConfigOptEnableDevxMeta 是否开启 devx_meta 字段注入
 	ResultTableListConfigOptEnableDevxMeta = "enable_devx_meta"
+	// ResultTableListConfigOptEnablePerforceMeta 是否启用 perforce_meta 字段注入
+	ResultTableListConfigOptEnablePerforceMeta = "enable_perforce_meta"
 
 	// 事件类
 	// PipelineConfigOptFlatBatchKey: 事件类数据需要进行进行插件的
@@ -112,28 +128,6 @@ const (
 	// PipelineConfigOptFlatBatchKey: 事件类数据需要进行进行插件的
 	PipelineConfigOptMetricsReportPathKey    = "metrics_report_path"
 	PipelineConfigCacheFieldRefreshPeriodKey = "cache_field_refresh_period"
-
-	// 故障自愈
-	// PipelineConfigOptFTARawDataKey: 原始事件数据存放的Key
-	PipelineConfigOptFTARawDataKey = "raw_data_key"
-	// PipelineConfigOptFTADefaultRawDataKey: 原始事件数据存放的Key默认值
-	PipelineConfigOptFTADefaultRawDataKey = "data"
-	// PipelineConfigOptFTADataFormatKey: 原始事件数据格式的Key
-	PipelineConfigOptFTADataFormatKey = "source_format"
-	// PipelineConfigOptFTADefaultDataFormat: 原始事件数据默认格式
-	PipelineConfigOptFTADefaultDataFormat = "json"
-	// PipelineConfigOptFTARawEventKey: 数据经反序列化之后理后存放的Key
-	PipelineConfigOptFTARawEventKey = "data"
-	// PipelineConfigOptFTAEventPathKey: 用户指定的事件数据所在路径
-	PipelineConfigOptFTAEventPathKey = "events_path"
-	// PipelineConfigOptFTAMultipleEventsKey: 是否为批量事件的配置Key
-	PipelineConfigOptFTAMultipleEventsKey = "multiple_events"
-	// PipelineConfigOptFTAFieldMappingKey: 字段映射配置Key
-	PipelineConfigOptFTAFieldMappingKey = "normalization_config"
-	// PipelineConfigOptFTAAlertsKey: 告警名称配置Key
-	PipelineConfigOptFTAAlertsKey = "alert_config"
-	// PipelineConfigOptFTAAlertNameKey: 事件数据的告警名称Key
-	PipelineConfigOptFTAAlertNameKey = "__bk_alert_name__"
 )
 
 // MetaResultTableConfig 专用
@@ -157,6 +151,8 @@ const (
 	ResultTableOptLogSeparatedFields = "separator_field_list"
 	// ResultTableOptLogSeparatorRegexp : 日志正则提取清洗专用，提取字段
 	ResultTableOptLogSeparatorRegexp = "separator_regexp"
+
+	ResultTableOptLogSeparatorConfigs = "separator_configs"
 
 	// 事件类
 	// 结果是否可以使用新的自定义维度
@@ -195,8 +191,23 @@ const (
 	MetaFieldOptTimeZone = "time_zone"
 	// MetaFieldOptTimeFormat : 时间格式（string)
 	MetaFieldOptTimeFormat = "time_format"
+	// MetaFieldOptTimeLayout 时间格式模板
+	MetaFieldOptTimeLayout = "time_layout"
 	// MetaFieldOptRealPath : "提取的真实路径"
 	MetaFieldOptRealPath = "real_path"
+
+	// MetaFieldOptDbmEnabled 是否启动 dbm 慢查询解析
+	MetaFieldOptDbmEnabled = "dbm_enabled"
+	// MetaFieldOptDbmUrl dbm 解析 URL
+	MetaFieldOptDbmUrl = "dbm_url"
+	// MetaFieldOptDbmField dbm 解析后写入的新字段
+	MetaFieldOptDbmField = "dbm_field"
+	// MetaFieldOptDbmRetry dbm 解析 URL 重试次数
+	MetaFieldOptDbmRetry = "dbm_retry"
+
+	// 允许通过函数决定缺省值
+	MetaFieldOptDefaultFunc   = "default_function"
+	MetaFieldOptTimestampUnit = "timestamp_unit"
 
 	// 时序类
 	// MetaFieldOptInfluxDisabled : 禁止写入 influxdb
@@ -207,6 +218,8 @@ const (
 	MetaFieldOptESType = "es_type"
 	// MetaFieldOptESFormat : es 对应格式(string)
 	MetaFieldOptESFormat = "es_format"
+	// MataFieldOptEnableOriginString 保留原始字符串格式（map[string]interface{}/[]interface{} -> string）
+	MataFieldOptEnableOriginString = "enable_origin_string"
 )
 
 // InitPipelineOptions : 初始化通用 pipeline option
@@ -306,9 +319,7 @@ func InitTSV2ResultTableOptions(rt *MetaResultTableConfig) {
 func InitFTAPipelineOptions(pipe *PipelineConfig) {
 	InitPipelineOptions(pipe)
 	helper := utils.NewMapHelper(pipe.Option)
-	helper.SetDefault(PipelineConfigOptFTARawDataKey, PipelineConfigOptFTADefaultRawDataKey)
-	helper.SetDefault(PipelineConfigOptFTADataFormatKey, PipelineConfigOptFTADefaultDataFormat)
-	helper.SetDefault(PipelineConfigOptFTAMultipleEventsKey, false)
+	helper.SetDefault(PipelineConfigOptFlatBatchKey, "data")
 }
 
 // InitFTAResultTableOptions

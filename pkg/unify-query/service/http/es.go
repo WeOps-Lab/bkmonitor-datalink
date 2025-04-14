@@ -11,13 +11,11 @@ package http
 
 import (
 	"context"
-	"encoding/json"
 	"io"
 
 	"github.com/gin-gonic/gin"
-	"github.com/spf13/viper"
-	oleltrace "go.opentelemetry.io/otel/trace"
 
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/internal/json"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/log"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metric"
@@ -27,7 +25,8 @@ import (
 
 // ErrResponse
 type ErrResponse struct {
-	Err string `json:"error"`
+	TraceID string `json:"trace_id,omitempty"`
+	Err     string `json:"error"`
 }
 
 // ESRequest
@@ -53,30 +52,30 @@ type Query struct {
 func HandleESQueryRequest(c *gin.Context) {
 	// 这里开始context就使用trace生成的了
 	var (
-		ctx         = c.Request.Context()
-		span        oleltrace.Span
+		ctx = c.Request.Context()
+
 		user        = metadata.GetUser(ctx)
 		servicePath = c.Request.URL.Path
+
+		err error
 	)
 
-	ctx, span = trace.IntoContext(ctx, trace.TracerName, "handle-es-request")
-	if span != nil {
-		defer span.End()
-	}
+	ctx, span := trace.NewSpan(ctx, "handle-es-request")
+	defer span.End(&err)
 
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		log.Errorf(context.TODO(), "read es request body failed for->[%s]", err)
-		metric.APIRequestInc(ctx, servicePath, metric.StatusFailed, user.SpaceUid)
-		c.JSON(400, ErrResponse{err.Error()})
+		metric.APIRequestInc(ctx, servicePath, metric.StatusFailed, user.SpaceUid, user.Source)
+		c.JSON(400, ErrResponse{Err: err.Error()})
 		return
 	}
 	var req *ESRequest
 	err = json.Unmarshal(body, &req)
 	if err != nil {
 		log.Errorf(context.TODO(), "anaylize es request body failed for->[%s]", err)
-		metric.APIRequestInc(ctx, servicePath, metric.StatusFailed, user.SpaceUid)
-		c.JSON(400, ErrResponse{err.Error()})
+		metric.APIRequestInc(ctx, servicePath, metric.StatusFailed, user.SpaceUid, user.Source)
+		c.JSON(400, ErrResponse{Err: err.Error()})
 		return
 	}
 	params := &es.Params{
@@ -89,18 +88,11 @@ func HandleESQueryRequest(c *gin.Context) {
 	result, err := es.Query(params)
 	if err != nil {
 		log.Errorf(context.TODO(), "query es failed for->[%s]", err)
-		metric.APIRequestInc(ctx, servicePath, metric.StatusFailed, user.SpaceUid)
-		c.JSON(400, ErrResponse{err.Error()})
+		metric.APIRequestInc(ctx, servicePath, metric.StatusFailed, user.SpaceUid, user.Source)
+		c.JSON(400, ErrResponse{Err: err.Error()})
 		return
 	}
 
-	metric.APIRequestInc(ctx, servicePath, metric.StatusSuccess, user.SpaceUid)
+	metric.APIRequestInc(ctx, servicePath, metric.StatusSuccess, user.SpaceUid, user.Source)
 	c.String(200, "%s", result)
-}
-
-// registerESService
-func registerESService(g *gin.Engine) {
-	servicePath := viper.GetString(ESHandlePathConfigPath)
-	g.POST(servicePath, HandleESQueryRequest)
-	log.Infof(context.TODO(), "es service register in path->[%s]", servicePath)
 }

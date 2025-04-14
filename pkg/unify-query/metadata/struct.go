@@ -18,21 +18,35 @@ import (
 
 	"github.com/VictoriaMetrics/metricsql"
 	"github.com/prometheus/prometheus/model/labels"
-	oleltrace "go.opentelemetry.io/otel/trace"
 
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/log"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/trace"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/internal/json"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/internal/set"
 )
 
 const (
 	StaticField = "value"
+
+	UUID = "query_uuid"
 )
 
-// AggrMethod 聚合方法
-type AggrMethod struct {
+type VmCondition string
+
+type TimeField struct {
+	Name string
+	Type string
+	Unit string
+}
+
+// Aggregate 聚合方法
+type Aggregate struct {
 	Name       string
 	Dimensions []string
 	Without    bool
+
+	Window   time.Duration
+	TimeZone string
+
+	Args []interface{}
 }
 
 // OffSetInfo Offset的信息存储，供promql查询转换为influxdb查询语句时使用
@@ -43,41 +57,54 @@ type OffSetInfo struct {
 	SLimit  int
 }
 
+type Aggregates []Aggregate
+
 // Query 查询扩展信息，为后面查询提供定位
 type Query struct {
-	SourceType string // 查询数据源 InfluxDB 或者 VictoriaMetrics
+	SourceType string
 	Password   string // 查询鉴权
 
 	ClusterID string // 存储 ID
 
 	StorageType string // 存储类型
+
+	StorageIDs  []string
 	StorageID   string
+	StorageName string
+
 	ClusterName string
 	TagsKey     []string
 
+	DataSource string
+	DataLabel  string
+	TableID    string
+	MetricName string
+
 	// vm 的 rt
-	TableID        string
-	VmRt           string
-	IsSingleMetric bool
+	VmRt string
 
 	// 兼容 InfluxDB 结构体
-	RetentionPolicy string   // 存储 RP
-	DB              string   // 存储 DB
-	Measurement     string   // 存储 Measurement
-	Field           string   // 存储 Field
-	Timezone        string   // 存储 Timezone
-	Fields          []string // 存储命中的 Field 列表，一般情况下为一个，当 Field 为模糊匹配时，解析为多个
-	Measurements    []string // 存储命中的 Measurement 列表，一般情况下为一个，当 Measurement 为模糊匹配时，解析为多个
+	RetentionPolicy string    // 存储 RP
+	DB              string    // 存储 DB
+	Measurement     string    // 存储 Measurement
+	Field           string    // 存储 Field
+	TimeField       TimeField // 时间字段
+	Timezone        string    // 存储 Timezone
+	Fields          []string  // 存储命中的 Field 列表，一般情况下为一个，当 Field 为模糊匹配时，解析为多个
+	Measurements    []string  // 存储命中的 Measurement 列表，一般情况下为一个，当 Measurement 为模糊匹配时，解析为多个
 
 	// 用于 promql 查询
-	LabelsMatcher []*labels.Matcher
-	IsHasOr       bool // 标记是否有 or 条件
+	IsHasOr bool // 标记是否有 or 条件
 
-	AggregateMethodList []AggrMethod // 聚合方法列表，从内到外排序
+	Aggregates Aggregates // 聚合方法列表，从内到外排序
 
 	Condition string // 过滤条件
 
-	VmCondition    string
+	// BkSql 过滤条件
+	BkSqlCondition string
+
+	// Vm 过滤条件
+	VmCondition    VmCondition
 	VmConditionNum int
 
 	Filters []map[string]string // 查询中自带查询条件，用于拼接
@@ -85,7 +112,37 @@ type Query struct {
 	OffsetInfo OffSetInfo // limit等偏移量配置
 
 	SegmentedEnable bool // 是否开启分段查询
+
+	// Es 查询扩展
+	QueryString   string
+	AllConditions AllConditions
+
+	HighLight *HighLight
+
+	Source []string
+	From   int
+	Size   int
+
+	Scroll             string
+	ResultTableOptions ResultTableOptions
+
+	Orders      Orders
+	NeedAddTime bool
 }
+
+type HighLight struct {
+	MaxAnalyzedOffset int  `json:"max_analyzed_offset,omitempty"`
+	Enable            bool `json:"enable,omitempty"`
+}
+
+type Order struct {
+	Name string
+	Ast  bool
+}
+
+type Orders []Order
+
+type AllConditions [][]ConditionField
 
 type QueryList []*Query
 
@@ -98,7 +155,37 @@ type QueryMetric struct {
 	IsCount bool // 标记是否为 count 方法
 }
 
-type QueryReference map[string]*QueryMetric
+// ConditionField 过滤条件的字段描述
+type ConditionField struct {
+	// DimensionName 过滤字段
+	DimensionName string
+	// Value 查询值
+	Value []string
+	// Operator 操作符，包含：eq, ne, erq, nreq, contains, ncontains
+	Operator string
+
+	// IsWildcard 是否是通配符
+	IsWildcard bool
+}
+
+// TimeAggregation 时间聚合字段
+type TimeAggregation struct {
+	// Function 时间聚合方法
+	Function string
+	// Window 聚合周期
+	WindowDuration time.Duration
+
+	Without bool
+}
+
+type QueryClusterMetric struct {
+	MetricName      string
+	Aggregates      Aggregates         // 聚合方法列表，从内到外排序
+	Conditions      [][]ConditionField // 用户请求的完整过滤条件，来源 structured 定义
+	TimeAggregation TimeAggregation
+}
+
+type QueryReference map[string][]*QueryMetric
 
 type Queries struct {
 	Query QueryReference
@@ -110,214 +197,185 @@ type Queries struct {
 	directlyResultTable   map[string][]string
 }
 
-// CheckDruidCheck 判断是否是查询 druid 数据
-func (qRef QueryReference) CheckDruidCheck(ctx context.Context) bool {
-	// 判断是否打开 druid-query 特性开关
-	if !GetDruidQueryFeatureFlag(ctx) {
-		return false
+type ReplaceLabels map[string]ReplaceLabel
+
+type ReplaceLabel struct {
+	Source string
+	Target string
+}
+
+func ReplaceVmCondition(condition VmCondition, replaceLabels ReplaceLabels) VmCondition {
+	if len(replaceLabels) == 0 {
+		return condition
 	}
 
-	druidCheckStatus := false
-	for _, reference := range qRef {
-		if len(reference.QueryList) > 0 {
+	expr, err := metricsql.Parse(condition.ToMatch())
+	if err != nil {
+		return condition
+	}
+
+	me, ok := expr.(*metricsql.MetricExpr)
+	if !ok {
+		return condition
+	}
+
+	var cond []byte
+	for i, f := range me.LabelFilterss {
+		var dst []byte
+		for j, l := range f {
+			if rl, exist := replaceLabels[l.Label]; exist {
+				if l.Value == rl.Source {
+					l.Value = rl.Target
+				}
+			}
+
+			if j == 0 {
+				dst = l.AppendString(dst)
+			} else {
+				dst = append(dst, ',', ' ')
+				dst = l.AppendString(dst)
+			}
+		}
+
+		if i == 0 {
+			cond = dst
+		} else {
+			cond = append(cond, " or "...)
+			cond = append(cond, dst...)
+		}
+	}
+
+	return VmCondition(cond)
+}
+
+// ToJson 通过 tableID 排序，并且返回 json 序列化
+func (qMetric QueryMetric) ToJson(isSort bool) string {
+	if isSort {
+		sort.SliceIsSorted(qMetric.QueryList, func(i, j int) bool {
+			return qMetric.QueryList[i].TableID < qMetric.QueryList[j].TableID
+		})
+	}
+
+	s, _ := json.Marshal(qMetric)
+	return string(s)
+}
+
+// Range 遍历查询列表
+func (qRef QueryReference) Range(name string, fn func(qry *Query)) {
+	for refName, references := range qRef {
+		if name != "" {
+			if refName != name {
+				continue
+			}
+		}
+
+		for _, reference := range references {
+			if reference == nil {
+				continue
+			}
 			for _, query := range reference.QueryList {
-				// 如果 vmRT 为空，则不进行判断
+				if query == nil {
+					continue
+				}
+
+				fn(query)
+			}
+		}
+	}
+}
+
+// ToVmExpand 判断是否是直查，如果都是 vm 查询的情况下，则使用直查模式
+func (qRef QueryReference) ToVmExpand(_ context.Context) (vmExpand *VmExpand) {
+	vmClusterNames := set.New[string]()
+	vmResultTable := set.New[string]()
+	metricFilterCondition := make(map[string]string)
+
+	for referenceName, references := range qRef {
+		if len(references) == 0 {
+			continue
+		}
+
+		// 因为是直查，reference 还需要承担聚合语法生成，所以 vm 不支持同指标的拼接，所以这里只取第一个 reference
+		reference := references[0]
+		if 0 < len(reference.QueryList) {
+			vmConditions := set.New[string]()
+			for _, query := range reference.QueryList {
 				if query.VmRt == "" {
 					continue
 				}
 
-				druidDimsStatus := map[string]struct{}{
-					"bk_obj_id":  {},
-					"bk_inst_id": {},
-				}
-
-				tags, _ := ParseCondition(query.Condition)
-
-				for _, tag := range tags {
-					if _, ok := druidDimsStatus[string(tag.Key)]; ok {
-						druidCheckStatus = true
-					}
-				}
-
-				if !druidCheckStatus {
-					for _, amList := range query.AggregateMethodList {
-						for _, amDimension := range amList.Dimensions {
-							if _, ok := druidDimsStatus[amDimension]; ok {
-								druidCheckStatus = true
-								break
-							}
-						}
-					}
-				}
-
-				if druidCheckStatus {
-					// 替换 vmrt 的值
-					oldVmRT := query.VmRt
-					newVmRT := strings.Replace(oldVmRT, "_raw", "_cmdb", 1)
-
-					if newVmRT != oldVmRT {
-						query.VmRt = newVmRT
-					}
-
-					expr, err := metricsql.Parse(fmt.Sprintf(`{%s}`, query.VmCondition))
-					if err != nil {
-						log.Errorf(ctx, fmt.Sprintf("metricsql parse error: %s", err.Error()))
-						return false
-					}
-
-					me, ok := expr.(*metricsql.MetricExpr)
-					if ok {
-						var condition []byte
-						for i, f := range me.LabelFilterss {
-							var dst []byte
-							for j, l := range f {
-								if l.Label == "result_table_id" {
-									l.Value = strings.Replace(l.Value, oldVmRT, newVmRT, 1)
-								}
-
-								if !query.IsSingleMetric {
-									oldMetric := fmt.Sprintf("%s_%s", query.Measurement, query.Field)
-									newMetric := fmt.Sprintf("%s_%s", query.Field, StaticField)
-
-									if l.Label == "__name__" {
-										l.Value = strings.Replace(l.Value, oldMetric, newMetric, 1)
-									}
-								}
-
-								if j == 0 {
-									dst = l.AppendString(dst)
-								} else {
-									dst = append(dst, ',')
-									dst = l.AppendString(dst)
-								}
-							}
-
-							if i == 0 {
-								condition = dst
-							} else {
-								condition = append(condition, " or "...)
-								condition = append(condition, dst...)
-							}
-						}
-						query.VmCondition = string(condition)
-					}
-
-					query.IsSingleMetric = true
-				}
+				vmResultTable.Add(query.VmRt)
+				vmConditions.Add(string(query.VmCondition))
+				vmClusterNames.Add(query.StorageName)
 			}
+
+			filterCondition := ""
+			if vmConditions.Size() > 0 {
+				filterCondition = fmt.Sprintf(`%s`, strings.Join(vmConditions.ToArray(), ` or `))
+			}
+
+			metricFilterCondition[referenceName] = filterCondition
 		}
 	}
 
-	return druidCheckStatus
+	if vmResultTable.Size() == 0 {
+		return
+	}
+
+	vmExpand = &VmExpand{
+		MetricFilterCondition: metricFilterCondition,
+		ResultTableList:       vmResultTable.ToArray(),
+	}
+	sort.Strings(vmExpand.ResultTableList)
+
+	// 当所有的 vm 集群都一样的时候，才进行传递
+	if vmClusterNames.Size() == 1 {
+		vmExpand.ClusterName = vmClusterNames.First()
+	}
+
+	return
 }
 
-// CheckVmQuery 判断是否是查询 vm 数据
-func (qRef QueryReference) CheckVmQuery(ctx context.Context) (bool, *VmExpand, error) {
-	var (
-		span oleltrace.Span
-		err  error
-		ok   bool
+func (vs VmCondition) String() string {
+	return string(vs)
+}
 
-		vmExpand = &VmExpand{
-			MetricAliasMapping:    make(map[string]string),
-			MetricFilterCondition: make(map[string]string),
-			ResultTableGroup:      make(map[string][]string),
-			LabelsMatcher:         make(map[string][]*labels.Matcher),
-			ConditionNum:          0,
+func (vs VmCondition) ToMatch() string {
+	return fmt.Sprintf("{%s}", vs)
+}
+
+// LastAggName 获取最新的聚合函数
+func (a Aggregates) LastAggName() string {
+	if len(a) == 0 {
+		return ""
+	}
+
+	return a[len(a)-1].Name
+}
+
+func (os Orders) SortSliceList(list []map[string]any) {
+	if len(os) == 0 {
+		return
+	}
+	if len(list) == 0 {
+		return
+	}
+
+	sort.SliceStable(list, func(i, j int) bool {
+		for _, o := range os {
+			a, _ := list[i][o.Name].(string)
+			b, _ := list[j][o.Name].(string)
+
+			if a != b {
+				if o.Ast {
+					r := a < b
+					return r
+				} else {
+					r := a > b
+					return r
+				}
+			}
 		}
-	)
-	ctx, span = trace.IntoContext(ctx, trace.TracerName, "check-vm-query")
-	if span != nil {
-		defer span.End()
-	}
-
-	// 特性开关 vm or 语法查询
-	vmQueryFeatureFlag := GetVMQueryFeatureFlag(ctx)
-	druidQueryStatus := qRef.CheckDruidCheck(ctx)
-
-	// 未开启 vm-query 特性开关 并且 不是 druid-query ，则不使用 vm 查询能力
-	if !vmQueryFeatureFlag && !druidQueryStatus {
-		return ok, vmExpand, err
-	}
-
-	isOrQuery := false
-
-	for referenceName, reference := range qRef {
-		if 0 < len(reference.QueryList) {
-			var (
-				metricName string
-				vmRts      = make(map[string]struct{})
-			)
-
-			trace.InsertIntIntoSpan(fmt.Sprintf("result_table_%s_num", referenceName), len(reference.QueryList), span)
-
-			vmConditions := make(map[string]struct{})
-
-			for _, query := range reference.QueryList {
-				// 获取 vm 的指标名
-				metricName = fmt.Sprintf("%s_%s", query.Measurement, query.Field)
-
-				// 只有全部为单指标单表
-				if !query.IsSingleMetric {
-					return ok, vmExpand, err
-				}
-
-				// 开启 vm rt 才进行 vm 查询
-				if query.VmRt != "" {
-					if query.IsHasOr {
-						isOrQuery = query.IsHasOr
-					}
-
-					if query.VmCondition != "" {
-						vmConditions[query.VmCondition] = struct{}{}
-					}
-
-					vmExpand.ConditionNum += query.VmConditionNum
-
-					// labels matcher 不支持 or 语法，所以只取一个
-					if len(query.LabelsMatcher) > 0 {
-						vmExpand.LabelsMatcher[referenceName] = query.LabelsMatcher
-					}
-
-					// 获取 vm 对应的 rt 列表
-					vmRts[query.VmRt] = struct{}{}
-				}
-			}
-
-			metricFilterCondition := ""
-			if len(vmConditions) > 0 {
-				vmc := make([]string, 0, len(vmConditions))
-				for k := range vmConditions {
-					vmc = append(vmc, k)
-				}
-
-				metricFilterCondition = fmt.Sprintf(`%s`, strings.Join(vmc, ` or `))
-				if len(vmConditions) > 1 {
-					isOrQuery = true
-				}
-			}
-
-			vmExpand.MetricFilterCondition[referenceName] = metricFilterCondition
-			vmExpand.MetricAliasMapping[referenceName] = metricName
-
-			if len(vmRts) == 0 {
-				err = fmt.Errorf("vm query result table is empty %s", metricName)
-				break
-			}
-
-			if vmExpand.ResultTableGroup[referenceName] == nil {
-				vmExpand.ResultTableGroup[referenceName] = make([]string, 0)
-			}
-			for k := range vmRts {
-				vmExpand.ResultTableGroup[referenceName] = append(vmExpand.ResultTableGroup[referenceName], k)
-			}
-
-			sort.Strings(vmExpand.ResultTableGroup[referenceName])
-		}
-	}
-
-	trace.InsertStringIntoSpan("vm-query-or", fmt.Sprintf("%v", isOrQuery), span)
-
-	ok = true
-	return ok, vmExpand, err
+		return true
+	})
 }

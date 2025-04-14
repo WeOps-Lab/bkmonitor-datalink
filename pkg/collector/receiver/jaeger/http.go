@@ -37,8 +37,11 @@ func init() {
 	receiver.RegisterReadyFunc(define.SourceJaeger, Ready)
 }
 
-func Ready() {
-	receiver.RegisterHttpRoute(define.SourceJaeger, []receiver.RouteWithFunc{
+func Ready(config receiver.ComponentConfig) {
+	if !config.Jaeger.Enabled {
+		return
+	}
+	receiver.RegisterRecvHttpRoute(define.SourceJaeger, []receiver.RouteWithFunc{
 		{
 			Method:       http.MethodPost,
 			RelativePath: routeJaegerTraces,
@@ -46,7 +49,7 @@ func Ready() {
 		},
 	})
 
-	receiver.RegisterGrpcRoute(func(s *grpc.Server) {
+	receiver.RegisterRecvGrpcRoute(func(s *grpc.Server) {
 		api_v2.RegisterCollectorServiceServer(s, GrpcService{})
 	})
 }
@@ -58,9 +61,9 @@ type HttpService struct {
 
 var httpSvc HttpService
 
-var acceptedThriftFormats = map[string]struct{}{
-	"application/x-thrift":                 {},
-	"application/vnd.apache.thrift.binary": {},
+var acceptedFormats = map[string]Encoder{
+	"application/x-thrift":                 newThriftV1Encoder(),
+	"application/vnd.apache.thrift.binary": newThriftV1Encoder(),
 }
 
 func (s HttpService) JaegerTraces(w http.ResponseWriter, req *http.Request) {
@@ -80,12 +83,11 @@ func (s HttpService) JaegerTraces(w http.ResponseWriter, req *http.Request) {
 		_ = req.Body.Close()
 	}()
 
-	traces, httpCode, err := decodeThriftHTTPBody(buf.Bytes(), req.Header.Get("Content-Type"))
+	traces, httpCode, err := decodeHTTPBody(buf.Bytes(), req.Header.Get("Content-Type"))
 	if err != nil {
-		err = errors.Wrapf(err, "failed to parse jaeger exported content, ip=%v", ip)
-		logger.Warn(err)
+		logger.Warnf("failed to parse jaeger exported content, ip=%v, err: %v", ip, err)
 		metricMonitor.IncDroppedCounter(define.RequestHttp, define.RecordTraces)
-		receiver.WriteResponse(w, define.ContentTypeJson, httpCode, []byte(err.Error()))
+		receiver.WriteErrResponse(w, define.ContentTypeJson, httpCode, err)
 		return
 	}
 
@@ -102,7 +104,7 @@ func (s HttpService) JaegerTraces(w http.ResponseWriter, req *http.Request) {
 		err = errors.Wrapf(err, "run pre-check failed, rtype=traces, code=%d, ip=%s", code, ip)
 		logger.WarnRate(time.Minute, r.Token.Original, err)
 		metricMonitor.IncPreCheckFailedCounter(define.RequestHttp, define.RecordTraces, processorName, r.Token.Original, code)
-		receiver.WriteResponse(w, define.ContentTypeJson, int(code), []byte(err.Error()))
+		receiver.WriteErrResponse(w, define.ContentTypeJson, int(code), err)
 		return
 	}
 
@@ -110,19 +112,20 @@ func (s HttpService) JaegerTraces(w http.ResponseWriter, req *http.Request) {
 	receiver.RecordHandleMetrics(metricMonitor, r.Token, define.RequestHttp, define.RecordTraces, buf.Len(), start)
 }
 
-func decodeThriftHTTPBody(bs []byte, ctype string) (ptrace.Traces, int, error) {
+func decodeHTTPBody(bs []byte, ctype string) (ptrace.Traces, int, error) {
 	contentType, _, err := mime.ParseMediaType(ctype)
 	if err != nil {
 		return ptrace.Traces{}, http.StatusBadRequest, err
 	}
 
-	if _, ok := acceptedThriftFormats[contentType]; !ok {
+	encoder, ok := acceptedFormats[contentType]
+	if !ok {
 		return ptrace.Traces{}, http.StatusBadRequest, errors.Errorf("unsupported content type: %v", contentType)
 	}
 
-	traces, err := newThriftV1Encoder().UnmarshalTraces(bs)
+	traces, err := encoder.UnmarshalTraces(bs)
 	if err != nil {
-		return ptrace.Traces{}, http.StatusBadRequest, errors.Errorf("unable to process request body: %v", err)
+		return ptrace.Traces{}, http.StatusBadRequest, errors.Wrap(err, "unmarshal request body failed")
 	}
 
 	return traces, http.StatusOK, nil

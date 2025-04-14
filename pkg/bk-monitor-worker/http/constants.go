@@ -10,8 +10,17 @@
 package http
 
 const (
-	// 异步任务
+	// AsyncTask 异步任务
 	AsyncTask = "async"
-	// 周期任务
+	// PeriodicTask 周期任务
 	PeriodicTask = "periodic"
+	// DaemonTask 常驻任务
+	DaemonTask = "daemon"
+	// 路由前缀
+	RouterPrefix     = "/bmw"
+	TaskRouterPrefix = "/task"
+	// DeleteAllTaskPath 删除所有任务
+	DeleteAllTaskPath = "/all"
+	// DaemonTaskReloadPath 常驻任务重载(重新启动)
+	DaemonTaskReloadPath = "/daemon/reload"
 )

@@ -12,13 +12,16 @@ package models
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strconv"
 	"time"
 
 	"github.com/jinzhu/gorm"
+	"github.com/pkg/errors"
 
+	cfg "github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/config"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/store/consul"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/store/dependentredis"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/store/redis"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/utils/jsonx"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/logger"
 )
@@ -33,6 +36,32 @@ type OptionBase struct {
 // BeforeCreate 新建前时间字段设置为当前时间
 func (r *OptionBase) BeforeCreate(tx *gorm.DB) error {
 	r.CreateTime = time.Now()
+	return nil
+}
+
+type BaseModel struct {
+	Creator    string    `gorm:"column:creator" json:"creator"`
+	CreateTime time.Time `gorm:"column:create_time" json:"create_time"`
+	Updater    string    `gorm:"column:updater" json:"updater"`
+	UpdateTime time.Time `gorm:"column:update_time" json:"update_time"`
+}
+
+// BeforeCreate 新建前时间字段设置为当前时间
+func (b *BaseModel) BeforeCreate(tx *gorm.DB) error {
+	b.CreateTime = time.Now()
+	b.UpdateTime = time.Now()
+	if b.Creator == "" {
+		b.Creator = SystemUser
+	}
+	if b.Updater == "" {
+		b.Updater = SystemUser
+	}
+	return nil
+}
+
+// BeforeUpdate 保存前最后修改时间字段设置为当前时间
+func (b *BaseModel) BeforeUpdate(tx *gorm.DB) error {
+	b.UpdateTime = time.Now()
 	return nil
 }
 
@@ -55,41 +84,62 @@ func (r *OptionBase) InterfaceValue() (interface{}, error) {
 	}
 }
 
-// PushToRedis 推送数据到 redis
-func PushToRedis(ctx context.Context, key, field, value string, isPublish bool) {
-	client, err := dependentredis.GetInstance(ctx)
-	if err != nil {
-		logger.Errorf("get redis client error, %v", err)
-		return
+// ParseOptionValue 解析option的interface{}的类型
+func ParseOptionValue(value interface{}) (string, string, error) {
+	if value == nil {
+		return "", "", errors.New("ParseOptionValue value can not be nil")
 	}
-
-	redisKey := fmt.Sprintf("%s:%s", InfluxdbKeyPrefix, key)
-	msgSuffix := fmt.Sprintf("key: %s, field: %s, value: %s", redisKey, field, value)
-
-	err = client.HSet(redisKey, field, value)
+	valueStr, err := jsonx.MarshalString(value)
 	if err != nil {
-		logger.Errorf("push redis failed, %s, err: %v", msgSuffix, err)
-	} else {
-		logger.Infof("push redis successfully, %s", msgSuffix)
+		return "", "", err
 	}
-	if isPublish {
-		err := client.Publish(InfluxdbKeyPrefix, key)
-		if err != nil {
-			logger.Errorf("publish redis failed, channel: %s, msg: %s, %s", InfluxdbKeyPrefix, key, err)
-		} else {
-			logger.Infof("publish redis successfully, channel: %s, msg: %s", InfluxdbKeyPrefix, key)
+	switch reflect.TypeOf(value).Kind() {
+	case reflect.Bool:
+		return valueStr, "bool", nil
+	case reflect.Slice, reflect.Array:
+		return valueStr, "list", nil
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64:
+		return valueStr, "int", nil
+	case reflect.Map:
+		return valueStr, "dict", nil
+	case reflect.String:
+		valueStr, ok := value.(string)
+		if !ok {
+			return "", "", errors.Errorf("assert string value type error, %#v", value)
 		}
+		return valueStr, "string", nil
+	default:
+		return "", "", errors.Errorf("unsupport option value type [%s], value [%v]", reflect.TypeOf(value).Kind().String(), value)
+	}
+}
+
+// PushToRedis 推送数据到 redis, just for influxdb
+func PushToRedis(ctx context.Context, key, field, value string) {
+	client := redis.GetStorageRedisInstance()
+	logger.Infof("PushToRedis: push redis, key->[%s], field->[%s]", key, field)
+	redisKey := fmt.Sprintf("%s%s:%s", InfluxdbKeyPrefix, cfg.BypassSuffixPath, key)
+	msgSuffix := fmt.Sprintf("key: %s, field: %s, value: %s", redisKey, field, value)
+	channelName := fmt.Sprintf("%s%s", InfluxdbKeyPrefix, cfg.BypassSuffixPath)
+	logger.Infof("PushToRedis: start push redis, key->[%s], field->[%s],value->[%s],channel_name->[%s],channel_key->[%s]", redisKey, field, value, channelName, key)
+	isSuccess, err := client.HSetWithCompareAndPublish(redisKey, field, value, channelName, key)
+	logger.Infof("PushToRedis: push redis, key->[%s], field->[%s],isSuccess:->[%v]", key, field, isSuccess)
+	if err != nil {
+		logger.Errorf("PushToRedis: push redis failed, %s, err: %v", msgSuffix, err)
+	} else {
+		logger.Infof("PushToRedis: push redis successfully, %s", msgSuffix)
 	}
 }
 
 // RefreshRouterVersion 更新consul中的version
 func RefreshRouterVersion(ctx context.Context, path string) error {
-	client, err := consul.GetInstance(ctx)
+	client, err := consul.GetInstance()
 	if err != nil {
 		return err
 	}
 	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
-	err = client.Put(path, timestamp, 0)
+	err = client.Put(path, timestamp, 0, 0)
 	if err != nil {
 		return err
 	}
@@ -100,4 +150,30 @@ func RefreshRouterVersion(ctx context.Context, path string) error {
 // IsBuildInDataId 检查是否为内置data_id
 func IsBuildInDataId(bkDataId uint) bool {
 	return (1000 <= bkDataId && bkDataId <= 1020) || (1100000 <= bkDataId && bkDataId <= 1199999)
+}
+
+type BaseModelWithTime struct {
+	Creator  string    `gorm:"column:creator" json:"creator"`
+	CreateAt time.Time `gorm:"column:create_at" json:"create_at"`
+	Updater  string    `gorm:"column:updater" json:"updater"`
+	UpdateAt time.Time `gorm:"column:update_at" json:"update_at"`
+}
+
+// BeforeCreate 新建前时间字段设置为当前时间
+func (b *BaseModelWithTime) BeforeCreate(tx *gorm.DB) error {
+	b.CreateAt = time.Now()
+	b.UpdateAt = time.Now()
+	if b.Creator == "" {
+		b.Creator = SystemUser
+	}
+	if b.Updater == "" {
+		b.Updater = SystemUser
+	}
+	return nil
+}
+
+// BeforeUpdate 保存前最后修改时间字段设置为当前时间
+func (b *BaseModelWithTime) BeforeUpdate(tx *gorm.DB) error {
+	b.UpdateAt = time.Now()
+	return nil
 }

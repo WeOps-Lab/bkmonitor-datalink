@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,13 +47,15 @@ type SpaceTsDbRouter struct {
 	kvBucketName string
 	kvPath       string
 	kvClient     kvstore.KVStore
-	cache        memcache.Cache
-	hasInit      bool
-	batchSize    int
+
+	isCache   bool
+	cache     memcache.Cache
+	hasInit   bool
+	batchSize int
 }
 
 // SetSpaceTsDbRouter 设置全局可用的 Router 单例，用于管理空间数据
-func SetSpaceTsDbRouter(ctx context.Context, kvPath string, kvBucketName string, routerPrefix string, batchSize int) (*SpaceTsDbRouter, error) {
+func SetSpaceTsDbRouter(ctx context.Context, kvPath string, kvBucketName string, routerPrefix string, batchSize int, isCache bool) (*SpaceTsDbRouter, error) {
 	globalSpaceTsDbRouterLock.Lock()
 	defer globalSpaceTsDbRouterLock.Unlock()
 	if globalSpaceTsDbRouter != nil {
@@ -66,6 +69,7 @@ func SetSpaceTsDbRouter(ctx context.Context, kvPath string, kvBucketName string,
 		kvPath:       kvPath,
 		routerPrefix: routerPrefix,
 		batchSize:    batchSize,
+		isCache:      isCache,
 	}
 	err := globalSpaceTsDbRouter.initRouter(ctx)
 	if err != nil {
@@ -81,11 +85,22 @@ func GetSpaceTsDbRouter() (*SpaceTsDbRouter, error) {
 	return globalSpaceTsDbRouter, nil
 }
 
-func (r *SpaceTsDbRouter) BatchAdd(ctx context.Context, stoPrefix string, entities []influxdb.GenericKV, interrupt bool) error {
+// BatchItemMeta 一个批次每个元素的更新情况
+type BatchItemMeta struct {
+	key string
+	val influxdb.GenericValue
+}
+
+func (m *BatchItemMeta) Print() string {
+	return fmt.Sprintf("Meta{key=%s, update=%s}", m.key, m.val.Print())
+}
+
+func (r *SpaceTsDbRouter) BatchAdd(ctx context.Context, stoPrefix string, entities []influxdb.GenericKV, once bool, printBytes bool) error {
 	keys := make([][]byte, 0)
 	values := make([][]byte, 0)
-	createdKeys := make([]string, 0)
-	updatedKeys := make([]string, 0)
+	batchItems := make([]*BatchItemMeta, 0)
+	createdCount := 0
+	updatedCount := 0
 	for _, entity := range entities {
 		var (
 			keyNotFound bool
@@ -95,7 +110,7 @@ func (r *SpaceTsDbRouter) BatchAdd(ctx context.Context, stoPrefix string, entiti
 		if err != nil {
 			log.Errorf(
 				ctx, "Fail to parse value for MarshalMsg, %+v, error: %v", entity, err)
-			if interrupt {
+			if once {
 				return err
 			}
 			continue
@@ -109,20 +124,20 @@ func (r *SpaceTsDbRouter) BatchAdd(ctx context.Context, stoPrefix string, entiti
 			}
 		}
 		if bytes.Equal(rawV, v) {
-			log.Debugf(ctx, "No change and not to write, %s", k)
 			continue
 		}
 		if keyNotFound {
-			createdKeys = append(createdKeys, k)
+			createdCount += 1
 		} else {
-			updatedKeys = append(updatedKeys, k)
+			updatedCount += 1
 		}
+		batchItems = append(batchItems, &BatchItemMeta{key: k, val: entity.Val})
 		keys = append(keys, kvstore.String2byte(k))
 		values = append(values, v)
 	}
 
 	// 如果变更和新增都为空则不处理该逻辑
-	if len(createdKeys) == 0 && len(updatedKeys) == 0 {
+	if createdCount == 0 && updatedCount == 0 {
 		return nil
 	}
 
@@ -130,12 +145,24 @@ func (r *SpaceTsDbRouter) BatchAdd(ctx context.Context, stoPrefix string, entiti
 	if err != nil {
 		return err
 	}
-	metric.SpaceRequestCountAdd(ctx, float64(len(createdKeys)), stoPrefix, metric.SpaceTypeBolt, metric.SpaceActionCreate)
-	metric.SpaceRequestCountAdd(ctx, float64(len(updatedKeys)), stoPrefix, metric.SpaceTypeBolt, metric.SpaceActionWrite)
-	for _, uk := range updatedKeys {
-		r.cache.Del(uk)
+	// 记录更新日志
+	log.Debugf(ctx, "[SpaceTSDB] Write count in kvStorage, once=%v, key=%s, %d created, %d updated", once, stoPrefix, createdCount, updatedCount)
+
+	// 更新成功的对象，需要进行额外操作
+	// 1. 清理对应的缓存
+	// 2. 针对 ResultTableDetail 记录元数据情况
+	// 3. 打印更新的对象内容
+	for _, item := range batchItems {
+		r.cache.Del(item.key)
+		if rt, ok := item.val.(*influxdb.ResultTableDetail); ok {
+			metric.ResultTableInfoSet(
+				ctx, float64(len(rt.Fields)), rt.TableId, strconv.FormatInt(rt.DataId, 10), rt.MeasurementType,
+				rt.VmRt, rt.BcsClusterID)
+		}
+		if printBytes {
+			log.Debugf(ctx, "[SpaceTSDB] Write content in kvStorage, once=%v, %s", once, item.Print())
+		}
 	}
-	log.Debugf(ctx, "Write KVStorage in key(%s), %d created, %d updated", stoPrefix, len(createdKeys), len(updatedKeys))
 	return nil
 }
 
@@ -143,21 +170,20 @@ func (r *SpaceTsDbRouter) BatchAdd(ctx context.Context, stoPrefix string, entiti
 func (r *SpaceTsDbRouter) Add(ctx context.Context, stoPrefix string, stoKey string, stoValue influxdb.GenericValue) error {
 	entities := make([]influxdb.GenericKV, 0, 1)
 	entities = append(entities, influxdb.GenericKV{Key: stoKey, Val: stoValue})
-	return r.BatchAdd(ctx, stoPrefix, entities, true)
+	return r.BatchAdd(ctx, stoPrefix, entities, true, true)
 }
 
 // Get a space data from db
-func (r *SpaceTsDbRouter) Get(ctx context.Context, stoPrefix string, stoKey string, cached bool) influxdb.GenericValue {
+func (r *SpaceTsDbRouter) Get(ctx context.Context, stoPrefix string, stoKey string, cached bool, ignoreKeyNotFound bool) influxdb.GenericValue {
 	stoKey = fmt.Sprintf("%s:%s", stoPrefix, stoKey)
 	stoVal, err := influxdb.NewGenericValue(stoPrefix)
 	if err != nil {
 		log.Warnf(ctx, "Fail to new generic value, %s", err)
 		return nil
 	}
-	if cached {
+	if cached && r.isCache {
 		data, exist := r.cache.Get(stoKey)
 		if exist {
-			metric.SpaceRequestCountInc(ctx, stoPrefix, metric.SpaceTypeCache, metric.SpaceActionRead)
 			// 存入缓存的数据可能有 nil 情况，需要兼容
 			if data == nil {
 				return nil
@@ -169,11 +195,12 @@ func (r *SpaceTsDbRouter) Get(ctx context.Context, stoPrefix string, stoKey stri
 			log.Warnf(ctx, "Fail to unSerialize cached data, %s, %v", stoKey, data)
 		}
 	}
-	metric.SpaceRequestCountInc(ctx, stoPrefix, metric.SpaceTypeBolt, metric.SpaceActionRead)
 	v, err := r.kvClient.Get(kvstore.String2byte(stoKey))
 	if err != nil {
 		if err.Error() == "keyNotFound" {
-			log.Infof(ctx, "Key(%s) not found in KVBolt", stoKey)
+			if !ignoreKeyNotFound {
+				log.Debugf(ctx, "Key(%s) not found in KVBolt", stoKey)
+			}
 		} else {
 			log.Warnf(ctx, "Fail to get value in KVBolt, key: %s, error: %v", stoKey, err)
 		}
@@ -185,7 +212,7 @@ func (r *SpaceTsDbRouter) Get(ctx context.Context, stoPrefix string, stoKey stri
 		}
 	}
 	// 添加缓存
-	if cached {
+	if cached && r.isCache {
 		// NOTE: 暂时使用 20 作为随机
 		expiredTime := viper.GetInt64(memcache.RistrettoExpiredTimePath) + rand.Int63n(viper.GetInt64(memcache.RistrettoExpiredTimeFluxValuePath))
 		r.cache.SetWithTTL(stoKey, stoVal, 0, time.Duration(expiredTime)*time.Minute)
@@ -231,9 +258,9 @@ func (r *SpaceTsDbRouter) RouterSubscribe(ctx context.Context) <-chan *goRedis.M
 	return r.router.SubscribeChannels(ctx, influxdb.SpaceChannelKeys...)
 }
 
-func (r *SpaceTsDbRouter) ReloadAllKey(ctx context.Context) error {
+func (r *SpaceTsDbRouter) ReloadAllKey(ctx context.Context, printBytes bool) error {
 	for _, k := range influxdb.SpaceAllKey {
-		err := r.LoadRouter(ctx, k)
+		err := r.LoadRouter(ctx, k, printBytes)
 		if err != nil {
 			return err
 		}
@@ -248,6 +275,12 @@ func (r *SpaceTsDbRouter) ReloadByChannel(ctx context.Context, channelKey string
 		channelKey = channelKey[len(r.routerPrefix)+1:]
 	}
 	switch channelKey {
+	case influxdb.BkAppToSpaceChannelKey:
+		spaceUidList, err := r.router.GetBkAppSpace(ctx, hashKey)
+		if err != nil {
+			return err
+		}
+		err = r.Add(ctx, influxdb.BkAppToSpaceKey, hashKey, &spaceUidList)
 	case influxdb.SpaceToResultTableChannelKey:
 		space, err := r.router.GetSpace(ctx, hashKey)
 		if err != nil {
@@ -290,12 +323,12 @@ func (r *SpaceTsDbRouter) ReloadByChannel(ctx context.Context, channelKey string
 	return nil
 }
 
-func (r *SpaceTsDbRouter) LoadRouter(ctx context.Context, key string) error {
+func (r *SpaceTsDbRouter) LoadRouter(ctx context.Context, key string, printBytes bool) error {
 	r.rwLock.Lock()
 	defer r.rwLock.Unlock()
 	start := time.Now()
 	defer func() {
-		log.Infof(ctx, "[SpaceTSDB] Load key(%s), time cost: %s", key, time.Since(start))
+		log.Debugf(ctx, "[SpaceTSDB] Load key(%s), time cost: %s", key, time.Since(start))
 	}()
 	var (
 		err error
@@ -323,7 +356,7 @@ func (r *SpaceTsDbRouter) LoadRouter(ctx context.Context, key string) error {
 			}
 			if !ok || count%batchSize == 0 {
 				log.Debugf(ctx, "Read %v entities from key(%s) channel", len(entities), key)
-				err = r.BatchAdd(ctx, key, entities, false)
+				err = r.BatchAdd(ctx, key, entities, false, printBytes)
 				if err != nil {
 					log.Errorf(ctx, "Fail to add batch from key(%s), %v", key, err)
 				}
@@ -366,9 +399,19 @@ func (r *SpaceTsDbRouter) Stop() error {
 	return nil
 }
 
+// GetSpaceUIDList 获取 bkAppCode 下的空间信息
+func (r *SpaceTsDbRouter) GetSpaceUIDList(ctx context.Context, bkAppCode string) *influxdb.SpaceUIDList {
+	genericRet := r.Get(ctx, influxdb.BkAppToSpaceKey, bkAppCode, true, true)
+	if genericRet != nil {
+		return genericRet.(*influxdb.SpaceUIDList)
+
+	}
+	return nil
+}
+
 // GetSpace 获取空间信息
 func (r *SpaceTsDbRouter) GetSpace(ctx context.Context, spaceID string) influxdb.Space {
-	genericRet := r.Get(ctx, influxdb.SpaceToResultTableKey, spaceID, true)
+	genericRet := r.Get(ctx, influxdb.SpaceToResultTableKey, spaceID, true, false)
 	if genericRet != nil {
 		return *genericRet.(*influxdb.Space)
 	}
@@ -376,8 +419,8 @@ func (r *SpaceTsDbRouter) GetSpace(ctx context.Context, spaceID string) influxdb
 }
 
 // GetResultTable 获取 RT 详情
-func (r *SpaceTsDbRouter) GetResultTable(ctx context.Context, tableID string) *influxdb.ResultTableDetail {
-	genericRet := r.Get(ctx, influxdb.ResultTableDetailKey, tableID, true)
+func (r *SpaceTsDbRouter) GetResultTable(ctx context.Context, tableID string, ignoreKeyNotFound bool) *influxdb.ResultTableDetail {
+	genericRet := r.Get(ctx, influxdb.ResultTableDetailKey, tableID, true, ignoreKeyNotFound)
 	if genericRet != nil {
 		return genericRet.(*influxdb.ResultTableDetail)
 	}
@@ -386,7 +429,7 @@ func (r *SpaceTsDbRouter) GetResultTable(ctx context.Context, tableID string) *i
 
 // GetDataLabelRelatedRts 获取 DataLabel 详情，仅包含映射的 RT 信息
 func (r *SpaceTsDbRouter) GetDataLabelRelatedRts(ctx context.Context, dataLabel string) influxdb.ResultTableList {
-	genericRet := r.Get(ctx, influxdb.DataLabelToResultTableKey, dataLabel, true)
+	genericRet := r.Get(ctx, influxdb.DataLabelToResultTableKey, dataLabel, true, false)
 	if genericRet != nil {
 		return *genericRet.(*influxdb.ResultTableList)
 	}
@@ -395,7 +438,7 @@ func (r *SpaceTsDbRouter) GetDataLabelRelatedRts(ctx context.Context, dataLabel 
 
 // GetFieldRelatedRts 获取 Field 指标详情，仅包含映射的 RT 信息
 func (r *SpaceTsDbRouter) GetFieldRelatedRts(ctx context.Context, field string) influxdb.ResultTableList {
-	genericRet := r.Get(ctx, influxdb.FieldToResultTableKey, field, true)
+	genericRet := r.Get(ctx, influxdb.FieldToResultTableKey, field, true, false)
 	if genericRet != nil {
 		return *genericRet.(*influxdb.ResultTableList)
 	}

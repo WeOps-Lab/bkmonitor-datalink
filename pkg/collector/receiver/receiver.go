@@ -10,12 +10,16 @@
 package receiver
 
 import (
+	"context"
 	"crypto/tls"
 	"net"
 	"net/http"
 	"sync"
 	"time"
 
+	"github.com/TarsCloud/TarsGo/tars"
+	tarstransport "github.com/TarsCloud/TarsGo/tars/transport"
+	"github.com/TarsCloud/TarsGo/tars/util/tools"
 	"github.com/elastic/beats/libbeat/common/transport/tlscommon"
 	"github.com/elastic/beats/libbeat/outputs/transport"
 	"github.com/pkg/errors"
@@ -32,10 +36,12 @@ import (
 type Receiver struct {
 	wg sync.WaitGroup
 
-	httpServer *http.Server
-	httpTls    *transport.TLSConfig
-	grpcServer *grpc.Server
-	config     Config
+	config      Config
+	adminServer *http.Server // 管理员服务 一般不对外暴露
+	recvServer  *http.Server // 接收服务
+	recvTls     *transport.TLSConfig
+	grpcServer  *grpc.Server
+	tarsServer  *tarstransport.TarsServer
 }
 
 var (
@@ -93,8 +99,8 @@ func New(conf *confengine.Config) (*Receiver, error) {
 	logger.Infof("receiver config: %+v", c)
 
 	var tlsConfig *tlscommon.TLSConfig
-	if c.HttpServer.TLS != nil {
-		if tlsConfig, err = tlscommon.LoadTLSServerConfig(c.HttpServer.TLS); err != nil {
+	if c.RecvServer.TLS != nil {
+		if tlsConfig, err = tlscommon.LoadTLSServerConfig(c.RecvServer.TLS); err != nil {
 			return nil, err
 		}
 		logger.Infof("receiver start httpserver with tls config: %+v", tlsConfig)
@@ -106,9 +112,14 @@ func New(conf *confengine.Config) (*Receiver, error) {
 
 	return &Receiver{
 		config:  c,
-		httpTls: tlsConfig,
-		httpServer: &http.Server{
-			Handler:      HttpRouter(),
+		recvTls: tlsConfig,
+		recvServer: &http.Server{
+			Handler:      RecvHttpRouter(),
+			ReadTimeout:  time.Minute * 5, // 读超时
+			WriteTimeout: time.Minute * 5, // 写超时
+		},
+		adminServer: &http.Server{
+			Handler:      AdminHttpRouter(),
 			ReadTimeout:  time.Minute * 5, // 读超时
 			WriteTimeout: time.Minute * 5, // 写超时
 		},
@@ -116,33 +127,10 @@ func New(conf *confengine.Config) (*Receiver, error) {
 }
 
 func (r *Receiver) ready() {
+	config := GetComponentConfig()
 	for k, f := range componentsReady {
-		switch k {
-		case define.SourceJaeger:
-			if GetComponentConfig().Jaeger.Enabled {
-				f()
-			}
-		case define.SourceOtlp:
-			if GetComponentConfig().Otlp.Enabled {
-				f()
-			}
-		case define.SourcePushGateway:
-			if GetComponentConfig().PushGateway.Enabled {
-				f()
-			}
-		case define.SourceRemoteWrite:
-			if GetComponentConfig().RemoteWrite.Enabled {
-				f()
-			}
-		case define.SourceZipkin:
-			if GetComponentConfig().Zipkin.Enabled {
-				f()
-			}
-		case define.SourceSkywalking:
-			if GetComponentConfig().Skywalking.Enabled {
-				f()
-			}
-		}
+		f(config)
+		logger.Infof("register '%s' component", k)
 	}
 }
 
@@ -150,24 +138,24 @@ func (r *Receiver) Reload(conf *confengine.Config) {
 	globalSkywalkingConfig = LoadConfigFrom(conf)
 }
 
-func (r *Receiver) startHttpServer() error {
-	for _, mid := range r.config.HttpServer.Middlewares {
+func (r *Receiver) startRecvHttpServer() error {
+	for _, mid := range r.config.RecvServer.Middlewares {
 		fn := httpmiddleware.Get(mid)
 		if fn != nil {
-			logger.Debugf("receiver/http use '%s' middleware", mid)
-			r.httpServer.Handler = fn(r.httpServer.Handler)
+			logger.Debugf("receiver/recv-http use '%s' middleware", mid)
+			r.recvServer.Handler = fn(r.recvServer.Handler)
 		}
 	}
 
-	endpoint := r.config.HttpServer.Endpoint
-	logger.Infof("start to listen http server at: %v", endpoint)
-	if r.httpTls != nil {
-		c := r.httpTls.BuildModuleConfig(endpoint)
+	endpoint := r.config.RecvServer.Endpoint
+	logger.Infof("start to listen http recv server at: %v", endpoint)
+	if r.recvTls != nil {
+		c := r.recvTls.BuildModuleConfig(endpoint)
 		l, err := tls.Listen("tcp", endpoint, c)
 		if err != nil {
 			return err
 		}
-		return r.httpServer.Serve(l)
+		return r.recvServer.Serve(l)
 	}
 
 	l, err := net.Listen("tcp", endpoint)
@@ -175,8 +163,28 @@ func (r *Receiver) startHttpServer() error {
 		return err
 	}
 
-	logger.Infof("register http route: %+v", HttpRoutes())
-	return r.httpServer.Serve(l)
+	logger.Infof("register recv http route: %+v", RecvHttpRoutes())
+	return r.recvServer.Serve(l)
+}
+
+func (r *Receiver) starAdminHttpServer() error {
+	for _, mid := range r.config.AdminServer.Middlewares {
+		fn := httpmiddleware.Get(mid)
+		if fn != nil {
+			logger.Debugf("receiver/admin-http use '%s' middleware", mid)
+			r.adminServer.Handler = fn(r.adminServer.Handler)
+		}
+	}
+
+	endpoint := r.config.AdminServer.Endpoint
+	logger.Infof("start to listen http admin server at: %v", endpoint)
+	l, err := net.Listen("tcp", endpoint)
+	if err != nil {
+		return err
+	}
+
+	logger.Infof("register http admin route: %+v", AdminHttpRoutes())
+	return r.adminServer.Serve(l)
 }
 
 func (r *Receiver) startGrpcServer() error {
@@ -204,27 +212,69 @@ func (r *Receiver) startGrpcServer() error {
 	return r.grpcServer.Serve(l)
 }
 
+func (r *Receiver) startTarsServer() error {
+	endpoint := r.config.TarsServer.Endpoint
+	logger.Infof("start to listen tars server at: %v", endpoint)
+
+	conf := &tarstransport.TarsServerConf{
+		Proto:          r.config.TarsServer.Transport,
+		Address:        endpoint,
+		MaxInvoke:      tars.MaxInvoke,
+		AcceptTimeout:  tools.ParseTimeOut(tars.AcceptTimeout),
+		ReadTimeout:    tools.ParseTimeOut(tars.ReadTimeout),
+		WriteTimeout:   tools.ParseTimeOut(tars.WriteTimeout),
+		HandleTimeout:  tools.ParseTimeOut(tars.HandleTimeout),
+		IdleTimeout:    tools.ParseTimeOut(tars.IdleTimeout),
+		QueueCap:       tars.QueueCap,
+		TCPReadBuffer:  tars.TCPReadBuffer,
+		TCPWriteBuffer: tars.TCPWriteBuffer,
+		TCPNoDelay:     tars.TCPNoDelay,
+	}
+	s := NewTarsProtocol(serviceMgr.tarsServants, true)
+	r.tarsServer = tarstransport.NewTarsServer(s, conf)
+	if err := r.tarsServer.Listen(); err != nil {
+		return err
+	}
+	return r.tarsServer.Serve()
+}
+
 func (r *Receiver) Start() error {
 	logger.Info("receiver start working...")
 
 	r.ready()
 	errs := make(chan error, 8)
 
+	// 启动 Recv HTTP 服务
 	r.wg.Add(1)
 	go func() {
 		r.wg.Done()
-		if !r.config.HttpServer.Enabled {
+		if !r.config.RecvServer.Enabled {
 			return
 		}
-		if err := r.startHttpServer(); err != nil {
+		if err := r.startRecvHttpServer(); err != nil {
 			if errors.Is(err, http.ErrServerClosed) {
-				logger.Info("receiver http server stopped")
 				return
 			}
 			errs <- err
 		}
 	}()
 
+	// 启动 Admin HTTP 服务
+	r.wg.Add(1)
+	go func() {
+		r.wg.Done()
+		if !r.config.AdminServer.Enabled {
+			return
+		}
+		if err := r.starAdminHttpServer(); err != nil {
+			if errors.Is(err, http.ErrServerClosed) {
+				return
+			}
+			errs <- err
+		}
+	}()
+
+	// 启动 Recv GRPC 服务
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
@@ -232,6 +282,18 @@ func (r *Receiver) Start() error {
 			return
 		}
 		if err := r.startGrpcServer(); err != nil {
+			errs <- err
+		}
+	}()
+
+	// 启动 Recv Tars 服务
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		if !r.config.TarsServer.Enabled {
+			return
+		}
+		if err := r.startTarsServer(); err != nil {
 			errs <- err
 		}
 	}()
@@ -251,16 +313,82 @@ func (r *Receiver) Start() error {
 	}
 }
 
-func (r *Receiver) Stop() error {
-	if r.config.HttpServer.Enabled {
-		if err := r.httpServer.Close(); err != nil {
-			return err
-		}
+func (r *Receiver) shutdownRecvServer() error {
+	if !r.config.RecvServer.Enabled {
+		return nil
 	}
 
-	if r.config.GrpcServer.Enabled {
-		r.grpcServer.Stop()
+	ctx, cancel := context.WithTimeout(context.Background(), define.ShutdownTimeout)
+	defer cancel()
+
+	t0 := time.Now()
+	err := r.recvServer.Shutdown(ctx)
+	if err != nil {
+		return err
 	}
+
+	logger.Infof("shutdown recv server, take: %s", time.Since(t0))
+	return nil
+}
+
+func (r *Receiver) shutdownAdminServer() error {
+	if !r.config.AdminServer.Enabled {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), define.ShutdownTimeout)
+	defer cancel()
+
+	t0 := time.Now()
+	err := r.adminServer.Shutdown(ctx)
+	if err != nil {
+		return err
+	}
+
+	logger.Infof("shutdown admin server, take: %s", time.Since(t0))
+	return nil
+}
+
+func (r *Receiver) shutdownTarsServer() error {
+	if !r.config.TarsServer.Enabled {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), define.ShutdownTimeout)
+	defer cancel()
+
+	t0 := time.Now()
+	err := r.tarsServer.Shutdown(ctx)
+	if err != nil {
+		return err
+	}
+
+	logger.Infof("shutdown tars server, take: %s", time.Since(t0))
+	return nil
+}
+
+func (r *Receiver) shutdownGrpcServer() {
+	if !r.config.GrpcServer.Enabled {
+		return
+	}
+
+	t0 := time.Now()
+	r.grpcServer.GracefulStop()
+	logger.Infof("shutdown grpc server, take: %s", time.Since(t0))
+}
+
+func (r *Receiver) Stop() error {
+	if err := r.shutdownRecvServer(); err != nil {
+		return err
+	}
+	if err := r.shutdownAdminServer(); err != nil {
+		return err
+	}
+	if err := r.shutdownTarsServer(); err != nil {
+		return err
+	}
+
+	r.shutdownGrpcServer()
 
 	r.wg.Wait()
 	return nil

@@ -10,12 +10,16 @@
 package converter
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/plog"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/generator"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/testkits"
 )
 
 func makeLogsGenerator(count, length int) *generator.LogsGenerator {
@@ -32,9 +36,8 @@ func TestLogsRandom(t *testing.T) {
 	g := makeLogsGenerator(2, 20)
 	data := g.Generate()
 	record := define.Record{
-		RecordType:  define.RecordLogs,
-		RequestType: define.RequestHttp,
-		Data:        data,
+		RecordType: define.RecordLogs,
+		Data:       data,
 	}
 
 	events := make([]define.Event, 0)
@@ -50,13 +53,71 @@ func TestLogsRandom(t *testing.T) {
 	assert.Len(t, events, 2)
 }
 
+func TestLogsTime(t *testing.T) {
+	assertLogsTime := func(t *testing.T, data plog.Logs) {
+		record := define.Record{
+			RecordType: define.RecordLogs,
+			Data:       data,
+		}
+
+		gather := func(evts ...define.Event) {
+			s := evts[0].Data().String()
+			assert.True(t, strings.Contains(s, "10000000"))
+		}
+		NewCommonConverter().Convert(&record, gather)
+	}
+
+	g := makeLogsGenerator(1, 20)
+	ts := pcommon.Timestamp(10000000000)
+
+	t.Run("Timestamp", func(t *testing.T) {
+		data := g.Generate()
+		log := testkits.FirstLogRecord(data)
+		log.SetTimestamp(ts)
+		log.SetObservedTimestamp(0)
+		assertLogsTime(t, data)
+	})
+
+	t.Run("ObservedTimestamp", func(t *testing.T) {
+		data := g.Generate()
+		log := testkits.FirstLogRecord(data)
+		log.SetTimestamp(0)
+		log.SetObservedTimestamp(ts)
+		assertLogsTime(t, data)
+	})
+}
+
+func TestLogsEscapeHTML(t *testing.T) {
+	g := makeLogsGenerator(1, 20)
+	data := g.Generate()
+
+	const body = "<html>&<tag>"
+
+	first := testkits.FirstLogRecord(data)
+	first.Body().SetStringVal(body)
+
+	record := define.Record{
+		RecordType: define.RecordLogs,
+		Data:       data,
+	}
+
+	gather := func(evts ...define.Event) {
+		for i := 0; i < len(evts); i++ {
+			evt := evts[i]
+			assert.Equal(t, define.RecordLogs, evt.RecordType())
+			assert.Contains(t, evt.Data()["data"], body)
+		}
+	}
+
+	NewCommonConverter().Convert(&record, gather)
+}
+
 func BenchmarkLogsConvert_10x1KB_LogRecords(b *testing.B) {
 	g := makeLogsGenerator(10, 1024) // 1KB
 	data := g.Generate()
 	record := define.Record{
-		RecordType:  define.RecordLogs,
-		RequestType: define.RequestHttp,
-		Data:        data,
+		RecordType: define.RecordLogs,
+		Data:       data,
 	}
 
 	gather := func(evts ...define.Event) {}
@@ -69,9 +130,8 @@ func BenchmarkLogsConvert_10x10KB_LogRecords(b *testing.B) {
 	g := makeLogsGenerator(10, 10240) // 10KB
 	data := g.Generate()
 	record := define.Record{
-		RecordType:  define.RecordLogs,
-		RequestType: define.RequestHttp,
-		Data:        data,
+		RecordType: define.RecordLogs,
+		Data:       data,
 	}
 
 	gather := func(evts ...define.Event) {}
@@ -84,9 +144,8 @@ func BenchmarkLogsConvert_10x100KB_LogRecords(b *testing.B) {
 	g := makeLogsGenerator(10, 102400) // 100KB
 	data := g.Generate()
 	record := define.Record{
-		RecordType:  define.RecordLogs,
-		RequestType: define.RequestHttp,
-		Data:        data,
+		RecordType: define.RecordLogs,
+		Data:       data,
 	}
 
 	gather := func(evts ...define.Event) {}
@@ -99,9 +158,8 @@ func BenchmarkLogsConvert_100x1KB_LogRecords(b *testing.B) {
 	g := makeLogsGenerator(100, 1024) // 1KB
 	data := g.Generate()
 	record := define.Record{
-		RecordType:  define.RecordLogs,
-		RequestType: define.RequestHttp,
-		Data:        data,
+		RecordType: define.RecordLogs,
+		Data:       data,
 	}
 
 	gather := func(evts ...define.Event) {}
@@ -114,9 +172,8 @@ func BenchmarkLogsConvert_100x10KB_LogRecords(b *testing.B) {
 	g := makeLogsGenerator(100, 10240) // 10KB
 	data := g.Generate()
 	record := define.Record{
-		RecordType:  define.RecordLogs,
-		RequestType: define.RequestHttp,
-		Data:        data,
+		RecordType: define.RecordLogs,
+		Data:       data,
 	}
 
 	gather := func(evts ...define.Event) {}
@@ -129,9 +186,8 @@ func BenchmarkLogsConvert_100x100KB_LogRecords(b *testing.B) {
 	g := makeLogsGenerator(100, 102400) // 100KB
 	data := g.Generate()
 	record := define.Record{
-		RecordType:  define.RecordLogs,
-		RequestType: define.RequestHttp,
-		Data:        data,
+		RecordType: define.RecordLogs,
+		Data:       data,
 	}
 
 	gather := func(evts ...define.Event) {}

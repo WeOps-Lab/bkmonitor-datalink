@@ -14,8 +14,10 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/config"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/log"
 )
 
@@ -34,110 +36,166 @@ const (
 	StatusFailed   = "failed"
 )
 
-var DefaultBuckets = []float64{0, 0.05, 0.1, 0.2, 0.5, 1, 3, 5, 10, 20, 30, 60}
+const (
+	_ = 1 << (10 * iota)
+	KB
+	MB
+	GB
+)
 
 var (
-	apiRequestTotal = prometheus.NewCounterVec(
+	secondsBuckets = []float64{0, 0.05, 0.1, 0.2, 0.5, 1, 3, 5, 10, 20, 30, 60}
+	bytesBuckets   = []float64{0, KB, 100 * KB, 500 * KB, MB, 5 * MB, 20 * MB, 50 * MB, 100 * MB}
+
+	minuteBuckets = []float64{5, 30, 60, 3 * 60, 6 * 60, 12 * 60, 24 * 60, 2 * 24 * 60, 7 * 24 * 60, 30 * 24 * 60, 6 * 30 * 24 * 60}
+)
+
+var (
+	apiRequestTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "unify_query",
 			Name:      "api_request_total",
 			Help:      "unify-query api request",
 		},
-		[]string{"api", "status", "space_uid"},
+		[]string{"api", "status", "space_uid", "source_type", "version", "commit_id"},
 	)
 
-	apiRequestSecondHistogram = prometheus.NewHistogramVec(
+	apiRequestSecondHistogram = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: "unify_query",
 			Name:      "api_request_second",
 			Help:      "unify-query api request second",
-			Buckets:   DefaultBuckets,
+			Buckets:   secondsBuckets,
 		},
-		[]string{"api", "space_uid"},
+		[]string{"api", "space_uid", "version", "commit_id"},
 	)
 
-	resultTableInfo = prometheus.NewGaugeVec(
+	resultTableInfo = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: "unify_query",
 			Name:      "result_table_info",
 		},
-		[]string{
-			"rt_table_id", "rt_bk_biz_id", "rt_data_id",
-			"rt_measurement_type", "vm_table_id", "bcs_cluster_id", "is_influxdb_disabled",
-		},
+		[]string{"rt_table_id", "rt_data_id", "rt_measurement_type", "vm_table_id", "bcs_cluster_id"},
 	)
 
-	tsDBRequestSecondHistogram = prometheus.NewHistogramVec(
+	tsDBRequestBytesHistogram = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: "unify_query",
+			Name:      "tsdb_request_bytes",
+			Help:      "tsdb request bytes",
+			Buckets:   bytesBuckets,
+		},
+		[]string{"tsdb_type"},
+	)
+
+	tsDBRequestSecondHistogram = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: "unify_query",
 			Name:      "tsdb_request_seconds",
 			Help:      "tsdb request seconds",
-			Buckets:   DefaultBuckets,
+			Buckets:   secondsBuckets,
 		},
-		[]string{"space_uid", "tsdb_type"},
+		[]string{"tsdb_type", "url"},
 	)
 
-	vmQuerySpaceUidInfo = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
+	tsDBRequestRangeMinuteHistogram = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
 			Namespace: "unify_query",
-			Name:      "vm_query_info",
-			Help:      "vm query info",
+			Name:      "tsdb_request_range_minute",
+			Help:      "tsdb request range minute",
+			Buckets:   minuteBuckets,
 		},
-		[]string{"space_uid"},
+		[]string{"tsdb_type"},
+	)
+
+	jwtRequestTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "unify_query",
+			Name:      "jwt_request_total",
+			Help:      "unify-query jwt request",
+		},
+		[]string{"user_agent", "client_ip", "api", "jwt_app_code", "jwt_app_user_name", "space_uid", "status"},
+	)
+
+	bkDataApiRequestTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "unify_query",
+			Name:      "bk_data_api_request_total",
+			Help:      "unify-query bk_data api request",
+		},
+		[]string{"space_uid", "table_id", "is_match", "is_ff"},
 	)
 )
 
-func APIRequestInc(ctx context.Context, params ...string) {
-	metric, err := apiRequestTotal.GetMetricWithLabelValues(params...)
-	counterInc(ctx, metric, err, params...)
+func APIRequestInc(ctx context.Context, api, status, spaceUID, sourceType string) {
+	// 拼接 version 和 commit_id
+	params := append([]string{}, api, status, spaceUID, sourceType, config.Version, config.CommitHash)
+
+	metric, _ := apiRequestTotal.GetMetricWithLabelValues(params...)
+	counterInc(ctx, metric)
 }
 
-func APIRequestSecond(ctx context.Context, duration time.Duration, params ...string) {
-	metric, err := apiRequestSecondHistogram.GetMetricWithLabelValues(params...)
-	observe(ctx, metric, err, duration, params...)
+func APIRequestSecond(ctx context.Context, duration time.Duration, api, spaceUID string) {
+	// 拼接 version 和 commit_id
+	params := append([]string{}, api, spaceUID, config.Version, config.CommitHash)
+
+	metric, _ := apiRequestSecondHistogram.GetMetricWithLabelValues(params...)
+	observe(ctx, metric, duration.Seconds())
 }
 
-func TsDBRequestSecond(ctx context.Context, duration time.Duration, params ...string) {
-	metric, err := tsDBRequestSecondHistogram.GetMetricWithLabelValues(params...)
-	observe(ctx, metric, err, duration, params...)
+func TsDBRequestSecond(ctx context.Context, duration time.Duration, tsdbType, url string) {
+	metric, _ := tsDBRequestSecondHistogram.GetMetricWithLabelValues(tsdbType, url)
+	observe(ctx, metric, duration.Seconds())
 }
 
-func ResultTableInfoSet(ctx context.Context, value float64, params ...string) {
-	metric, err := resultTableInfo.GetMetricWithLabelValues(params...)
-	gaugeSet(ctx, metric, err, value, params...)
+func TsDBRequestBytes(ctx context.Context, bytes int, tsdbType string) {
+	metric, _ := tsDBRequestBytesHistogram.GetMetricWithLabelValues(tsdbType)
+	observe(ctx, metric, float64(bytes))
 }
 
-func VmQueryInfo(ctx context.Context, value float64, params ...string) {
-	metric, err := vmQuerySpaceUidInfo.GetMetricWithLabelValues(params...)
-	gaugeSet(ctx, metric, err, value, params...)
+func TsDBRequestRangeMinute(ctx context.Context, duration time.Duration, tsdbType string) {
+	metric, _ := tsDBRequestRangeMinuteHistogram.GetMetricWithLabelValues(tsdbType)
+	observe(ctx, metric, duration.Minutes())
+}
+
+func ResultTableInfoSet(ctx context.Context, value float64, rtTableID, rtDataID, rtMeasurementType, vmTableID, bcsClusterID string) {
+	metric, _ := resultTableInfo.GetMetricWithLabelValues(rtTableID, rtDataID, rtMeasurementType, vmTableID, bcsClusterID)
+	gaugeSet(ctx, metric, value)
+}
+
+func JWTRequestInc(ctx context.Context, userAgent, clusterIP, api, jwtAppCode, jwtAppUserName, spaceUID, status string) {
+	return
+	//metric, _ := jwtRequestTotal.GetMetricWithLabelValues(userAgent, clusterIP, api, jwtAppCode, jwtAppUserName, spaceUID, status)
+	//counterInc(ctx, metric)
+}
+
+func BkDataRequestInc(ctx context.Context, spaceUID, tableID, isMatch, isFF string) {
+	metric, _ := bkDataApiRequestTotal.GetMetricWithLabelValues(spaceUID, tableID, isMatch, isFF)
+	counterInc(ctx, metric)
 }
 
 func gaugeSet(
-	ctx context.Context, metric prometheus.Gauge, err error, value float64, params ...string,
+	_ context.Context, metric prometheus.Gauge, value float64,
 ) {
-	if err != nil {
-		log.Warnf(ctx, "metric gauge: %v failed, error:%s", params, err)
+	if metric == nil {
 		return
 	}
-
 	metric.Set(value)
 }
 
 func counterInc(
-	ctx context.Context, metric prometheus.Counter, err error, params ...string,
+	ctx context.Context, metric prometheus.Counter,
 ) {
-	counterAdd(ctx, metric, 1, err, params...)
+	counterAdd(ctx, metric, 1)
 }
 
 // handleCount
 func counterAdd(
-	ctx context.Context, metric prometheus.Counter, val float64, err error, params ...string,
+	ctx context.Context, metric prometheus.Counter, val float64,
 ) {
-	if err != nil {
-		log.Warnf(ctx, "metric counter:%v failed,error:%s", params, err)
+	if metric == nil {
 		return
 	}
-
 	sp := trace.SpanFromContext(ctx).SpanContext()
 	if sp.IsSampled() {
 		exemplarAdder, ok := metric.(prometheus.ExemplarAdder)
@@ -155,10 +213,9 @@ func counterAdd(
 }
 
 func observe(
-	ctx context.Context, metric prometheus.Observer, err error, duration time.Duration, params ...string,
+	ctx context.Context, metric prometheus.Observer, value float64,
 ) {
-	if err != nil {
-		log.Warnf(ctx, "metric histogram:%v failed,error:%s", params, err)
+	if metric == nil {
 		return
 	}
 
@@ -167,7 +224,7 @@ func observe(
 		// exemplarObserve 只支持 histograms 类型，使用 summary 会报错
 		exemplarObserve, ok := metric.(prometheus.ExemplarObserver)
 		if ok {
-			exemplarObserve.ObserveWithExemplar(duration.Seconds(), prometheus.Labels{
+			exemplarObserve.ObserveWithExemplar(value, prometheus.Labels{
 				"traceID": sp.TraceID().String(),
 				"spanID":  sp.SpanID().String(),
 			})
@@ -175,15 +232,7 @@ func observe(
 			log.Errorf(ctx, "metric type is wrong: %T, %v", metric, metric)
 		}
 	} else {
-		metric.Observe(duration.Seconds())
+		metric.Observe(value)
 	}
 
-}
-
-// init
-func init() {
-	prometheus.MustRegister(
-		apiRequestTotal, apiRequestSecondHistogram, resultTableInfo,
-		tsDBRequestSecondHistogram, vmQuerySpaceUidInfo,
-	)
 }

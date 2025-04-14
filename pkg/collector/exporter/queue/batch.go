@@ -17,13 +17,14 @@ import (
 
 	"github.com/elastic/beats/libbeat/common"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/logger"
 )
 
 var (
-	queueFullTotal = prometheus.NewCounterVec(
+	queueFullTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: define.MonitoringNamespace,
 			Name:      "exporter_queue_full_total",
@@ -32,7 +33,7 @@ var (
 		[]string{"id"},
 	)
 
-	queueTickTotal = prometheus.NewCounterVec(
+	queueTickTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: define.MonitoringNamespace,
 			Name:      "exporter_queue_tick_total",
@@ -41,7 +42,7 @@ var (
 		[]string{"id"},
 	)
 
-	queuePopBatchSize = prometheus.NewHistogramVec(
+	queuePopBatchSize = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: define.MonitoringNamespace,
 			Name:      "exporter_queue_pop_batch_size",
@@ -51,14 +52,6 @@ var (
 		[]string{"record_type", "id"},
 	)
 )
-
-func init() {
-	prometheus.MustRegister(
-		queueFullTotal,
-		queueTickTotal,
-		queuePopBatchSize,
-	)
-}
 
 var DefaultMetricMonitor = &metricMonitor{}
 
@@ -81,7 +74,7 @@ type BatchQueue struct {
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 	mut     sync.RWMutex
-	qs      map[int32]chan []define.Event
+	qs      map[string]chan []define.Event
 	out     chan common.MapStr
 	conf    Config
 	getSize func(string) Config
@@ -92,6 +85,7 @@ type Config struct {
 	MetricsBatchSize int           `config:"metrics_batch_size" mapstructure:"metrics_batch_size"`
 	LogsBatchSize    int           `config:"logs_batch_size" mapstructure:"logs_batch_size"`
 	TracesBatchSize  int           `config:"traces_batch_size" mapstructure:"traces_batch_size"`
+	ProxyBatchSize   int           `config:"proxy_batch_size" mapstructure:"proxy_batch_size"`
 	FlushInterval    time.Duration `config:"flush_interval" mapstructure:"flush_interval"`
 }
 
@@ -100,7 +94,7 @@ func NewBatchQueue(conf Config, fn func(string) Config) Queue {
 	cq := &BatchQueue{
 		ctx:     ctx,
 		cancel:  cancel,
-		qs:      make(map[int32]chan []define.Event),
+		qs:      make(map[string]chan []define.Event),
 		out:     make(chan common.MapStr, define.Concurrency()),
 		conf:    conf,
 		getSize: fn,
@@ -158,11 +152,15 @@ func (bq *BatchQueue) compact(dc DataIDChan) {
 		switch dc.rtype {
 		case define.RecordTraces, define.RecordLogs:
 			bq.out <- NewEventsMapStr(dc.dataID, data)
-		case define.RecordMetrics, define.RecordPushGateway, define.RecordRemoteWrite:
+		case define.RecordMetrics, define.RecordPushGateway, define.RecordRemoteWrite, define.RecordTars:
 			bq.out <- NewMetricsMapStr(dc.dataID, data)
+		case define.RecordProfiles:
+			bq.out <- NewProfilesMapStr(dc.dataID, data)
+		case define.RecordProxy:
+			bq.out <- NewProxyMapStr(dc.dataID, data)
 
-		// proxy/pingserver 数据不做聚合（没办法做聚合
-		case define.RecordProxy, define.RecordPingserver:
+		// 数据不做聚合
+		case define.RecordPingserver, define.RecordFta, define.RecordBeat:
 			for _, item := range data {
 				bq.out <- item
 			}
@@ -217,9 +215,10 @@ func (bq *BatchQueue) Put(events ...define.Event) {
 
 	dataID := events[0].DataId()
 	rtype := events[0].RecordType()
+	uk := strconv.Itoa(int(dataID)) + "/" + string(rtype)
 
 	bq.mut.Lock() // read-write-lock
-	_, ok := bq.qs[dataID]
+	_, ok := bq.qs[uk]
 	var batchSize int
 	if !ok {
 		switch rtype {
@@ -229,7 +228,9 @@ func (bq *BatchQueue) Put(events ...define.Event) {
 			batchSize = bq.conf.LogsBatchSize
 		case define.RecordTraces:
 			batchSize = bq.conf.TracesBatchSize
-		default: // define.RecordProxy, define.RecordPingserver
+		case define.RecordProxy:
+			batchSize = bq.conf.ProxyBatchSize
+		default:
 			batchSize = 100
 		}
 
@@ -240,9 +241,9 @@ func (bq *BatchQueue) Put(events ...define.Event) {
 			batchSize: batchSize,
 			ch:        ch,
 		})
-		bq.qs[dataID] = ch
+		bq.qs[uk] = ch
 	}
-	q := bq.qs[dataID]
+	q := bq.qs[uk]
 	bq.mut.Unlock()
 
 	select {

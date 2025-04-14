@@ -266,6 +266,23 @@ func (s *Service) reloadInfluxDBRouter(ctx context.Context) error {
 		return err
 	}
 
+	s.wg.Add(1)
+	go func() {
+		ticker := time.NewTicker(PingPeriod)
+		defer ticker.Stop()
+		defer s.wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				log.Warnf(ctx, "maintain influxdb host status info loop exit")
+				return
+			case <-ticker.C:
+				ir.Ping(ctx, PingTimeout, PingCount)
+				log.Debugf(ctx, "finish to Ping goroutine.")
+			}
+		}
+	}()
+
 	ch := ir.RouterSubscribe(ctx)
 	s.wg.Add(1)
 	go func() {
@@ -286,7 +303,7 @@ func (s *Service) reloadInfluxDBRouter(ctx context.Context) error {
 				log.Infof(ctx, "ir reload all key time ticker reload")
 			case msg := <-ch:
 				ir.ReloadByKey(ctx, msg.Payload)
-				log.Infof(ctx, "subscribe msg: %s, space: %s", msg.String(), msg.Payload)
+				log.Debugf(ctx, "subscribe msg: %s, space: %s", msg.String(), msg.Payload)
 			}
 		}
 	}()
@@ -296,11 +313,11 @@ func (s *Service) reloadInfluxDBRouter(ctx context.Context) error {
 
 // reloadInfluxDBRouter 重新加载 SpaceTsDbRouter
 func (s *Service) reloadSpaceTsDbRouter(ctx context.Context) error {
-	ir, err := inner.SetSpaceTsDbRouter(ctx, SpaceRouterBboltPath, SpaceRouterBboltBucketName, SpaceRouterPrefix, SpaceRouterBboltWriteBatchSize)
+	ir, err := inner.SetSpaceTsDbRouter(ctx, SpaceRouterBboltPath, SpaceRouterBboltBucketName, SpaceRouterPrefix, SpaceRouterBboltWriteBatchSize, true)
 	if err != nil {
 		return err
 	}
-	err = ir.ReloadAllKey(ctx)
+	err = ir.ReloadAllKey(ctx, false)
 	if err != nil {
 		return err
 	}
@@ -314,22 +331,22 @@ func (s *Service) reloadSpaceTsDbRouter(ctx context.Context) error {
 		for {
 			select {
 			case <-ctx.Done():
-				log.Warnf(ctx, "[SpaceTsDB Router] Loop exit")
+				log.Warnf(ctx, "[SpaceTSDB Router] Loop exit")
 				return
 				// 订阅 redis
 			case <-ticker.C:
-				err = ir.ReloadAllKey(ctx)
+				err = ir.ReloadAllKey(ctx, true)
 				if err != nil {
-					log.Errorf(ctx, "[SpaceTsDB Router] TimeTicker reload with error, %v", err)
+					log.Errorf(ctx, "[SpaceTSDB Router] TimeTicker reload with error, %v", err)
 				} else {
-					log.Infof(ctx, "[SpaceTsDB Router] TimeTicker reload")
+					log.Infof(ctx, "[SpaceTSDB Router] TimeTicker reload")
 				}
 			case msg := <-ch:
 				err = ir.ReloadByChannel(ctx, msg.Channel, msg.Payload)
 				if err != nil {
-					log.Errorf(ctx, "[SpaceTsDB Router] Subscribe msg with error, %s, %v", msg.String(), err)
+					log.Errorf(ctx, "[SpaceTSDB Router] Subscribe msg with error, %s, %v", msg.String(), err)
 				} else {
-					log.Infof(ctx, "[SpaceTsDB Router] Subscribe msg: %s, space: %s", msg.String(), msg.Payload)
+					log.Infof(ctx, "[SpaceTSDB Router] Subscribe msg: %s, key: %s", msg.String(), msg.Payload)
 				}
 			}
 		}

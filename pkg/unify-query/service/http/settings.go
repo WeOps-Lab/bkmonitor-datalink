@@ -40,16 +40,24 @@ const (
 	TSQueryInfoHandlePathConfigPath           = "http.path.ts_info"
 	TSQueryExemplarHandlePathConfigPath       = "http.path.ts_exemplar"
 	TSQueryPromQLHandlePathConfigPath         = "http.path.ts_promql"
+	TSQueryReferenceQueryHandlePathConfigPath = "http.path.ts_reference"
+	TSQueryRawQueryHandlePathConfigPath       = "http.path.ts_raw"
 	TSQueryStructToPromQLHandlePathConfigPath = "http.path.ts_struct_to_promql"
 	TSQueryPromQLToStructHandlePathConfigPath = "http.path.ts_promql_to_struct"
 	TSQueryLabelValuesPathConfigPath          = "http.path.ts_label_values"
+	TSQueryClusterMetricsPathConfigPath       = "http.path.ts_cluster_metrics"
 	FluxHandlePromqlPathConfigPath            = "http.path.promql"
 	PrintHandlePathConfigPath                 = "http.path.print"
 	InfluxDBPrintHandlePathConfigPath         = "http.path.influxdb_print"
 	SpacePrintHandlePathConfigPath            = "http.path.space_print"
 	SpaceKeyPrintHandlePathConfigPath         = "http.path.space_key_print"
+	TsDBPrintHandlePathConfigPath             = "http.path.tsdb_print"
 	FeatureFlagHandlePathConfigPath           = "http.path.feature_flag_path"
 	ESHandlePathConfigPath                    = "http.path.es"
+	TSQueryRawMAXLimitConfigPath              = "http.query.raw.max_limit"
+
+	CheckQueryTsConfigPath     = "http.path.check_query_ts"
+	CheckQueryPromQLConfigPath = "http.path.check_query_promql"
 
 	// 查询配置
 	InfoDefaultLimit = "http.info.limit"
@@ -58,6 +66,13 @@ const (
 	SegmentedEnable      = "http.segmented.enable"
 	SegmentedMaxRoutines = "http.segmented.max_routines"
 	SegmentedMinInterval = "http.segmented.min_interval"
+
+	// 集群指标查询配置
+	ClusterMetricQueryPrefixConfigPath  = "http.cluster_metric.prefix"
+	ClusterMetricQueryTimeoutConfigPath = "http.cluster_metric.timeout"
+
+	JwtPublicKeyConfigPath       = "jwt.public_key"
+	JwtBkAppCodeSpacesConfigPath = "jwt.bk_app_code_spaces"
 )
 
 var (
@@ -74,7 +89,11 @@ var (
 	SlowQueryThreshold    time.Duration
 	DefaultQueryListLimit int
 
-	DefaultInfoLimit int
-
 	QueryMaxRouting int
+
+	ClusterMetricQueryPrefix  string
+	ClusterMetricQueryTimeout time.Duration
+
+	JwtPublicKey       string
+	JwtBkAppCodeSpaces map[string][]string
 )

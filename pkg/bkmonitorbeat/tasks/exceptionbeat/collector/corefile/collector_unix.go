@@ -8,12 +8,12 @@
 // specific language governing permissions and limitations under the License.
 
 //go:build aix || darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris || zos
-// +build aix darwin dragonfly freebsd linux netbsd openbsd solaris zos
 
 package corefile
 
 import (
 	"context"
+	"regexp"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -41,6 +41,7 @@ type CoreFileCollector struct {
 	done                    chan bool
 	state                   int
 	coreFilePattern         string
+	matchRegx               *regexp.Regexp
 	corePath                string
 	pattern                 string
 	patternArr              [][]string
@@ -78,6 +79,14 @@ func (c *CoreFileCollector) Start(ctx context.Context, e chan<- define.Event, co
 	}
 	c.reportTimeInfo = make(map[string]*ReportInfo)
 	c.coreFilePattern = conf.CoreFilePattern
+	if conf.CoreFileMatchRegex != "" {
+		r, err := regexp.Compile(conf.CoreFileMatchRegex)
+		if err != nil {
+			logger.Errorf("faield to compile regex pattern(%s), err: %v", conf.CoreFileMatchRegex, err)
+		} else {
+			c.matchRegx = r
+		}
+	}
 
 	logger.Infof("CoreFileColletor start success with config data_id->[%d] report_gap->[%s]", c.dataid, c.reportTimeGap)
 	go c.statistic(ctx, e)

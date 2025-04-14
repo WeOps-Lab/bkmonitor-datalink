@@ -11,11 +11,8 @@ package promql
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
-
-	oleltrace "go.opentelemetry.io/otel/trace"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/consul"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/influxdb"
@@ -75,18 +72,16 @@ func clusterIDToSourceType(clusterID string) (string, error) {
 func tsDBToMetadataQuery(ctx context.Context, metricName string, queryInfo *QueryInfo) (metadata.QueryList, error) {
 
 	var (
-		span oleltrace.Span
+		err error
 	)
 
-	ctx, span = trace.IntoContext(ctx, trace.TracerName, "ts-db-metadata-query")
-	if span != nil {
-		defer span.End()
-	}
+	ctx, span := trace.NewSpan(ctx, "ts-db-metadata-query")
+	defer span.End(&err)
 
-	trace.InsertIntIntoSpan("result_table_num", len(queryInfo.TsDBs), span)
+	span.Set("result_table_num", len(queryInfo.TsDBs))
 
 	queryList := make(metadata.QueryList, 0, len(queryInfo.TsDBs))
-	for i, tsDB := range queryInfo.TsDBs {
+	for _, tsDB := range queryInfo.TsDBs {
 		var (
 			field     string
 			whereList = NewWhereList()
@@ -102,9 +97,6 @@ func tsDBToMetadataQuery(ctx context.Context, metricName string, queryInfo *Quer
 				},
 			}
 		)
-
-		tsDBStr, _ := json.Marshal(tsDB)
-		trace.InsertStringIntoSpan(fmt.Sprintf("result_table_%d", i), string(tsDBStr), span)
 
 		db := tsDB.DB
 		measurement := tsDB.Measurement
@@ -129,16 +121,6 @@ func tsDBToMetadataQuery(ctx context.Context, metricName string, queryInfo *Quer
 			err = fmt.Errorf("%s: %s 类型异常", tsDB.TableID, tsDB.MeasurementType)
 			log.Errorf(ctx, err.Error())
 			return nil, err
-		}
-
-		// 增加聚合方法
-		query.AggregateMethodList = make([]metadata.AggrMethod, len(queryInfo.AggregateMethodList))
-		for i, aggr := range queryInfo.AggregateMethodList {
-			query.AggregateMethodList[i] = metadata.AggrMethod{
-				Name:       aggr.Name,
-				Dimensions: aggr.Dimensions,
-				Without:    aggr.Without,
-			}
 		}
 
 		// 如果有额外condition，则录入where语句中
@@ -191,6 +173,7 @@ func tsDBToMetadataQuery(ctx context.Context, metricName string, queryInfo *Quer
 		}
 
 		query.TableID = tsDB.TableID
+		query.DataLabel = tsDB.DataLabel
 		query.DB = db
 		query.Measurement = measurement
 		query.Field = field
@@ -209,13 +192,11 @@ func queryInfoMetadataQuery(ctx context.Context, metricName string, queryInfo *Q
 		tableInfos []*consul.TableID
 		whereList  = NewWhereList()
 		isHasOr    = false
-		span       oleltrace.Span
+		err        error
 	)
 
-	ctx, span = trace.IntoContext(ctx, trace.TracerName, "query-info-metadata-query")
-	if span != nil {
-		defer span.End()
-	}
+	ctx, span := trace.NewSpan(ctx, "query-info-metadata-query")
+	defer span.End(&err)
 
 	if queryInfo.DB != "" && queryInfo.Measurement != "" {
 		tableInfos = append(tableInfos, influxdb.GetTableIDByDBAndMeasurement(
@@ -243,10 +224,10 @@ func queryInfoMetadataQuery(ctx context.Context, metricName string, queryInfo *Q
 		}
 	}
 
-	trace.InsertIntIntoSpan("result_table_num", len(tableInfos), span)
+	span.Set("result_table_num", len(tableInfos))
 
 	queryList := make(metadata.QueryList, 0, len(tableInfos))
-	for i, tableInfo := range tableInfos {
+	for _, tableInfo := range tableInfos {
 		var (
 			db          = tableInfo.DB
 			clusterID   = tableInfo.ClusterID
@@ -279,9 +260,9 @@ func queryInfoMetadataQuery(ctx context.Context, metricName string, queryInfo *Q
 		}
 
 		// 增加聚合方法
-		query.AggregateMethodList = make([]metadata.AggrMethod, len(queryInfo.AggregateMethodList))
+		query.Aggregates = make(metadata.Aggregates, len(queryInfo.AggregateMethodList))
 		for j, aggr := range queryInfo.AggregateMethodList {
-			query.AggregateMethodList[j] = metadata.AggrMethod{
+			query.Aggregates[j] = metadata.Aggregate{
 				Name:       aggr.Name,
 				Dimensions: aggr.Dimensions,
 				Without:    aggr.Without,
@@ -301,67 +282,11 @@ func queryInfoMetadataQuery(ctx context.Context, metricName string, queryInfo *Q
 		query.Field = field
 		query.Condition = whereList.String()
 
-		queryStr, _ := json.Marshal(query)
-		trace.InsertStringIntoSpan(fmt.Sprintf("result_table_%d", i), string(queryStr), span)
-
 		log.Debugf(ctx, "query_info: %+v", query)
 		queryList = append(queryList, query)
 	}
 
 	return queryList, nil
-}
-
-// QueryInfoIntoContext 获取 queryInfo 的数据进行解析，存入 ctx 缓存中，给后续的请求使用
-func QueryInfoIntoContext(ctx context.Context, referenceName, metricName string, queryInfo *QueryInfo) (context.Context, error) {
-	// 查询列表，里面包含该次查询对应的所有实例，实现跨 DB 查询
-	var (
-		err         error
-		queryMetric = &metadata.QueryMetric{
-			ReferenceName: referenceName,
-			MetricName:    metricName,
-			IsCount:       queryInfo.IsCount,
-		}
-		span oleltrace.Span
-	)
-
-	ctx, span = trace.IntoContext(ctx, trace.TracerName, "query-info-into-context")
-	if span != nil {
-		defer span.End()
-	}
-
-	// 空间内容解析
-	if queryInfo.TsDBs != nil {
-		queryMetric.QueryList, err = tsDBToMetadataQuery(ctx, metricName, queryInfo)
-	} else {
-		queryMetric.QueryList, err = queryInfoMetadataQuery(ctx, metricName, queryInfo)
-	}
-	if err != nil {
-		return ctx, err
-	}
-	queries := metadata.GetQueries(ctx)
-	if queries == nil {
-		queries = &metadata.Queries{
-			Query: make(metadata.QueryReference),
-		}
-	}
-
-	queries.Query[referenceName] = queryMetric
-
-	queryMetricStr, _ := json.Marshal(queryMetric)
-	trace.InsertStringIntoSpan(fmt.Sprintf("reference_%s", referenceName), string(queryMetricStr), span)
-
-	err = metadata.SetQueries(ctx, queries)
-	return ctx, err
-}
-
-// QueryInfoFromContext 通过 ctx 获取查询信息
-func QueryInfoFromContext(ctx context.Context, referenceName string) (*metadata.QueryMetric, error) {
-	queries := metadata.GetQueries(ctx)
-	if queryMetric, ok := queries.Query[referenceName]; ok {
-		return queryMetric, nil
-	} else {
-		return nil, fmt.Errorf("metadata query is empty, with referenceName: %s", referenceName)
-	}
 }
 
 // OffSetInfo Offset的信息存储，供promql查询转换为influxdb查询语句时使用

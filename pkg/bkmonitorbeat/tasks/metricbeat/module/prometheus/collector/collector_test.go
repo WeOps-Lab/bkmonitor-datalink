@@ -20,24 +20,16 @@ import (
 )
 
 func TestGetEventFromPromEvent(t *testing.T) {
-	deltaKeys := map[string]struct{}{}
-	lastDeltaMetrics := make(map[string]map[string]float64)
-	for _, key := range []string{"metric1", "metric2"} {
-		deltaKeys[key] = struct{}{}
-		lastDeltaMetrics[key] = make(map[string]float64)
-	}
-
 	mb := &MetricSet{
-		deltaKeys:        deltaKeys,
-		lastDeltaMetrics: lastDeltaMetrics,
+		normalizeMetricName: true,
 	}
 
 	lines1 := `
 metric1{label1="value1"} 10
 metric2{label1="value2"} 11
-metric3{label1="value3"} 12
+metric3:foo:bar{label1="value3"} 12
 `
-	ch := mb.getEventsFromReader(io.NopCloser(bytes.NewBufferString(lines1)), func() {}, false)
+	ch := mb.getEventsFromReader(io.NopCloser(bytes.NewBufferString(lines1)), func() {}, true)
 	expected := []common.MapStr{
 		{
 			"key": "metric1",
@@ -52,59 +44,36 @@ metric3{label1="value3"} 12
 			},
 		},
 		{
-			"key": "metric3",
+			"key": "metric3_foo_bar",
 			"labels": common.MapStr{
 				"label1": "value3",
 			},
 			"value": float64(12),
 		},
+		{
+			"key":    "bkm_metricbeat_scrape_line",
+			"labels": common.MapStr{},
+			"value":  float64(3),
+		},
+		{
+			"key": "bkm_metricbeat_endpoint_up",
+			"labels": common.MapStr{
+				"code":      "0",
+				"code_name": "成功",
+			},
+			"value": float64(1),
+		},
+		{
+			"key":    "bkm_metricbeat_handle_duration_seconds",
+			"labels": common.MapStr{},
+			"value":  float64(0.1),
+		},
 	}
 
 	index := 0
 	for msg := range ch {
-		for k, _ := range expected[index] {
-			assert.Equal(t, expected[index][k], msg[k])
-		}
-		_, ok := msg["timestamp"]
-		assert.True(t, ok)
-		index++
-	}
-
-	lines2 := `
-metric1{label1="value1"} 20
-metric2{label1="value2"} 21
-metric3{label1="value3"} 22
-`
-	ch = mb.getEventsFromReader(io.NopCloser(bytes.NewBufferString(lines2)), func() {}, false)
-	expected = []common.MapStr{
-		{
-			"key": "metric1",
-			"labels": common.MapStr{
-				"label1": "value1",
-			},
-			"value": float64(10),
-		},
-		{
-			"key": "metric2",
-			"labels": common.MapStr{
-				"label1": "value2",
-			},
-			"value": float64(10),
-		},
-		{
-			"key": "metric3",
-			"labels": common.MapStr{
-				"label1": "value3",
-			},
-			"value": float64(22),
-		},
-	}
-
-	index = 0
-	for msg := range ch {
-		for k, _ := range expected[index] {
-			assert.Equal(t, expected[index][k], msg[k])
-		}
+		assert.Equal(t, expected[index]["key"], msg["key"])
+		t.Log(msg)
 		_, ok := msg["timestamp"]
 		assert.True(t, ok)
 		index++

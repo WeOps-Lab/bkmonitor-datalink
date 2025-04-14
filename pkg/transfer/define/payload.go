@@ -18,12 +18,22 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/transfer/json"
 )
 
+type PayloadFlag uint8
+
+const (
+	PayloadFlagNoGroups     PayloadFlag = 1 << 0
+	PayloadFlagNoCmdbLevels PayloadFlag = 1 << 1
+)
+
 // BasePayload :
 type BasePayload struct {
 	sn   int
 	meta *sync.Map
 	Data []byte
 	t    time.Time
+	flag PayloadFlag
+
+	r *ETLRecord
 }
 
 func (p BasePayload) copy() *BasePayload {
@@ -81,14 +91,32 @@ func (p *BasePayload) From(v interface{}) error {
 	panic(ErrNotImplemented)
 }
 
-func (p *BasePayload) SetTime(t time.Time) { p.t = t }
-func (p *BasePayload) GetTime() time.Time  { return p.t }
+func (p *BasePayload) SetTime(t time.Time) {
+	p.t = t
+}
 
-// NewBasePayload :
-func NewBasePayload() *BasePayload {
-	return &BasePayload{
-		Data: make([]byte, 0),
-	}
+func (p *BasePayload) GetTime() time.Time {
+	return p.t
+}
+
+func (p *BasePayload) AddFlag(f PayloadFlag) {
+	p.flag = p.flag | f
+}
+
+func (p *BasePayload) SetFlag(f PayloadFlag) {
+	p.flag = f
+}
+
+func (p *BasePayload) Flag() PayloadFlag {
+	return p.flag
+}
+
+func (p *BasePayload) SetETLRecord(r *ETLRecord) {
+	p.r = r
+}
+
+func (p *BasePayload) GetETLRecord() *ETLRecord {
+	return p.r
 }
 
 // NewBasePayloadFrom :
@@ -152,6 +180,7 @@ func DerivePayload(payload Payload, v interface{}) (derived Payload, err error) 
 			return nil, err
 		}
 		derived.SetTime(t.GetTime())
+		derived.SetFlag(t.Flag())
 	}
 
 	err = derived.From(v)

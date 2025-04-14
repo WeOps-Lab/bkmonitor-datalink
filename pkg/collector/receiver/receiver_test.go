@@ -52,6 +52,18 @@ func TestReceiver(t *testing.T) {
       # default: ""
       endpoint: "localhost:0"
 
+    # Tars Server Config
+    tars_server:
+      # 是否启动 Tars 服务
+      # default: false
+      enabled: false
+      # 传输协议，目前支持 tcp
+      # default: ""
+      transport: "tcp"
+      # 服务监听端点
+      # default: ""
+      endpoint: ":4319"
+
     components:
       jaeger:
         enabled: true
@@ -65,18 +77,30 @@ func TestReceiver(t *testing.T) {
         enabled: true
       skywalking:
         enabled: true
+      pyroscope:
+        enabled: true
+      fta:
+        enabled: true
+      beat:
+        enabled: true
+      tars:
+        enabled: true
 `
 
 	config := confengine.MustLoadConfigContent(configContent)
 	r, err := New(config)
 	assert.NoError(t, err)
 
-	componentsReady[define.SourceJaeger] = func() { t.Logf("%s ready", define.SourceJaeger) }
-	componentsReady[define.SourceOtlp] = func() { t.Logf("%s ready", define.SourceOtlp) }
-	componentsReady[define.SourcePushGateway] = func() { t.Logf("%s ready", define.SourcePushGateway) }
-	componentsReady[define.SourceRemoteWrite] = func() { t.Logf("%s ready", define.SourceRemoteWrite) }
-	componentsReady[define.SourceZipkin] = func() { t.Logf("%s ready", define.SourceZipkin) }
-	componentsReady[define.SourceSkywalking] = func() { t.Logf("%s ready", define.SourceSkywalking) }
+	componentsReady[define.SourceJaeger] = func(_ ComponentConfig) { t.Logf("%s ready", define.SourceJaeger) }
+	componentsReady[define.SourceOtlp] = func(_ ComponentConfig) { t.Logf("%s ready", define.SourceOtlp) }
+	componentsReady[define.SourcePushGateway] = func(_ ComponentConfig) { t.Logf("%s ready", define.SourcePushGateway) }
+	componentsReady[define.SourceRemoteWrite] = func(_ ComponentConfig) { t.Logf("%s ready", define.SourceRemoteWrite) }
+	componentsReady[define.SourceZipkin] = func(_ ComponentConfig) { t.Logf("%s ready", define.SourceZipkin) }
+	componentsReady[define.SourceSkywalking] = func(_ ComponentConfig) { t.Logf("%s ready", define.SourceSkywalking) }
+	componentsReady[define.SourcePyroscope] = func(_ ComponentConfig) { t.Logf("%s ready", define.SourcePyroscope) }
+	componentsReady[define.SourceFta] = func(_ ComponentConfig) { t.Logf("%s ready", define.SourceFta) }
+	componentsReady[define.SourceBeat] = func(_ ComponentConfig) { t.Logf("%s ready", define.SourceBeat) }
+	componentsReady[define.SourceTars] = func(_ ComponentConfig) { t.Logf("%s ready", define.SourceTars) }
 
 	r.ready()
 	assert.NoError(t, r.Start())
@@ -103,7 +127,7 @@ func TestPublisher(t *testing.T) {
 
 func TestRegisterDuplicateRoutes(t *testing.T) {
 	assert.Panics(t, func() {
-		RegisterHttpRoute("test", []RouteWithFunc{
+		RegisterRecvHttpRoute("test", []RouteWithFunc{
 			{
 				Method:       http.MethodGet,
 				RelativePath: "/route1",

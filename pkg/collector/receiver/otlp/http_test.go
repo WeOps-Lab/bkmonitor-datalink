@@ -20,6 +20,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.uber.org/atomic"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/generator"
@@ -28,179 +29,130 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/receiver"
 )
 
+const (
+	localV1TracesURL  = "http://localhost/v1/traces"
+	localV1MetricsURL = "http://localhost/v1/metrics"
+	localV1LogsURL    = "http://localhost/v1/logs"
+)
+
 func TestReady(t *testing.T) {
-	assert.NotPanics(t, Ready)
-}
-
-func TestHttpTracesPbContent(t *testing.T) {
-	g := generator.NewTracesGenerator(define.TracesOptions{
-		SpanCount: 10,
-		SpanKind:  1,
+	assert.NotPanics(t, func() {
+		Ready(receiver.ComponentConfig{})
 	})
-	b, err := ptrace.NewProtoMarshaler().MarshalTraces(g.Generate())
-	assert.NoError(t, err)
-
-	buf := &bytes.Buffer{}
-	buf.Write(b)
-
-	req, err := http.NewRequest(http.MethodPut, "http://localhost/v1/traces", buf)
-	assert.NoError(t, err)
-	req.Header.Set("Content-Type", define.ContentTypeProtobuf)
-
-	var n int
-	svc := HttpService{
-		receiver.Publisher{Func: func(record *define.Record) { n++ }},
-		pipeline.Validator{Func: func(record *define.Record) (define.StatusCode, string, error) {
-			return define.StatusCodeOK, "", nil
-		}},
-	}
-	rw := httptest.NewRecorder()
-	svc.ExportTraces(rw, req)
-	assert.Equal(t, rw.Code, http.StatusOK)
-	assert.Equal(t, 1, n)
 }
 
-func TestHttpInvalidBody(t *testing.T) {
-	buf := &bytes.Buffer{}
-	buf.WriteString("{-}")
-
-	req, err := http.NewRequest(http.MethodPut, "http://localhost/v1/traces", buf)
-	assert.NoError(t, err)
-
-	var n int
+func newSvc(code define.StatusCode, msg string, err error) (HttpService, *atomic.Int64) {
+	n := atomic.NewInt64(0)
 	svc := HttpService{
-		receiver.Publisher{Func: func(record *define.Record) { n++ }},
+		receiver.Publisher{Func: func(record *define.Record) { n.Inc() }},
 		pipeline.Validator{Func: func(record *define.Record) (define.StatusCode, string, error) {
-			return define.StatusCodeOK, "", nil
+			return code, msg, err
 		}},
 	}
-	rw := httptest.NewRecorder()
-	svc.ExportTraces(rw, req)
-	assert.Equal(t, rw.Code, http.StatusBadRequest)
-	assert.Equal(t, 0, n)
+	return svc, n
 }
 
-func TestHttpReadFailed(t *testing.T) {
-	buf := testkits.NewBrokenReader()
-	req, err := http.NewRequest(http.MethodPut, "http://localhost/v1/traces", buf)
-	assert.NoError(t, err)
+func TestHttpRequest(t *testing.T) {
+	t.Run("traces pb/content", func(t *testing.T) {
+		g := generator.NewTracesGenerator(define.TracesOptions{
+			SpanCount: 10,
+			SpanKind:  1,
+		})
+		b, _ := ptrace.NewProtoMarshaler().MarshalTraces(g.Generate())
+		buf := bytes.NewBuffer(b)
 
-	var n int
-	svc := HttpService{
-		receiver.Publisher{Func: func(record *define.Record) { n++ }},
-		pipeline.Validator{Func: func(record *define.Record) (define.StatusCode, string, error) {
-			return define.StatusCodeOK, "", nil
-		}},
-	}
-	rw := httptest.NewRecorder()
-	svc.ExportTraces(rw, req)
-	assert.Equal(t, rw.Code, http.StatusInternalServerError)
-	assert.Equal(t, 0, n)
-}
+		req := httptest.NewRequest(http.MethodPut, localV1TracesURL, buf)
+		req.Header.Set("Content-Type", define.ContentTypeProtobuf)
 
-func TestHttpTracesPreCheckFailed(t *testing.T) {
-	g := generator.NewTracesGenerator(define.TracesOptions{
-		SpanCount: 10,
-		SpanKind:  1,
+		svc, n := newSvc(define.StatusCodeOK, "", nil)
+		rw := httptest.NewRecorder()
+		svc.ExportTraces(rw, req)
+		assert.Equal(t, rw.Code, http.StatusOK)
+		assert.Equal(t, int64(1), n.Load())
 	})
-	b, err := ptrace.NewJSONMarshaler().MarshalTraces(g.Generate())
-	assert.NoError(t, err)
 
-	buf := &bytes.Buffer{}
-	buf.Write(b)
+	t.Run("invalid body", func(t *testing.T) {
+		buf := bytes.NewBufferString("{-}")
+		req := httptest.NewRequest(http.MethodPut, localV1TracesURL, buf)
 
-	req, err := http.NewRequest(http.MethodPut, "http://localhost/v1/traces", buf)
-	assert.NoError(t, err)
-
-	var n int
-	svc := HttpService{
-		receiver.Publisher{Func: func(record *define.Record) { n++ }},
-		pipeline.Validator{Func: func(record *define.Record) (define.StatusCode, string, error) {
-			return define.StatusCodeUnauthorized, "", errors.New("MUST ERROR")
-		}},
-	}
-	rw := httptest.NewRecorder()
-	svc.ExportTraces(rw, req)
-	assert.Equal(t, rw.Code, http.StatusUnauthorized)
-	assert.Equal(t, 0, n)
-}
-
-func TestHttpTracesTokenAfterPreCheck(t *testing.T) {
-	g := generator.NewTracesGenerator(define.TracesOptions{
-		SpanCount: 10,
-		SpanKind:  1,
+		svc, n := newSvc(define.StatusCodeOK, "", nil)
+		rw := httptest.NewRecorder()
+		svc.ExportTraces(rw, req)
+		assert.Equal(t, rw.Code, http.StatusBadRequest)
+		assert.Equal(t, int64(0), n.Load())
 	})
-	b, err := ptrace.NewJSONMarshaler().MarshalTraces(g.Generate())
-	assert.NoError(t, err)
 
-	buf := &bytes.Buffer{}
-	buf.Write(b)
+	t.Run("read failed", func(t *testing.T) {
+		buf := testkits.NewBrokenReader()
+		req := httptest.NewRequest(http.MethodPut, localV1TracesURL, buf)
 
-	req, err := http.NewRequest(http.MethodPut, "http://localhost/v1/traces", buf)
-	assert.NoError(t, err)
-
-	var n int
-	svc := HttpService{
-		receiver.Publisher{Func: func(record *define.Record) { n++ }},
-		pipeline.Validator{Func: func(record *define.Record) (define.StatusCode, string, error) {
-			return define.StatusCodeOK, "", nil
-		}},
-	}
-	rw := httptest.NewRecorder()
-	svc.ExportTraces(rw, req)
-	assert.Equal(t, rw.Code, http.StatusOK)
-	assert.Equal(t, 1, n)
-}
-
-func TestHttpMetricsTokenAfterPreCheck(t *testing.T) {
-	g := generator.NewMetricsGenerator(define.MetricsOptions{
-		GaugeCount: 10,
+		svc, n := newSvc(define.StatusCodeOK, "", nil)
+		rw := httptest.NewRecorder()
+		svc.ExportTraces(rw, req)
+		assert.Equal(t, rw.Code, http.StatusInternalServerError)
+		assert.Equal(t, int64(0), n.Load())
 	})
-	b, err := pmetric.NewJSONMarshaler().MarshalMetrics(g.Generate())
-	assert.NoError(t, err)
 
-	buf := &bytes.Buffer{}
-	buf.Write(b)
+	t.Run("traces precheck failed", func(t *testing.T) {
+		g := generator.NewTracesGenerator(define.TracesOptions{
+			SpanCount: 10,
+			SpanKind:  1,
+		})
+		b, _ := ptrace.NewJSONMarshaler().MarshalTraces(g.Generate())
+		buf := bytes.NewBuffer(b)
+		req := httptest.NewRequest(http.MethodPut, localV1TracesURL, buf)
 
-	req, err := http.NewRequest(http.MethodPut, "http://localhost/v1/metrics", buf)
-	assert.NoError(t, err)
-
-	var n int
-	svc := HttpService{
-		receiver.Publisher{Func: func(record *define.Record) { n++ }},
-		pipeline.Validator{Func: func(record *define.Record) (define.StatusCode, string, error) {
-			return define.StatusCodeOK, "", nil
-		}},
-	}
-	rw := httptest.NewRecorder()
-	svc.ExportMetrics(rw, req)
-	assert.Equal(t, rw.Code, http.StatusOK)
-	assert.Equal(t, 1, n)
-}
-
-func TestHttpLogsTokenAfterPreCheck(t *testing.T) {
-	g := generator.NewLogsGenerator(define.LogsOptions{
-		LogCount:  10,
-		LogLength: 10,
+		svc, n := newSvc(define.StatusCodeUnauthorized, "", errors.New("MUST ERROR"))
+		rw := httptest.NewRecorder()
+		svc.ExportTraces(rw, req)
+		assert.Equal(t, rw.Code, http.StatusUnauthorized)
+		assert.Equal(t, int64(0), n.Load())
 	})
-	b, err := plog.NewJSONMarshaler().MarshalLogs(g.Generate())
-	assert.NoError(t, err)
 
-	buf := &bytes.Buffer{}
-	buf.Write(b)
+	t.Run("traces success", func(t *testing.T) {
+		g := generator.NewTracesGenerator(define.TracesOptions{
+			SpanCount: 10,
+			SpanKind:  1,
+		})
+		b, _ := ptrace.NewJSONMarshaler().MarshalTraces(g.Generate())
+		buf := bytes.NewBuffer(b)
+		req := httptest.NewRequest(http.MethodPut, localV1TracesURL, buf)
 
-	req, err := http.NewRequest(http.MethodPut, "http://localhost/v1/logs", buf)
-	assert.NoError(t, err)
+		svc, n := newSvc(define.StatusCodeOK, "", nil)
+		rw := httptest.NewRecorder()
+		svc.ExportTraces(rw, req)
+		assert.Equal(t, rw.Code, http.StatusOK)
+		assert.Equal(t, int64(1), n.Load())
+	})
 
-	var n int
-	svc := HttpService{
-		receiver.Publisher{Func: func(record *define.Record) { n++ }},
-		pipeline.Validator{Func: func(record *define.Record) (define.StatusCode, string, error) {
-			return define.StatusCodeOK, "", nil
-		}},
-	}
-	rw := httptest.NewRecorder()
-	svc.ExportLogs(rw, req)
-	assert.Equal(t, rw.Code, http.StatusOK)
-	assert.Equal(t, 1, n)
+	t.Run("metrics success", func(t *testing.T) {
+		g := generator.NewMetricsGenerator(define.MetricsOptions{
+			GaugeCount: 10,
+		})
+		b, _ := pmetric.NewJSONMarshaler().MarshalMetrics(g.Generate())
+		buf := bytes.NewBuffer(b)
+		req := httptest.NewRequest(http.MethodPut, localV1MetricsURL, buf)
+
+		svc, n := newSvc(define.StatusCodeOK, "", nil)
+		rw := httptest.NewRecorder()
+		svc.ExportMetrics(rw, req)
+		assert.Equal(t, rw.Code, http.StatusOK)
+		assert.Equal(t, int64(1), n.Load())
+	})
+
+	t.Run("logs success", func(t *testing.T) {
+		g := generator.NewLogsGenerator(define.LogsOptions{
+			LogCount:  10,
+			LogLength: 10,
+		})
+		b, _ := plog.NewJSONMarshaler().MarshalLogs(g.Generate())
+		buf := bytes.NewBuffer(b)
+		req := httptest.NewRequest(http.MethodPut, localV1LogsURL, buf)
+
+		svc, n := newSvc(define.StatusCodeOK, "", nil)
+		rw := httptest.NewRecorder()
+		svc.ExportLogs(rw, req)
+		assert.Equal(t, rw.Code, http.StatusOK)
+		assert.Equal(t, int64(1), n.Load())
+	})
 }

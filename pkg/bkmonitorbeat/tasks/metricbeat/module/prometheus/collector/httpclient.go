@@ -10,6 +10,7 @@
 package collector
 
 import (
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -23,11 +24,21 @@ import (
 	"github.com/elastic/beats/metricbeat/mb"
 )
 
+type authConfig struct {
+	bearerFile  string
+	bearerToken string
+	username    string
+	password    string
+}
+
 type HTTPClient struct {
-	base    mb.BaseMetricSet
-	client  *http.Client
-	headers map[string]string
-	method  string
+	base     mb.BaseMetricSet
+	client   *http.Client
+	method   string
+	rawQuery string
+
+	baseHeader map[string]string
+	authConf   authConfig
 }
 
 func NewHTTPClient(base mb.BaseMetricSet) (*HTTPClient, error) {
@@ -40,32 +51,21 @@ func NewHTTPClient(base mb.BaseMetricSet) (*HTTPClient, error) {
 		Username    string             `config:"username"`
 		Password    string             `config:"password"`
 		ProxyURL    string             `config:"proxy_url"`
+		Query       url.Values         `config:"query"`
 	}{}
 	if err := base.Module().UnpackConfig(&config); err != nil {
 		return nil, err
 	}
 
-	if config.Headers == nil {
-		config.Headers = map[string]string{}
-	}
-	config.Headers["Accept"] = "application/openmetrics-text,*/*"
-	config.Headers["X-BK-AGENT"] = "bkmonitorbeat"
-
-	if config.BearerToken != "" {
-		config.Headers["Authorization"] = fmt.Sprintf("Bearer %s", config.BearerToken)
+	params := make(url.Values)
+	for k, v := range config.Query {
+		params[k] = make([]string, len(v))
+		copy(params[k], v)
 	}
 
-	if config.BearerToken == "" && config.BearerFile != "" {
-		data, err := os.ReadFile(config.BearerFile)
-		if err != nil {
-			return nil, err
-		}
-		config.Headers["Authorization"] = fmt.Sprintf("Bearer %s", data)
-	}
-
-	if config.Username != "" || config.Password != "" {
-		auth := config.Username + ":" + config.Password
-		config.Headers["Authorization"] = fmt.Sprintf("Basic %s", base64.StdEncoding.EncodeToString([]byte(auth)))
+	var rawQuery string
+	if len(params) > 0 {
+		rawQuery = params.Encode()
 	}
 
 	tlsConfig, err := outputs.LoadTLSConfig(config.TLS)
@@ -84,6 +84,11 @@ func NewHTTPClient(base mb.BaseMetricSet) (*HTTPClient, error) {
 		DialTLS:         tlsDialer.Dial,
 		IdleConnTimeout: time.Minute * 5,
 	}
+
+	if tlsConfig != nil && tlsConfig.Verification == transport.VerifyNone {
+		trp.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+
 	if config.ProxyURL != "" {
 		parsed, err := url.Parse(config.ProxyURL)
 		if err != nil {
@@ -92,20 +97,66 @@ func NewHTTPClient(base mb.BaseMetricSet) (*HTTPClient, error) {
 		trp.Proxy = http.ProxyURL(parsed)
 	}
 
+	authConf := authConfig{
+		bearerFile:  config.BearerFile,
+		bearerToken: config.BearerToken,
+		username:    config.Username,
+		password:    config.Password,
+	}
+
 	return &HTTPClient{
 		base: base,
 		client: &http.Client{
 			Transport: trp,
 			Timeout:   config.Timeout,
 		},
-		headers: config.Headers,
-		method:  "GET",
+		baseHeader: config.Headers,
+		authConf:   authConf,
+		method:     "GET",
+		rawQuery:   rawQuery,
 	}, nil
 }
 
+func (cli *HTTPClient) getHeaders() (map[string]string, error) {
+	headers := make(map[string]string)
+
+	for k, v := range cli.baseHeader {
+		headers[k] = v
+	}
+	headers["Accept"] = "application/openmetrics-text,*/*"
+	headers["X-BK-AGENT"] = "bkmonitorbeat"
+
+	if cli.authConf.bearerToken != "" {
+		headers["Authorization"] = fmt.Sprintf("Bearer %s", cli.authConf.bearerToken)
+	}
+
+	if cli.authConf.bearerToken == "" && cli.authConf.bearerFile != "" {
+		data, err := os.ReadFile(cli.authConf.bearerFile)
+		if err != nil {
+			return nil, err
+		}
+		headers["Authorization"] = fmt.Sprintf("Bearer %s", data)
+	}
+
+	if cli.authConf.username != "" || cli.authConf.password != "" {
+		auth := cli.authConf.username + ":" + cli.authConf.password
+		headers["Authorization"] = fmt.Sprintf("Basic %s", base64.StdEncoding.EncodeToString([]byte(auth)))
+	}
+	return headers, nil
+}
+
 func (cli *HTTPClient) FetchResponse() (*http.Response, error) {
+	u, err := url.Parse(cli.base.HostData().SanitizedURI)
+	if err != nil {
+		return nil, err
+	}
+	u.RawQuery = cli.rawQuery
+	reqUrl := u.String()
+	if cli.rawQuery == "" {
+		reqUrl = cli.base.HostData().SanitizedURI
+	}
 	var reader io.Reader
-	req, err := http.NewRequest(cli.method, cli.base.HostData().SanitizedURI, reader)
+	req, err := http.NewRequest(cli.method, reqUrl, reader)
 	if err != nil {
 		return nil, err
 	}
@@ -114,7 +165,11 @@ func (cli *HTTPClient) FetchResponse() (*http.Response, error) {
 		req.SetBasicAuth(cli.base.HostData().User, cli.base.HostData().Password)
 	}
 
-	for k, v := range cli.headers {
+	headers, err := cli.getHeaders()
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
 

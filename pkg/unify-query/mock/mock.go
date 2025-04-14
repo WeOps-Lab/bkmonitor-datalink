@@ -12,95 +12,32 @@ package mock
 import (
 	"context"
 	"fmt"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
-	"go.opentelemetry.io/otel/trace"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 
-	goRedis "github.com/go-redis/redis/v8"
-	"github.com/spf13/viper"
-
-	offlineDataArchiveMetadata "github.com/TencentBlueKing/bkmonitor-datalink/pkg/offline-data-archive/metadata"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/config"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/influxdb"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/log"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/offlineDataArchive"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/redis"
-	ir "github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/router/influxdb"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 )
 
 var (
-	once       sync.Once
-	genTraceID int
-	genSpanID  int
-	lock       sync.Mutex
+	mockInitOnce sync.Once
 )
 
-func Init(ctx context.Context) context.Context {
-	once.Do(func() {
-		config.CustomConfigFilePath = os.Getenv("UNIFY-QUERY-CONFIG-FILE-PATH")
+func Init() {
+	mockInitOnce.Do(func() {
+		dir, _ := os.Getwd()
+		dir, _ = filepath.Abs(dir)
+		name := `bkmonitor-datalink/pkg/unify-query`
+		rootDir := strings.Split(dir, name)
+		path := fmt.Sprintf("%s%s/unify-query.yaml", rootDir[0], name)
+		config.CustomConfigFilePath = path
+		config.InitConfig()
 		log.InitTestLogger()
-
 		metadata.InitMetadata()
+		ctx := metadata.InitHashID(context.Background())
+		mockHandler(ctx)
 	})
-
-	lock.Lock()
-	defer lock.Unlock()
-	genTraceID++
-	genSpanID++
-	tid, _ := trace.TraceIDFromHex(fmt.Sprintf("%032x", genTraceID))
-	sid, _ := trace.SpanIDFromHex(fmt.Sprintf("%016x", genTraceID))
-	sc := trace.NewSpanContext(trace.SpanContextConfig{TraceID: tid, SpanID: sid})
-	return trace.ContextWithRemoteSpanContext(ctx, sc)
-}
-
-func SetOfflineDataArchiveMetadata(m offlineDataArchiveMetadata.Metadata) {
-	offlineDataArchive.MockMetaData(m)
-}
-
-func SetSpaceTsDbMockData(
-	ctx context.Context, path string, bucketName string, spaceInfo ir.SpaceInfo, rtInfo ir.ResultTableDetailInfo,
-	fieldInfo ir.FieldToResultTable, dataLabelInfo ir.DataLabelToResultTable) {
-	sr, err := influxdb.SetSpaceTsDbRouter(ctx, path, bucketName, "", 100)
-	Init(ctx)
-	if err != nil {
-		panic(err)
-	}
-	for sid, space := range spaceInfo {
-		err = sr.Add(ctx, ir.SpaceToResultTableKey, sid, &space)
-		if err != nil {
-			panic(err)
-		}
-	}
-	for rid, rt := range rtInfo {
-		err = sr.Add(ctx, ir.ResultTableDetailKey, rid, rt)
-		if err != nil {
-			panic(err)
-		}
-	}
-	for field, rts := range fieldInfo {
-		err = sr.Add(ctx, ir.FieldToResultTableKey, field, &rts)
-		if err != nil {
-			panic(err)
-		}
-	}
-	for dataLabel, rts := range dataLabelInfo {
-		err = sr.Add(ctx, ir.DataLabelToResultTableKey, dataLabel, &rts)
-		if err != nil {
-			panic(err)
-		}
-	}
-}
-
-func SetRedisClient(ctx context.Context, serverName string) {
-	Init(ctx)
-	host := viper.GetString("redis.host")
-	port := viper.GetInt("redis.port")
-	pwd := viper.GetString("redis.password")
-	options := &goRedis.UniversalOptions{
-		DB:       0,
-		Addrs:    []string{fmt.Sprintf("%s:%d", host, port)},
-		Password: pwd,
-	}
-	redis.SetInstance(ctx, serverName, options)
 }

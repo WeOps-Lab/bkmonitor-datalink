@@ -44,8 +44,11 @@ func init() {
 	receiver.RegisterReadyFunc(define.SourceOtlp, Ready)
 }
 
-func Ready() {
-	receiver.RegisterHttpRoute(define.SourceOtlp, []receiver.RouteWithFunc{
+func Ready(config receiver.ComponentConfig) {
+	if !config.Otlp.Enabled {
+		return
+	}
+	receiver.RegisterRecvHttpRoute(define.SourceOtlp, []receiver.RouteWithFunc{
 		{
 			Method:       http.MethodPost,
 			RelativePath: routeV1Traces,
@@ -68,7 +71,7 @@ func Ready() {
 		},
 	})
 
-	receiver.RegisterGrpcRoute(func(s *grpc.Server) {
+	receiver.RegisterRecvGrpcRoute(func(s *grpc.Server) {
 		ptraceotlp.RegisterServer(s, grpcSvc.traces)
 		pmetricotlp.RegisterServer(s, grpcSvc.metrics)
 		plogotlp.RegisterServer(s, grpcSvc.logs)
@@ -101,6 +104,15 @@ func writeError(w http.ResponseWriter, rh receiver.ResponseHandler, err error, s
 	receiver.WriteResponse(w, rh.ContentType(), statusCode, msg)
 }
 
+// 允许从 Http Header 中读取 token
+func extractTokenFromHttpHeader(header http.Header) string {
+	token := header.Get(define.KeyToken)
+	if len(token) > 0 {
+		return token
+	}
+	return header.Get(define.KeyTenantID)
+}
+
 func (s HttpService) httpExport(w http.ResponseWriter, req *http.Request, rtype define.RecordType) {
 	defer utils.HandleCrash()
 	ip := utils.ParseRequestIP(req.RemoteAddr)
@@ -111,7 +123,7 @@ func (s HttpService) httpExport(w http.ResponseWriter, req *http.Request, rtype 
 	if err != nil {
 		metricMonitor.IncInternalErrorCounter(define.RequestHttp, rtype)
 		receiver.WriteResponse(w, define.ContentTypeJson, http.StatusInternalServerError, nil)
-		logger.Errorf("failed to read body content, ip=%v, error: %s", ip, err)
+		logger.Errorf("failed to read body content, rtype=%s, ip=%v, error: %s", rtype.S(), ip, err)
 		return
 	}
 	defer func() {
@@ -123,7 +135,7 @@ func (s HttpService) httpExport(w http.ResponseWriter, req *http.Request, rtype 
 	if err != nil {
 		metricMonitor.IncDroppedCounter(define.RequestHttp, rtype)
 		writeError(w, rh, err, http.StatusBadRequest)
-		logger.Warnf("failed to unmarshal body, ip=%v, error: %s", ip, err)
+		logger.Warnf("failed to unmarshal body, rtype=%s, ip=%v, error: %s", rtype.S(), ip, err)
 		return
 	}
 
@@ -133,6 +145,12 @@ func (s HttpService) httpExport(w http.ResponseWriter, req *http.Request, rtype 
 		RecordType:    rtype,
 		Data:          data,
 	}
+
+	tk := extractTokenFromHttpHeader(req.Header)
+	if len(tk) > 0 {
+		r.Token = define.Token{Original: tk}
+	}
+
 	prettyprint.Pretty(rtype, data)
 
 	code, processorName, err := s.Validate(r)

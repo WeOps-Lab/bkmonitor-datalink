@@ -12,11 +12,18 @@ package metadata
 const (
 	BkQuerySourceHeader = "Bk-Query-Source"
 	SpaceUIDHeader      = "X-Bk-Scope-Space-Uid"
+	SkipSpaceHeader     = "X-Bk-Scope-Skip-Space"
 
-	UserKey           = "user"
-	MessageKey        = "message"
-	QueriesKey        = "queries"
-	QueryReferenceKey = "query_reference"
+	UserKey               = "user"
+	StatusKey             = "message"
+	ExpandKey             = "expand"
+	QueriesKey            = "queries"
+	QueryParamsKey        = "query_params"
+	QueryReferenceKey     = "query_reference"
+	QueryClusterMetricKey = "query_cluster_metric"
+	JwtPayLoadKey         = "jwt_payload"
+
+	PromDataFormatKey = "prom_data_format"
 
 	ExceedsMaximumLimit  = "EXCEEDS_MAXIMUM_LIMIT"
 	ExceedsMaximumSlimit = "EXCEEDS_MAXIMUM_SLIMIT"
@@ -24,4 +31,6 @@ const (
 	SpaceIsNotExists             = "SPACE_IS_NOT_EXISTS"
 	SpaceTableIDFieldIsNotExists = "SPACE_TABLE_ID_FIELD_IS_NOT_EXISTS"
 	TableIDProxyISNotExists      = "TABLE_ID_PROXY_IS_NOT_EXISTS"
+
+	QueryRawError = "QUERY_RAW_ERROR"
 )

@@ -12,8 +12,13 @@ package influxdb
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/mock"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/router/influxdb"
 )
 
 func TestGetTagRouter(t *testing.T) {
@@ -47,8 +52,46 @@ func TestGetTagRouter(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			actual, err := GetTagRouter(context.Background(), c.tagKey, c.condition)
 			assert.Nil(t, err)
-			if err == nil {
-				assert.Equal(t, c.expected, actual)
+			assert.Equal(t, c.expected, actual)
+		})
+	}
+}
+
+func TestRouterPingInfluxdb(t *testing.T) {
+	testCases := map[string]struct {
+		HostInfo influxdb.HostInfo
+		Expected bool
+	}{
+		"test-1": {
+			HostInfo: map[string]*influxdb.Host{
+				"127.0.0.1": {
+					DomainName: "127.0.0.1",
+					Port:       6371,
+					Protocol:   "http",
+				},
+			},
+			Expected: true,
+		},
+		"test-2": {
+			HostInfo: map[string]*influxdb.Host{
+				"127.0.0.2": {
+					DomainName: "127.0.0.2",
+					Port:       6371,
+					Protocol:   "http",
+				},
+			},
+			Expected: false,
+		},
+	}
+
+	mock.Init()
+	for name, v := range testCases {
+		t.Run(name, func(t *testing.T) {
+			ctx := metadata.InitHashID(context.Background())
+			ir := MockRouterWithHostInfo(v.HostInfo)
+			ir.Ping(ctx, time.Second*1, 3)
+			for _, j := range ir.hostStatusInfo {
+				assert.Equal(t, v.Expected, j.Read)
 			}
 		})
 	}

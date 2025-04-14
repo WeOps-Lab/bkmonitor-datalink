@@ -15,50 +15,26 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sync"
 	"time"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/avast/retry-go"
+	redis "github.com/go-redis/redis/v8"
 	"github.com/spf13/cast"
-	"github.com/spf13/viper"
 
 	common "github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/common"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/config"
 	task "github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/task"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/utils/errors"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/utils/timex"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/logger"
 	redisUtils "github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/register/redis"
 )
-
-const (
-	redisModePath             = "broker.redis.mode"
-	redisMasterNamePath       = "broker.redis.master_name"
-	redisAddressPath          = "broker.redis.address"
-	redisHostPath             = "broker.redis.host"
-	redisPortPath             = "broker.redis.port"
-	redisUsernamePath         = "broker.redis.username"
-	redisSentinelPasswordPath = "broker.redis.sentinel_password"
-	redisPasswordPath         = "broker.redis.password"
-	redisDatabasePath         = "broker.redis.database"
-	redisDialTimeoutPath      = "broker.redis.dial_timeout"
-	redisReadTimeoutPath      = "broker.redis.read_timeout"
-)
-
-func init() {
-	viper.SetDefault(redisMasterNamePath, "")
-	viper.SetDefault(redisAddressPath, []string{"127.0.0.1:6379"})
-	viper.SetDefault(redisHostPath, "127.0.0.1")
-	viper.SetDefault(redisPortPath, 6379)
-	viper.SetDefault(redisUsernamePath, "root")
-	viper.SetDefault(redisPasswordPath, "")
-	viper.SetDefault(redisSentinelPasswordPath, "")
-	viper.SetDefault(redisDatabasePath, 0)
-	viper.SetDefault(redisDialTimeoutPath, time.Second*10)
-	viper.SetDefault(redisReadTimeoutPath, time.Second*10)
-}
 
 // set ttl
 const statsTTL = 90 * 24 * time.Hour
 
-const LeaseDuration = 30 * time.Second
+const LeaseDuration = 30 * time.Minute
 
 // RDB is a client interface to query and mutate task queues.
 type RDB struct {
@@ -66,36 +42,59 @@ type RDB struct {
 	clock  timex.Clock
 }
 
-var rdb *RDB
+var (
+	brokerInstance *RDB
+	brokerOnce     sync.Once
+)
 
-// NewRDB new a rdb client
-func NewRDB() (*RDB, error) {
-	if rdb != nil {
-		return rdb, nil
+// GetRDB Get the redis broker client
+func GetRDB() *RDB {
+	if brokerInstance != nil {
+		return brokerInstance
 	}
-	// new redis client
-	client, err := redisUtils.NewRedisClient(
-		context.Background(),
-		&redisUtils.Option{
-			Mode:             viper.GetString(redisModePath),
-			Host:             viper.GetString(redisHostPath),
-			Port:             viper.GetInt(redisPortPath),
-			SentinelAddress:  viper.GetStringSlice(redisAddressPath),
-			MasterName:       viper.GetString(redisMasterNamePath),
-			Password:         viper.GetString(redisPasswordPath),
-			SentinelPassword: viper.GetString(redisSentinelPasswordPath),
-			Db:               viper.GetInt(redisDatabasePath),
-			DialTimeout:      viper.GetDuration(redisDialTimeoutPath),
-			ReadTimeout:      viper.GetDuration(redisReadTimeoutPath),
-		},
-	)
-	if err != nil {
-		return nil, err
-	}
-	return &RDB{client: client, clock: timex.NewTimeClock()}, err
+
+	brokerOnce.Do(func() {
+		var client redis.UniversalClient
+		var err error
+
+		err = retry.Do(
+			func() error {
+				client, err = redisUtils.NewRedisClient(
+					context.Background(),
+					&redisUtils.Option{
+						Mode:             config.BrokerRedisMode,
+						Host:             config.BrokerRedisStandaloneHost,
+						Port:             config.BrokerRedisStandalonePort,
+						Password:         config.BrokerRedisStandalonePassword,
+						SentinelAddress:  config.BrokerRedisSentinelAddress,
+						MasterName:       config.BrokerRedisSentinelMasterName,
+						SentinelPassword: config.BrokerRedisSentinelPassword,
+						Db:               config.BrokerRedisDatabase,
+						DialTimeout:      config.BrokerRedisDialTimeout,
+						ReadTimeout:      config.BrokerRedisReadTimeout,
+					},
+				)
+				if err != nil {
+					return err
+				}
+				return nil
+			},
+			retry.Attempts(3),
+			retry.Delay(5*time.Second),
+		)
+
+		// 因为是必要依赖，如果有错误，直接异常
+		if err != nil {
+			logger.Fatalf("failed to create redis broker client, error: %s", err)
+		}
+
+		brokerInstance = &RDB{client: client, clock: timex.NewTimeClock()}
+	})
+
+	return brokerInstance
 }
 
-// Open open a connection
+// Open opens a connection
 func (r *RDB) Open() error {
 	return nil
 }
@@ -161,6 +160,7 @@ redis.call("HSET", KEYS[1],
            "msg", ARGV[1],
            "state", "pending",
            "pending_since", ARGV[3])
+redis.call("EXPIRE", KEYS[1], ARGV[4])
 redis.call("LPUSH", KEYS[2], ARGV[2])
 return 1
 `)
@@ -183,6 +183,7 @@ func (r *RDB) Enqueue(ctx context.Context, msg *task.TaskMessage) error {
 		encoded,
 		msg.ID,
 		r.clock.Now().UnixNano(),
+		msg.Timeout,
 	}
 	n, err := r.runScriptWithErrorCode(ctx, op, enqueueCmd, keys, argv...)
 	if err != nil {
@@ -222,6 +223,7 @@ redis.call("HSET", KEYS[2],
            "state", "pending",
            "pending_since", ARGV[4],
            "unique_key", KEYS[1])
+redis.call("EXPIRE", KEYS[2], ARGV[5])
 redis.call("LPUSH", KEYS[3], ARGV[1])
 return 1
 `)
@@ -247,16 +249,17 @@ func (r *RDB) EnqueueUnique(ctx context.Context, msg *task.TaskMessage, ttl time
 		int(ttl.Seconds()),
 		encoded,
 		r.clock.Now().UnixNano(),
+		msg.Timeout,
 	}
 	n, err := r.runScriptWithErrorCode(ctx, op, enqueueUniqueCmd, keys, argv...)
 	if err != nil {
 		return err
 	}
 	if n == -1 {
-		return errors.E(op, errors.AlreadyExists, errors.ErrDuplicateTask)
+		return errors.E(op, errors.AlreadyExists, errors.ErrDuplicateTask, msg.UniqueKey)
 	}
 	if n == 0 {
-		return errors.E(op, errors.AlreadyExists, errors.ErrTaskIdConflict)
+		return errors.E(op, errors.AlreadyExists, errors.ErrTaskIdConflict, msg.UniqueKey)
 	}
 	return nil
 }
@@ -309,13 +312,17 @@ func (r *RDB) Dequeue(qnames ...string) (msg *task.TaskMessage, leaseExpirationT
 		}
 		res, err := dequeueCmd.Run(context.Background(), r.client, keys, argv...).Result()
 		if err == redis.Nil {
+			logger.Debugf("No processable task found in queue %s, keys: %v, args: %v", qname, keys, argv)
 			continue
 		} else if err != nil {
 			return nil, time.Time{}, errors.E(op, errors.Unknown, fmt.Sprintf("redis eval error: %v", err))
 		}
 		encoded, err := cast.ToStringE(res)
 		if err != nil {
-			return nil, time.Time{}, errors.E(op, errors.Internal, fmt.Sprintf("cast error: unexpected return value from Lua script: %v", res))
+			return nil, time.Time{}, errors.E(
+				op, errors.Internal,
+				fmt.Sprintf("cast error: unexpected return value from Lua script: %v", res),
+			)
 		}
 		if msg, err = task.DecodeMessage([]byte(encoded)); err != nil {
 			return nil, time.Time{}, errors.E(op, errors.Internal, fmt.Sprintf("cannot decode message: %v", err))
@@ -335,12 +342,8 @@ func (r *RDB) Dequeue(qnames ...string) (msg *task.TaskMessage, leaseExpirationT
 // ARGV[2] -> stats expiration timestamp
 // ARGV[3] -> max int64 value
 var doneCmd = redis.NewScript(`
-if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then
-  return redis.error_reply("NOT FOUND")
-end
-if redis.call("ZREM", KEYS[2], ARGV[1]) == 0 then
-  return redis.error_reply("NOT FOUND")
-end
+redis.call("LREM", KEYS[1], 0, ARGV[1])
+redis.call("ZREM", KEYS[2], ARGV[1])
 if redis.call("DEL", KEYS[3]) == 0 then
   return redis.error_reply("NOT FOUND")
 end
@@ -368,12 +371,8 @@ return redis.status_reply("OK")
 // ARGV[2] -> stats expiration timestamp
 // ARGV[3] -> max int64 value
 var doneUniqueCmd = redis.NewScript(`
-if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then
-  return redis.error_reply("NOT FOUND")
-end
-if redis.call("ZREM", KEYS[2], ARGV[1]) == 0 then
-  return redis.error_reply("NOT FOUND")
-end
+redis.call("LREM", KEYS[1], 0, ARGV[1])
+redis.call("ZREM", KEYS[2], ARGV[1])
 if redis.call("DEL", KEYS[3]) == 0 then
   return redis.error_reply("NOT FOUND")
 end
@@ -637,7 +636,8 @@ redis.call("ZADD", KEYS[3], ARGV[3], ARGV[1])
 return 1
 `)
 
-// ScheduleUnique adds the task to the backlog queue to be processed in the future if the uniqueness lock can be acquired.
+// ScheduleUnique adds the task to the backlog queue to be processed in the future,
+// if the uniqueness lock can be acquired.
 // It returns ErrDuplicateTask if the lock cannot be acquired.
 func (r *RDB) ScheduleUnique(ctx context.Context, msg *task.TaskMessage, processAt time.Time, ttl time.Duration) error {
 	var op errors.Op = "rdb.ScheduleUnique"
@@ -776,16 +776,12 @@ const (
 // ARGV[6] -> stats expiration timestamp
 // ARGV[7] -> max int64 value
 var archiveCmd = redis.NewScript(`
-if redis.call("LREM", KEYS[2], 0, ARGV[1]) == 0 then
-  return redis.error_reply("NOT FOUND")
-end
-if redis.call("ZREM", KEYS[3], ARGV[1]) == 0 then
-  return redis.error_reply("NOT FOUND")
-end
+redis.call("LREM", KEYS[2], 0, ARGV[1])
+redis.call("ZREM", KEYS[3], ARGV[1])
 redis.call("ZADD", KEYS[4], ARGV[3], ARGV[1])
 redis.call("ZREMRANGEBYSCORE", KEYS[4], "-inf", ARGV[4])
 redis.call("ZREMRANGEBYRANK", KEYS[4], 0, -ARGV[5])
-redis.call("HSET", KEYS[1], "msg", ARGV[2], "state", "archived")
+redis.call("DEL", KEYS[1])
 local n = redis.call("INCR", KEYS[5])
 if tonumber(n) == 1 then
 	redis.call("EXPIREAT", KEYS[5], ARGV[6])
@@ -1006,7 +1002,8 @@ func (r *RDB) ExtendLease(qname string, ids ...string) (expirationTime time.Time
 		zs = append(zs, &redis.Z{Member: id, Score: float64(expireAt.Unix())})
 	}
 	// Use XX option to only update elements that already exist; Don't add new elements
-	// TODO: Consider adding GT option to ensure we only "extend" the lease. Ceveat is that GT is supported from redis v6.2.0 or above.
+	// TODO: Consider adding GT option to ensure we only "extend" the lease.
+	// TODO Ceveat is that GT is supported from redis v6.2.0 or above.
 	err = r.client.ZAddXX(context.Background(), common.LeaseKey(qname), zs...).Err()
 	if err != nil {
 		return time.Time{}, err

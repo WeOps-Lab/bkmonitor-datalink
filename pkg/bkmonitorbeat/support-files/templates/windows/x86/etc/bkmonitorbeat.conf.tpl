@@ -4,11 +4,11 @@ output.bkpipe:
   endpoint: '{{ plugin_path.endpoint }}'
   # 地址分配方式，static：静态 dynamic：动态
   bk_addressing: {{ cmdb_instance.host.bk_addressing|default('static', true) }}
-{%- if nodeman is defined %}
-  hostip: {{ nodeman.host.inner_ip }}
-{%- else %}
-  hostip: {{ cmdb_instance.host.bk_host_innerip_v6 if cmdb_instance.host.bk_host_innerip_v6 and not cmdb_instance.host.bk_host_innerip else cmdb_instance.host.bk_host_innerip }}
-{%- endif %}
+#{%- if nodeman is defined %}
+#  hostip: {{ nodeman.host.inner_ip }}
+#{%- else %}
+#  hostip: {{ cmdb_instance.host.bk_host_innerip_v6 if cmdb_instance.host.bk_host_innerip_v6 and not cmdb_instance.host.bk_host_innerip else cmdb_instance.host.bk_host_innerip }}
+#{%- endif %}
   cloudid: {{ cmdb_instance.host.bk_cloud_id[0].id if cmdb_instance.host.bk_cloud_id is iterable and cmdb_instance.host.bk_cloud_id is not string else cmdb_instance.host.bk_cloud_id }}
   hostid: {{ cmdb_instance.host.bk_host_id }}
 
@@ -29,9 +29,13 @@ logging.backups: 5
 
 # ============================= Resource ==================================
 resource_limit:
+{%- if extra_vars is defined and extra_vars.disable_resource_limit is defined and extra_vars.disable_resource_limit == "true" %}
+  enabled: false
+{%- else %}
   enabled: true
   cpu: 1    # CPU 资源限制 单位 core(float64)
   mem: -1 # 内存资源限制 单位 MB(int)，-1 代表无限制
+{%- endif %}
 
 # ================================= Tasks =======================================
 bkmonitorbeat:
@@ -77,6 +81,10 @@ bkmonitorbeat:
     period: 60s
     publish_immediately: true
 
+  # 任务执行状态配置
+  gather_up_beat:
+    dataid: 1100017
+
   # 静态资源采集配置
   static_task:
     dataid: 1100010
@@ -98,7 +106,7 @@ bkmonitorbeat:
       info_timeout: 30s
     disk:
       stat_times: 1
-      mountpoint_black_list: ["docker","container","k8s","kubelet"]
+      mountpoint_black_list: ["docker","container","k8s","kubelet","blueking"]
 {%- if extra_vars is defined and extra_vars.fs_type_white_list is defined %}
       fs_type_white_list: {{ extra_vars.fs_type_white_list | default(["overlay","btrfs","ext2","ext3","ext4","reiser","xfs","ffs","ufs","jfs","jfs2","vxfs","hfs","apfs","refs","ntfs","fat32","zfs"], true) }}
 {%- else %}
@@ -124,7 +132,14 @@ bkmonitorbeat:
     check_disk_space_interval: 60
     check_oom_interval: 10
     used_max_disk_space_percent: 95
-
+    free_min_disk_space: 10
+{%- if extra_vars is defined and extra_vars.corefile_pattern is defined %}
+    corefile_pattern: {{ extra_vars.corefile_pattern or '' }}
+{%- endif %}
+{%- if extra_vars is defined and extra_vars.corefile_match_regex is defined %}
+    corefile_match_regex: {{ extra_vars.corefile_match_regex or '' }}
+{%- endif %}
+    disk_ro_black_list: ["docker","container","k8s","kubelet","blueking"]
   # 进程采集：同步 CMDB 进程配置文件到 bkmonitorbeat 子任务文件夹下
   procconf_task:
     task_id: 103

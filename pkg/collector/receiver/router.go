@@ -10,23 +10,17 @@
 package receiver
 
 import (
-	"fmt"
 	"net/http"
-	"net/http/pprof"
-	"runtime/debug"
 	"sort"
 
 	"github.com/gorilla/mux"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/libgse/beat"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/logger"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/pprofsnapshot"
 )
 
-type Ready func()
+type Ready func(config ComponentConfig)
 
 var componentsReady = map[string]Ready{}
 
@@ -34,59 +28,26 @@ func RegisterReadyFunc(source string, f Ready) {
 	componentsReady[source] = f
 }
 
-func init() {
-	const statsSource = "stats"
-	mustRegisterHttpGetRoute(statsSource, "/metrics", func(w http.ResponseWriter, r *http.Request) {
-		promhttp.Handler().ServeHTTP(w, r)
-	})
-	mustRegisterHttpGetRoute(statsSource, "/ping", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("pong"))
-	})
-
-	const adminSource = "admin"
-	mustRegisterHttpPostRoute(adminSource, "/-/logger", func(w http.ResponseWriter, r *http.Request) {
-		level := r.FormValue("level")
-		logger.SetLoggerLevel(level)
-		w.Write([]byte(`{"status": "success"}`))
-	})
-	mustRegisterHttpPostRoute(adminSource, "/-/reload", func(w http.ResponseWriter, r *http.Request) {
-		beat.ReloadChan <- true
-		w.Write([]byte(`{"status": "success"}`))
-	})
-
-	// debug 专用
-	mustRegisterHttpPostRoute(adminSource, "/-/freemem", func(w http.ResponseWriter, r *http.Request) {
-		debug.FreeOSMemory()
-		w.Write([]byte(`{"status": "success"}`))
-	})
-
-	const pprofSource = "pprof"
-	mustRegisterHttpGetRoute(pprofSource, "/debug/pprof/snapshot", pprofsnapshot.HandlerFuncFor())
-	mustRegisterHttpGetRoute(pprofSource, "/debug/pprof/cmdline", pprof.Cmdline)
-	mustRegisterHttpGetRoute(pprofSource, "/debug/pprof/profile", pprof.Profile)
-	mustRegisterHttpGetRoute(pprofSource, "/debug/pprof/symbol", pprof.Symbol)
-	mustRegisterHttpGetRoute(pprofSource, "/debug/pprof/trace", pprof.Trace)
-	mustRegisterHttpGetRoute(pprofSource, "/debug/pprof/{other}", pprof.Index)
-}
-
 type serviceManager struct {
 	httpRoutes   map[string]define.RouteInfo
 	httpRouter   *mux.Router
 	grpcServices []func(s *grpc.Server)
+	tarsServants map[string]*TarsServant
 }
 
 var serviceMgr = &serviceManager{
-	httpRoutes: map[string]define.RouteInfo{},
-	httpRouter: mux.NewRouter(),
+	httpRoutes:   map[string]define.RouteInfo{},
+	httpRouter:   mux.NewRouter(),
+	tarsServants: map[string]*TarsServant{},
 }
 
-// HttpRouter 返回全局 mux.Router
-func HttpRouter() *mux.Router {
+// RecvHttpRouter 返回 Receiver mux.Router
+func RecvHttpRouter() *mux.Router {
 	return serviceMgr.httpRouter
 }
 
-// HttpRoutes 返回已经注册的路由表
-func HttpRoutes() []define.RouteInfo {
+// RecvHttpRoutes 返回 Receiver 注册的路由表
+func RecvHttpRoutes() []define.RouteInfo {
 	var routes []define.RouteInfo
 	for _, v := range serviceMgr.httpRoutes {
 		routes = append(routes, v)
@@ -104,47 +65,50 @@ type RouteWithFunc struct {
 	HandlerFunc  http.HandlerFunc
 }
 
-func mustRegisterHttpGetRoute(source, relativePath string, handleFunc http.HandlerFunc) {
-	err := registerHttpRoute(source, http.MethodGet, relativePath, handleFunc)
-	if err != nil {
-		panic(err)
-	}
-}
-
-func mustRegisterHttpPostRoute(source, relativePath string, handleFunc http.HandlerFunc) {
-	err := registerHttpRoute(source, http.MethodPost, relativePath, handleFunc)
-	if err != nil {
-		panic(err)
-	}
-}
-
 // registerHttpRoute 端口需要收敛 所以 server 的控制权转移至上层控制器 调用方只需要注册路由
-func registerHttpRoute(source, httpMethod, relativePath string, handleFunc http.HandlerFunc) error {
+func registerHttpRoute(source, httpMethod, relativePath string, handleFunc http.HandlerFunc, mgr *serviceManager) error {
 	ri := define.RouteInfo{
 		Source:     source,
 		HttpMethod: httpMethod,
 		Path:       relativePath,
 	}
-	if _, ok := serviceMgr.httpRoutes[ri.Key()]; ok {
-		return fmt.Errorf("duplicated http route '%v'", ri)
+	if _, ok := mgr.httpRoutes[ri.Key()]; ok {
+		return errors.Errorf("duplicated http route '%v'", ri)
 	}
 
-	serviceMgr.httpRoutes[ri.Key()] = ri
-	serviceMgr.httpRouter.HandleFunc(relativePath, handleFunc).Methods(httpMethod)
+	mgr.httpRoutes[ri.Key()] = ri
+	mgr.httpRouter.HandleFunc(relativePath, handleFunc).Methods(httpMethod)
 	return nil
 }
 
-// RegisterHttpRoute 注册 Http 路由 失败直接 panic
-func RegisterHttpRoute(source string, routes []RouteWithFunc) {
+// RegisterRecvHttpRoute 注册 Http 路由 失败直接 panic
+func RegisterRecvHttpRoute(source string, routes []RouteWithFunc) {
 	for i := 0; i < len(routes); i++ {
 		r := routes[i]
-		if err := registerHttpRoute(source, r.Method, r.RelativePath, r.HandlerFunc); err != nil {
+		if err := registerHttpRoute(source, r.Method, r.RelativePath, r.HandlerFunc, serviceMgr); err != nil {
 			panic(err)
 		}
 	}
 }
 
-// RegisterGrpcRoute 注册 Grpc 路由
-func RegisterGrpcRoute(register func(s *grpc.Server)) {
+// RegisterRecvGrpcRoute 注册 Grpc 路由
+func RegisterRecvGrpcRoute(register func(s *grpc.Server)) {
 	serviceMgr.grpcServices = append(serviceMgr.grpcServices, register)
+}
+
+// registerRecvTarsRoute 注册 Tars Servant
+func registerRecvTarsRoute(o string, server string, impl interface{}, dispatch TarsDispatch, mgr *serviceManager) error {
+	s := NewTarsServant(o, server, impl, dispatch)
+	if _, ok := mgr.tarsServants[s.Obj]; ok {
+		return errors.Errorf("duplicated tars servant '%v'", s.Obj)
+	}
+	serviceMgr.tarsServants[s.Obj] = s
+	return nil
+}
+
+// RegisterRecvTarsRoute 注册 Tars Servant
+func RegisterRecvTarsRoute(o string, server string, impl interface{}, dispatch TarsDispatch) {
+	if err := registerRecvTarsRoute(o, server, impl, dispatch, serviceMgr); err != nil {
+		panic(err)
+	}
 }

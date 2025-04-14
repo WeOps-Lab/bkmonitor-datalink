@@ -103,6 +103,18 @@ bk-collector:
       # default: ""
       endpoint: ":4317"
 
+    # Tars Server Config
+    tars_server:
+      # 是否启动 Tars 服务
+      # default: false
+      enabled: false
+      # 传输协议，目前支持 tcp
+      # default: ""
+      transport: "tcp"
+      # 服务监听端点
+      # default: ""
+      endpoint: ":4319"
+
     components:
       jaeger:
         enabled: true
@@ -112,7 +124,10 @@ bk-collector:
         enabled: true
       zipkin:
         enabled: false
-
+      fta:
+        enabled: true
+      tars:
+        enabled: false
 
   # =============================== Processor ================================
   # name: 名称规则为 ${processor}[/${id}]，id 字段为可选项
@@ -337,6 +352,10 @@ bk-collector:
         decoded_iv: "bkbkbkbkbkbkbkbk"
         decoded_key: "81be7fc6-5476-4934-9417-6d4d593728db"
 
+    # Pprof converter: pprof 协议转换器
+    - name: "pprof_translator/common"
+      config:
+        type: "spy"
 
     # TracesDeriver: Traces 派生处理器
     # Duration
@@ -573,6 +592,25 @@ bk-collector:
       type: "metrics.derived"
       processors:
         - "apdex_calculator/standard"
+
+    - name: "profiles_pipeline/common"
+      type: "profiles"
+      processors:
+        - "token_checker/aes256"
+        - "rate_limiter/token_bucket"
+        - "pprof_translator/common"
+
+    - name: "fta_pipeline/common"
+      type: "fta"
+      processors:
+        - "token_checker/aes256"
+        - "rate_limiter/token_bucket"
+
+    - name: "tars_pipeline/common"
+      type: "tars"
+      processors:
+        - "token_checker/aes256"
+        - "rate_limiter/token_bucket"
 
   # =============================== Exporter =================================
   exporter:

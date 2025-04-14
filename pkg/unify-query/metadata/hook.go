@@ -10,14 +10,18 @@
 package metadata
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	cache "github.com/patrickmn/go-cache"
 	"github.com/spf13/viper"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/eventbus"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/log"
 )
 
 var (
@@ -29,6 +33,16 @@ var (
 func setDefaultConfig() {
 	viper.SetDefault(DefaultExpirationPath, time.Minute*1)
 	viper.SetDefault(CleanupIntervalPath, time.Minute*5)
+
+	viper.SetDefault(MaDruidQueryRawSuffixPath, "_raw")
+	viper.SetDefault(MaDruidQueryCmdbSuffixPath, "_cmdb")
+}
+
+// LoadConfig
+func LoadConfig() {
+
+	MaDruidQueryRawSuffix = viper.GetString(MaDruidQueryRawSuffixPath)
+	MaDruidQueryCmdbSuffix = viper.GetString(MaDruidQueryCmdbSuffixPath)
 }
 
 // InitMetadata 初始化
@@ -40,6 +54,22 @@ func InitMetadata() {
 			viper.GetDuration(DefaultExpirationPath),
 			viper.GetDuration(CleanupIntervalPath),
 		),
+	}
+}
+
+func InitHashID(ctx context.Context) context.Context {
+	id := uuid.New()
+	log.Debugf(ctx, "set uuid: %s", id.String())
+	return context.WithValue(ctx, UUID, id.String())
+}
+
+func hashID(ctx context.Context) string {
+	if id, ok := ctx.Value(UUID).(string); ok {
+		return id
+	} else {
+		span := trace.SpanFromContext(ctx)
+		traceID := span.SpanContext().TraceID().String()
+		return traceID
 	}
 }
 
@@ -56,6 +86,13 @@ func init() {
 		fmt.Printf(
 			"failed to subscribe event->[%s] for log module for default config, maybe log module won't working.",
 			eventbus.EventSignalConfigPreParse,
+		)
+	}
+
+	if err := eventbus.EventBus.Subscribe(eventbus.EventSignalConfigPostParse, LoadConfig); err != nil {
+		fmt.Printf(
+			"failed to subscribe event->[%s] for http module for new config, maybe http module won't working.",
+			eventbus.EventSignalConfigPostParse,
 		)
 	}
 }

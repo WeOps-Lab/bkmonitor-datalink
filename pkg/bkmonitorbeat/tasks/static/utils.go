@@ -13,6 +13,7 @@ import (
 	"context"
 	"math/rand"
 	"net"
+	"runtime"
 	"time"
 
 	"github.com/elastic/beats/libbeat/common"
@@ -82,13 +83,20 @@ func (r *Report) AsMapStr() common.MapStr {
 		}
 	}
 
+	arch := "x86"
+	if r.System.Arch == "arm" || r.System.Arch == "aarch64" {
+		arch = "arm"
+	}
+
 	if r.System != nil {
 		result["system"] = common.MapStr{
-			"hostname": r.System.HostName,
-			"os":       r.System.OS,
-			"platform": r.System.Platform,
-			"platVer":  r.System.PlatVer,
-			"sysType":  r.System.SysType,
+			"hostname":      r.System.HostName,
+			"os":            r.System.OS,
+			"arch":          arch,
+			"platform":      r.System.Platform,
+			"platVer":       r.System.PlatVer,
+			"sysType":       r.System.SysType,
+			"kernelVersion": r.System.KernelVersion,
 		}
 	}
 	return result
@@ -124,12 +132,14 @@ type Interface struct {
 
 // System :
 type System struct {
-	HostName  string
-	OS        string
-	Platform  string
-	PlatVer   string
-	SysType   string
-	BKAgentID string
+	HostName      string
+	OS            string
+	Platform      string
+	PlatVer       string
+	SysType       string
+	BKAgentID     string
+	Arch          string
+	KernelVersion string
 }
 
 // GetData 采集全部静态数据
@@ -175,6 +185,15 @@ var GetCPUStatus = func(ctx context.Context) (*CPU, error) {
 		model = "unknown"
 	} else {
 		model = infos[0].ModelName
+	}
+
+	// gopsutil cpu 返回的信息 在不同平台不一样 需要进行区别操作
+	if runtime.GOOS == "windows" {
+		n := 0
+		for _, info := range infos {
+			n += int(info.Cores) // NumberOfLogicalProcessors
+		}
+		total = n
 	}
 	return &CPU{Total: total, Model: model}, nil
 }
@@ -250,12 +269,14 @@ var GetSystemStatus = func(ctx context.Context) (*System, error) {
 
 	bkAgentID := GetBKAgentID()
 	return &System{
-		HostName:  info.Hostname,
-		SysType:   osSystemType,
-		OS:        info.OS,
-		Platform:  info.Platform,
-		PlatVer:   info.PlatformVersion,
-		BKAgentID: bkAgentID,
+		HostName:      info.Hostname,
+		SysType:       osSystemType,
+		OS:            info.OS,
+		Platform:      info.Platform,
+		PlatVer:       info.PlatformVersion,
+		BKAgentID:     bkAgentID,
+		Arch:          info.KernelArch,
+		KernelVersion: info.KernelVersion,
 	}, nil
 }
 

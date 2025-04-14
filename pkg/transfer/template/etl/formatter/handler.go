@@ -10,6 +10,11 @@
 package formatter
 
 import (
+	"bytes"
+	"compress/gzip"
+	"encoding/base64"
+	"io"
+	"strings"
 	"time"
 
 	"github.com/cstockton/go-conv"
@@ -85,16 +90,16 @@ func FormatDimensionsHandler(record *define.ETLRecord, next define.ETLRecordHand
 }
 
 func fetchCCTopoResponseStore(record *define.ETLRecord, store define.Store) (*models.CCTopoBaseModelInfo, error) {
-	info, _, err := fetchCCTopoResponse(record, store)
+	info, _, err := fetchCCTopoResponse(record, store, ExtraMetaNone)
 	return info, err
 }
 
-func fetchExtraMetaResponseStore(record *define.ETLRecord, store define.Store) (string, error) {
-	_, s, err := fetchCCTopoResponse(record, store)
+func fetchExtraMetaResponseStore(record *define.ETLRecord, store define.Store, metaType ExtraMetaType) (string, error) {
+	_, s, err := fetchCCTopoResponse(record, store, metaType)
 	return s, err
 }
 
-func fetchCCTopoResponse(record *define.ETLRecord, store define.Store) (*models.CCTopoBaseModelInfo, string, error) {
+func fetchCCTopoResponse(record *define.ETLRecord, store define.Store, metaType ExtraMetaType) (*models.CCTopoBaseModelInfo, string, error) {
 	var (
 		modelInfo  models.CCInfo
 		err        error
@@ -126,11 +131,19 @@ func fetchCCTopoResponse(record *define.ETLRecord, store define.Store) (*models.
 
 	// 这里 dbm_meta/devx_meta 应该只能两者取其一
 	if isHostInfo {
-		if obj, ok := modelInfo.(*models.CCHostInfo); ok && len(obj.DbmMeta) > 0 {
-			extraMeta = obj.DbmMeta
-		}
-		if obj, ok := modelInfo.(*models.CCHostInfo); ok && len(obj.DevxMeta) > 0 {
-			extraMeta = obj.DevxMeta
+		switch metaType {
+		case ExtraMetaDbm:
+			if obj, ok := modelInfo.(*models.CCHostInfo); ok && len(obj.DbmMeta) > 0 {
+				extraMeta = obj.DbmMeta
+			}
+		case ExtraMetaDevx:
+			if obj, ok := modelInfo.(*models.CCHostInfo); ok && len(obj.DevxMeta) > 0 {
+				extraMeta = obj.DevxMeta
+			}
+		case ExtraMetaPerforce:
+			if obj, ok := modelInfo.(*models.CCHostInfo); ok && len(obj.PerforceMeta) > 0 {
+				extraMeta = obj.PerforceMeta
+			}
 		}
 	}
 
@@ -311,7 +324,16 @@ func transformFields(from map[string]interface{}, transformers map[string]etl.Tr
 		if err != nil {
 			return nil, errors.Wrapf(define.ErrOperationForbidden, "transform field %v error %v", key, err)
 		}
-		to[key] = value
+
+		// TODO(mando): 暂时没有找到优雅的方案处理 db record 先在这里做个断言
+		r, ok := value.(etl.DbmRecord)
+		if !ok {
+			to[key] = value // 普通类型处理
+			continue
+		}
+
+		to[r.BodyFieldName] = r.Body
+		to[r.ResponseFieldName] = r.Response
 	}
 	return to, nil
 }
@@ -361,14 +383,126 @@ func MetricsCutterHandler(record *define.ETLRecord, next define.ETLRecordHandler
 	return nil
 }
 
-func TransferRecordCutterByExtraMetaCreator(store define.Store, enable bool) define.ETLRecordChainingHandler {
-	if !enable {
+func tryDecodeExtraMeta(s string) ([]map[string]string, error) {
+	type V1Meta struct {
+		Common map[string]string   `json:"common"`
+		Custom []map[string]string `json:"custom"`
+	}
+
+	type V2Meta struct {
+		Content string `json:"content"`
+	}
+
+	parseV0Meta := func(b []byte) ([]map[string]string, error) {
+		ret := make([]map[string]string, 0)
+		err := json.Unmarshal(b, &ret)
+		if err != nil {
+			return nil, err
+		}
+		return ret, nil
+	}
+
+	parseV1Meta := func(b []byte) ([]map[string]string, error) {
+		var v1Meta V1Meta
+		if err := json.Unmarshal(b, &v1Meta); err != nil {
+			return nil, err
+		}
+		ret := make([]map[string]string, 0)
+		for _, custom := range v1Meta.Custom {
+			item := make(map[string]string)
+			for k, v := range custom {
+				item[k] = v
+			}
+			for k, v := range v1Meta.Common {
+				item[k] = v
+			}
+			ret = append(ret, item)
+		}
+		return ret, nil
+	}
+
+	parseV2Meta := func(b []byte) ([]map[string]string, error) {
+		var v2Meta V2Meta
+		if err := json.Unmarshal(b, &v2Meta); err != nil {
+			return nil, err
+		}
+
+		b, err := base64.RawStdEncoding.DecodeString(strings.TrimRight(v2Meta.Content, "="))
+		if err != nil {
+			return nil, err
+		}
+
+		r, err := gzip.NewReader(bytes.NewBuffer(b))
+		if err != nil {
+			return nil, err
+		}
+		defer r.Close()
+
+		content, err := io.ReadAll(r)
+		if err != nil {
+			return nil, err
+		}
+		return parseV1Meta(content)
+	}
+
+	type tryVer struct {
+		Version string `json:"version"`
+	}
+
+	var tryV tryVer
+	var ret []map[string]string
+
+	// 尝试用最小代价解析 version 字段，判断数据版本号
+	// 不同版本格式
+	// v0: []map[string]string
+	// v1: V1Meta
+	// v2: V2Meta -> content: V1Meta
+	err := json.Unmarshal([]byte(s), &tryV)
+	if err == nil && tryV.Version == "v1" {
+		ret, err = parseV1Meta([]byte(s))
+	} else if err == nil && tryV.Version == "v2" {
+		ret, err = parseV2Meta([]byte(s))
+	} else {
+		ret, err = parseV0Meta([]byte(s))
+	}
+
+	if err != nil {
+		return nil, err
+	}
+	if len(ret) <= 0 {
+		return nil, errors.New("empty extra meta record items")
+	}
+	return ret, nil
+}
+
+type ExtraMetaType uint8
+
+const (
+	ExtraMetaNone ExtraMetaType = iota
+	ExtraMetaDbm
+	ExtraMetaDevx
+	ExtraMetaPerforce
+)
+
+func TransferRecordCutterByDbmMetaCreator(store define.Store, enabled bool) define.ETLRecordChainingHandler {
+	return transferRecordCutterByExtraMetaCreator(store, ExtraMetaDbm, enabled)
+}
+
+func TransferRecordCutterByDevxMetaCreator(store define.Store, enabled bool) define.ETLRecordChainingHandler {
+	return transferRecordCutterByExtraMetaCreator(store, ExtraMetaDevx, enabled)
+}
+
+func TransferRecordCutterByPerforceMetaCreator(store define.Store, enabled bool) define.ETLRecordChainingHandler {
+	return transferRecordCutterByExtraMetaCreator(store, ExtraMetaPerforce, enabled)
+}
+
+func transferRecordCutterByExtraMetaCreator(store define.Store, metaType ExtraMetaType, enabled bool) define.ETLRecordChainingHandler {
+	if !enabled {
 		return nil
 	}
 
 	return func(record *define.ETLRecord, next define.ETLRecordHandler) error {
-		items := make([]map[string]string, 0)
-		body, err := fetchExtraMetaResponseStore(record, store)
+		body, err := fetchExtraMetaResponseStore(record, store, metaType)
 		if err != nil {
 			return errors.Wrap(err, "failed to fetch extra meta response")
 		}
@@ -377,13 +511,9 @@ func TransferRecordCutterByExtraMetaCreator(store define.Store, enable bool) def
 			return errors.New("empty extra meta response")
 		}
 
-		err = json.Unmarshal([]byte(body), &items)
+		items, err := tryDecodeExtraMeta(body)
 		if err != nil {
-			return errors.Wrap(err, "failed to decode extra-meta field or empty items")
-		}
-
-		if len(items) <= 0 {
-			return errors.New("empty extra meta record items")
+			return err
 		}
 
 		// 维度补充

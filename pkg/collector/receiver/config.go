@@ -18,42 +18,28 @@ import (
 )
 
 type ComponentConfig struct {
-	Jaeger      ComponentJaeger      `config:"jaeger"`
-	Otlp        ComponentOtlp        `config:"otlp"`
-	PushGateway ComponentPushGateway `config:"pushgateway"`
-	RemoteWrite ComponentRemoteWrite `config:"remotewrite"`
-	Zipkin      ComponentZipkin      `config:"zipkin"`
-	Skywalking  ComponentSkywalking  `config:"skywalking"`
+	Jaeger      ComponentCommon `config:"jaeger"`
+	Otlp        ComponentCommon `config:"otlp"`
+	PushGateway ComponentCommon `config:"pushgateway"`
+	RemoteWrite ComponentCommon `config:"remotewrite"`
+	Zipkin      ComponentCommon `config:"zipkin"`
+	Skywalking  ComponentCommon `config:"skywalking"`
+	Pyroscope   ComponentCommon `config:"pyroscope"`
+	Fta         ComponentCommon `config:"fta"`
+	Beat        ComponentCommon `config:"beat"`
+	Tars        ComponentCommon `config:"tars"`
 }
 
-type ComponentJaeger struct {
-	Enabled bool `config:"enabled"`
-}
-
-type ComponentOtlp struct {
-	Enabled bool `config:"enabled"`
-}
-
-type ComponentPushGateway struct {
-	Enabled bool `config:"enabled"`
-}
-
-type ComponentRemoteWrite struct {
-	Enabled bool `config:"enabled"`
-}
-
-type ComponentZipkin struct {
-	Enabled bool `config:"enabled"`
-}
-
-type ComponentSkywalking struct {
+type ComponentCommon struct {
 	Enabled bool `config:"enabled"`
 }
 
 type Config struct {
-	HttpServer HttpServerConfig `config:"http_server"`
-	GrpcServer GrpcServerConfig `config:"grpc_server"`
-	Components ComponentConfig  `config:"components"`
+	RecvServer  HttpServerConfig `config:"http_server"`
+	AdminServer HttpServerConfig `config:"admin_server"`
+	GrpcServer  GrpcServerConfig `config:"grpc_server"`
+	TarsServer  TarsServerConfig `config:"tars_server"`
+	Components  ComponentConfig  `config:"components"`
 }
 
 type HttpServerConfig struct {
@@ -68,6 +54,12 @@ type GrpcServerConfig struct {
 	Endpoint    string   `config:"endpoint"`
 	Middlewares []string `config:"middlewares"`
 	Transport   string   `config:"transport"`
+}
+
+type TarsServerConfig struct {
+	Enabled   bool   `config:"enabled"`
+	Endpoint  string `config:"endpoint"`
+	Transport string `config:"transport"`
 }
 
 type SkywalkingConfig struct {

@@ -40,3 +40,11 @@ test:
 
 tidy:
 	go mod tidy
+
+imports:
+	goimports-reviser -project-name "github.com/TencentBlueKing/bkmonitor-datalink/pkg" ./...
+
+.PHONY: gen
+gen:
+	#find . -type f -name 'qs_*_gen.go' -exec rm -f {} \;
+	go generate ./...

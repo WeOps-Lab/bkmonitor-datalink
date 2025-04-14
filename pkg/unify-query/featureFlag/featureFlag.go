@@ -11,13 +11,13 @@ package featureFlag
 
 import (
 	"context"
-	"encoding/json"
 	"sync"
 
 	ffclient "github.com/thomaspoignant/go-feature-flag"
 	"github.com/thomaspoignant/go-feature-flag/exporter"
 	"github.com/thomaspoignant/go-feature-flag/ffuser"
 
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/internal/json"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/log"
 )
 
@@ -34,6 +34,9 @@ type FeatureFlag struct {
 
 // ReloadFeatureFlags
 func ReloadFeatureFlags(data []byte) error {
+	if data == nil {
+		return nil
+	}
 	featureFlag.lock.Lock()
 	defer featureFlag.lock.Unlock()
 	featureFlag.flags = data
@@ -50,6 +53,15 @@ func StringVariation(ctx context.Context, user ffuser.User, flagKey string, defa
 	res, err := ffclient.StringVariation(flagKey, user, defaultValue)
 	if err != nil {
 		log.Errorf(ctx, err.Error())
+		return defaultValue
+	}
+	return res
+}
+
+// IntVariation
+func IntVariation(ctx context.Context, user ffuser.User, flagKey string, defaultValue int) int {
+	res, err := ffclient.IntVariation(flagKey, user, defaultValue)
+	if err != nil {
 		return defaultValue
 	}
 	return res

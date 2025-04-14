@@ -12,27 +12,27 @@ package influxdb
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"math"
+	"net/http"
 	"sync"
+	"time"
 
 	goRedis "github.com/go-redis/redis/v8"
 	"github.com/influxdata/influxdb/prometheus/remote"
-	oleltrace "go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/internal/json"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/log"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metric"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/redis"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/trace"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/router/influxdb"
 )
 
 var (
-	influxDBRouter     *Router
-	influxDBRouterLock = new(sync.RWMutex)
+	once           sync.Once
+	influxDBRouter *Router
 
 	hostMapInc  = make(map[string]int)
 	hostMapLock = new(sync.Mutex)
@@ -42,6 +42,7 @@ var (
 	DefaultTagKey = "__default__/__default__/__default__==__default__"
 )
 
+// Router 查询路由
 type Router struct {
 	ctx        context.Context
 	cancelFunc context.CancelFunc
@@ -60,6 +61,7 @@ type Router struct {
 	hostStatusInfo influxdb.HostStatusInfo
 }
 
+// MockRouter mock 路由信息
 func MockRouter(proxyInfo influxdb.ProxyInfo) {
 	ir := GetInfluxDBRouter()
 	ir.lock.Lock()
@@ -73,18 +75,18 @@ func MockRouter(proxyInfo influxdb.ProxyInfo) {
 	}
 }
 
+// GetInfluxDBRouter 获取实例
 func GetInfluxDBRouter() *Router {
-	influxDBRouterLock.RLock()
-	defer influxDBRouterLock.RUnlock()
-	if influxDBRouter == nil {
+	once.Do(func() {
 		influxDBRouter = &Router{
 			wg:   new(sync.WaitGroup),
 			lock: new(sync.RWMutex),
 		}
-	}
+	})
 	return influxDBRouter
 }
 
+// ReloadRouter InfluxDBRouter 初始化入口
 func (r *Router) ReloadRouter(ctx context.Context, prefix string, dialOpts []grpc.DialOption) error {
 	var err error
 	err = r.Stop()
@@ -114,7 +116,56 @@ func (r *Router) ReloadRouter(ctx context.Context, prefix string, dialOpts []grp
 	}, dialOpts)
 
 	err = r.ReloadAllKey(r.ctx)
+
 	return err
+}
+
+// Ping ping 方法
+func (r *Router) Ping(ctx context.Context, timeout time.Duration, pingCount int) {
+	// 不存在 host 信息则直接返回
+	if len(r.hostInfo) == 0 {
+		return
+	}
+
+	// 开始进行 Ping influxdb
+	clint := &http.Client{Timeout: timeout}
+	for _, v := range r.hostInfo {
+		// 重试 pingCount 次数
+		var read bool
+		for i := 0; i < pingCount; i++ {
+			addr := fmt.Sprintf("%s://%s:%d/ping", HTTP, v.DomainName, v.Port)
+			req, err := http.NewRequest("GET", addr, nil)
+			if err != nil {
+				log.Warnf(ctx, "unable to NewRequest, addr:%s, error: %s", addr, err)
+				continue
+			}
+			resp, err := clint.Do(req)
+			if err != nil {
+				log.Warnf(ctx, "do ping failed, error: %s", err)
+				continue
+			}
+			// 状态码 204 变更 read 跳出循环
+			// 否则持续走完 PingCount 结束
+			if resp.StatusCode == http.StatusNoContent {
+				read = true
+				break
+			}
+		}
+
+		r.lock.RLock()
+		if read == r.hostStatusInfo[v.DomainName].Read {
+			r.lock.RUnlock()
+			continue
+		}
+		r.lock.RUnlock()
+
+		r.lock.Lock()
+		r.hostStatusInfo[v.DomainName] = &influxdb.HostStatus{
+			Read:           read,
+			LastModifyTime: time.Now().Unix(),
+		}
+		r.lock.Unlock()
+	}
 }
 
 func (r *Router) ReloadAllKey(ctx context.Context) error {
@@ -176,19 +227,13 @@ func (r *Router) GetInfluxDBHost(ctx context.Context, tagsKey []string, clusterN
 		hosts []*influxdb.Host
 
 		readHost []string
-
-		span oleltrace.Span
 	)
 
 	r.lock.RLock()
 	defer r.lock.RUnlock()
 
-	ctx, span = trace.IntoContext(ctx, trace.TracerName, "get-influxdb-host")
-	if span != nil {
-		defer span.End()
-	}
-
-	trace.InsertStringIntoSpan("cluster-name", clusterName, span)
+	ctx, span := trace.NewSpan(ctx, "get-influxdb-host")
+	defer span.End(&err)
 
 	if clusterHostList, ok := r.clusterInfo[clusterName]; ok {
 		hostList = clusterHostList.HostList
@@ -197,17 +242,11 @@ func (r *Router) GetInfluxDBHost(ctx context.Context, tagsKey []string, clusterN
 		}
 	}
 
-	trace.InsertStringSliceIntoSpan("all-host-list", hostList, span)
-	trace.InsertStringIntoSpan("unread-host", fmt.Sprintf("%+v", unReadHost), span)
-
 	if len(tagsKey) > 0 {
 		hostList, err = r.getReadHostByTagsKey(ctx, tagsKey, clusterName, db, measurement, condition)
 		if err != nil {
 			return nil, err
 		}
-
-		trace.InsertStringIntoSpan("tags-key", fmt.Sprintf("%+v", tagsKey), span)
-		trace.InsertStringSliceIntoSpan("tag-host-list", hostList, span)
 	}
 
 	for _, h := range hostList {
@@ -222,7 +261,7 @@ func (r *Router) GetInfluxDBHost(ctx context.Context, tagsKey []string, clusterN
 			}
 
 			// 有读状态才判断，如果没有读状态，则默认可读，防止影响原数据
-			if s, statusOk := r.hostStatusInfo[h]; statusOk {
+			if s, statusOk := r.hostStatusInfo[v.DomainName]; statusOk {
 				// 不可读的状态直接跳过
 				if !s.Read {
 					continue
@@ -253,15 +292,10 @@ func (r *Router) GetInfluxDBHost(ctx context.Context, tagsKey []string, clusterN
 		hostMapInc[k]++
 		index = int(math.Mod(float64(hostMapInc[k]), float64(len(hosts))))
 
-		trace.InsertStringIntoSpan("host-map-inc", fmt.Sprintf("%+v", hostMapInc), span)
-		trace.InsertIntIntoSpan("host-map-index", index, span)
-		trace.InsertStringSliceIntoSpan("read-host-list", readHost, span)
-
 		hostMapLock.Unlock()
 	}
 
 	if index < len(hosts) {
-		trace.InsertStringIntoSpan("return-host", hosts[index].DomainName, span)
 		return hosts[index], nil
 	} else {
 		return nil, fmt.Errorf("backend index is error: %d > %d, %s", index, len(hosts), logInfo)
@@ -338,13 +372,6 @@ func (r *Router) Print(ctx context.Context, reload bool) string {
 	}
 	res += fmt.Sprintln("----------------------------------------")
 
-	res += fmt.Sprintln("queryRouterInfo")
-	for k, v := range r.queryRouterInfo {
-		s, _ = json.Marshal(v)
-		res += fmt.Sprintf("%s => %s\n", k, s)
-	}
-	res += fmt.Sprintln("----------------------------------------")
-
 	res += fmt.Sprintln("hostStatusInfo")
 	for k, v := range r.hostStatusInfo {
 		s, _ = json.Marshal(v)
@@ -362,13 +389,11 @@ func (r *Router) Print(ctx context.Context, reload bool) string {
 
 func (r *Router) loadRouter(ctx context.Context, key string) error {
 	var (
-		clusterInfo     influxdb.ClusterInfo
-		hostInfo        influxdb.HostInfo
-		tagInfo         influxdb.TagInfo
-		proxyInfo       influxdb.ProxyInfo
-		hostStatusInfo  influxdb.HostStatusInfo
-		queryRouterInfo influxdb.QueryRouterInfo
-		err             error
+		clusterInfo influxdb.ClusterInfo
+		hostInfo    influxdb.HostInfo
+		tagInfo     influxdb.TagInfo
+		proxyInfo   influxdb.ProxyInfo
+		err         error
 	)
 
 	if r.router == nil {
@@ -386,6 +411,12 @@ func (r *Router) loadRouter(ctx context.Context, key string) error {
 		if err == nil {
 			r.hostInfo = hostInfo
 			r.endpointSet.Update(ctx)
+
+			// 更新 hostInfo 信息后重新初始化 hostStatusInfo
+			r.hostStatusInfo = make(influxdb.HostStatusInfo, len(r.hostInfo))
+			for _, h := range r.hostInfo {
+				r.hostStatusInfo[h.DomainName] = &influxdb.HostStatus{Read: true}
+			}
 		}
 	case influxdb.TagInfoKey:
 		tagInfo, err = r.router.GetTagInfo(ctx)
@@ -397,27 +428,6 @@ func (r *Router) loadRouter(ctx context.Context, key string) error {
 		if err == nil {
 			r.proxyInfo = proxyInfo
 		}
-	case influxdb.QueryRouterInfoKey:
-		queryRouterInfo, err = r.router.GetQueryRouterInfo(ctx)
-		if err == nil {
-			for k, v := range queryRouterInfo {
-				var value = float64(0)
-				if v.VmTableId != "" {
-					value = 1
-				}
-
-				metric.ResultTableInfoSet(
-					ctx, value, k, v.BkBizId, v.DataId, v.MeasurementType, v.VmTableId,
-					v.BcsClusterId, fmt.Sprintf("%v", v.IsInfluxdbDisabled),
-				)
-			}
-			r.queryRouterInfo = queryRouterInfo
-		}
-	case influxdb.HostStatusInfoKey:
-		hostStatusInfo, err = r.router.GetHostStatusInfo(ctx)
-		if err == nil {
-			r.hostStatusInfo = hostStatusInfo
-		}
 	}
 	return err
 }
@@ -428,13 +438,11 @@ func GetTagRouter(ctx context.Context, tagsKey []string, condition string) (stri
 	}
 
 	var (
-		span oleltrace.Span
+		err error
 	)
 
-	ctx, span = trace.IntoContext(ctx, trace.TracerName, "get-tag-values")
-	if span != nil {
-		defer span.End()
-	}
+	ctx, span := trace.NewSpan(ctx, "get-tag-values")
+	defer span.End(&err)
 
 	// 解析 where 中的条件
 	tags, err := metadata.ParseCondition(condition)
@@ -442,8 +450,8 @@ func GetTagRouter(ctx context.Context, tagsKey []string, condition string) (stri
 		return "", err
 	}
 
-	trace.InsertStringIntoSpan("condition", condition, span)
-	trace.InsertStringIntoSpan("condition-tags", fmt.Sprintf("%+v", tags), span)
+	span.Set("condition", condition)
+	span.Set("condition-tags", tags)
 
 	// 判断是否有 tagKey
 	var buf bytes.Buffer
@@ -478,14 +486,10 @@ func (r *Router) getReadHostByTagsKey(ctx context.Context, tagsKey []string, clu
 		return nil, nil
 	}
 
-	var (
-		span oleltrace.Span
-	)
+	var err error
 
-	ctx, span = trace.IntoContext(ctx, trace.TracerName, "get-read-host-by-tags-key")
-	if span != nil {
-		defer span.End()
-	}
+	ctx, span := trace.NewSpan(ctx, "get-read-host-by-tags-key")
+	defer span.End(&err)
 
 	allHostList := make(map[string]struct{})
 	if cls, ok := r.clusterInfo[clusterName]; ok {
@@ -493,8 +497,6 @@ func (r *Router) getReadHostByTagsKey(ctx context.Context, tagsKey []string, clu
 			allHostList[h] = struct{}{}
 		}
 	}
-
-	trace.InsertStringIntoSpan("all-host-list", fmt.Sprintf("%+v", allHostList), span)
 
 	// 判断是否有 tagKey
 	var buf bytes.Buffer
@@ -505,28 +507,20 @@ func (r *Router) getReadHostByTagsKey(ctx context.Context, tagsKey []string, clu
 		return nil, err
 	}
 	buf.WriteString(tagRouter)
-	trace.InsertStringIntoSpan("check-tag-key", buf.String(), span)
 
 	var (
 		tagHostList []string
 		hostList    []string
 	)
 
-	trace.InsertStringIntoSpan("check-tag-key", buf.String(), span)
-
 	// 判断是否命中tag条件
 	if tag, ok := r.tagInfo[buf.String()]; ok {
 		tagHostList = tag.HostList
-
-		trace.InsertStringIntoSpan("tag-info-list-key", fmt.Sprintf("%+v", tagHostList), span)
 	} else {
 		// 使用默认配置
 		defaultTagKey := fmt.Sprintf("%s/%s", clusterName, DefaultTagKey)
 		if tag, ok = r.tagInfo[defaultTagKey]; ok {
 			tagHostList = tag.HostList
-
-			trace.InsertStringIntoSpan("tag-info-default-key", defaultTagKey, span)
-			trace.InsertStringIntoSpan("tag-info-list-default", fmt.Sprintf("%+v", tagHostList), span)
 		} else {
 			return nil, fmt.Errorf("default tag is empty: %v with: %s", r.tagInfo, defaultTagKey)
 		}
@@ -538,8 +532,6 @@ func (r *Router) getReadHostByTagsKey(ctx context.Context, tagsKey []string, clu
 			hostList = append(hostList, h)
 		}
 	}
-
-	trace.InsertStringIntoSpan("return-host-list", fmt.Sprintf("%+v", hostList), span)
 
 	if len(hostList) == 0 {
 		return nil, fmt.Errorf("empty influxdb host in %s, all backend: %+v", buf.String(), allHostList)

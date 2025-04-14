@@ -14,12 +14,8 @@ import (
 	"sync"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/consul"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/curl"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/log"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 	inner "github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/tsdb"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/tsdb/offlineDataArchive"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/tsdb/victoriaMetrics"
 )
 
 type Service struct {
@@ -64,12 +60,6 @@ func (s *Service) Reload(ctx context.Context) {
 	err = s.loopReloadStorage(s.ctx)
 	if err != nil {
 		log.Errorf(context.TODO(), "start loop reload storage failed for->[%s]", err)
-		return
-	}
-
-	err = metadata.GetQueryRouter().Reload(ctx)
-	if err != nil {
-		log.Errorf(context.TODO(), "start loop reload query router failed for->[%s]", err)
 		return
 	}
 
@@ -132,10 +122,6 @@ func (s *Service) reloadStorage() error {
 	}
 
 	options := &inner.Options{
-		VM: &inner.VMOption{
-			UriPath: "select/0/prometheus/api/v1",
-			Timeout: VmTimeout,
-		},
 		InfluxDB: &inner.InfluxDBOption{
 			Timeout:        InfluxDBTimeout,
 			ContentType:    InfluxDBContentType,
@@ -149,6 +135,11 @@ func (s *Service) reloadStorage() error {
 			RouterPrefix:   InfluxDBRouterPrefix,
 			ReadRateLimit:  InfluxDBQueryReadRateLimit,
 		},
+		Es: &inner.ESOption{
+			Timeout:    EsTimeout,
+			MaxRouting: EsMaxRouting,
+			MaxSize:    EsMaxSize,
+		},
 	}
 	err = inner.ReloadTsDBStorage(s.ctx, consulData, options)
 	if err != nil {
@@ -156,40 +147,5 @@ func (s *Service) reloadStorage() error {
 		return err
 	}
 
-	inner.SetStorage(consul.OfflineDataArchive, &inner.Storage{
-		Type: consul.OfflineDataArchive,
-		Instance: &offlineDataArchive.Instance{
-			Ctx:                    s.ctx,
-			Address:                OfflineDataArchiveAddress,
-			Timeout:                OfflineDataArchiveTimeout,
-			MaxLimit:               InfluxDBMaxLimit,
-			MaxSLimit:              InfluxDBMaxSLimit,
-			Toleration:             InfluxDBTolerance,
-			ReadRateLimit:          InfluxDBQueryReadRateLimit,
-			GrpcMaxCallRecvMsgSize: OfflineDataArchiveGrpcMaxCallRecvMsgSize,
-			GrpcMaxCallSendMsgSize: OfflineDataArchiveGrpcMaxCallSendMsgSize,
-		},
-	})
-
-	// 增加全局 vm storage 查询
-	inner.SetStorage(consul.VictoriaMetricsStorageType, &inner.Storage{
-		Type: consul.VictoriaMetricsStorageType,
-		Instance: &victoriaMetrics.Instance{
-			Ctx:                  s.ctx,
-			ContentType:          VmContentType,
-			Address:              VmAddress,
-			UriPath:              VmUriPath,
-			Code:                 VmCode,
-			Secret:               VmSecret,
-			Token:                VmToken,
-			AuthenticationMethod: VmAuthenticationMethod,
-			Timeout:              VmTimeout,
-			// 是否开启 influxdb 正则匹配
-			MaxConditionNum:  VmMaxConditionNum,
-			InfluxCompatible: VmInfluxCompatible,
-			UseNativeOr:      VmUseNativeOr,
-			Curl:             &curl.HttpCurl{Log: log.OtLogger},
-		},
-	})
 	return nil
 }

@@ -18,76 +18,73 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/atomic"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/pipeline"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/receiver"
 )
 
+const (
+	localPromWriteURL = "http://localhost/prometheus/write"
+)
+
 func TestReady(t *testing.T) {
-	assert.NotPanics(t, Ready)
+	assert.NotPanics(t, func() {
+		Ready(receiver.ComponentConfig{})
+	})
 }
 
-func TestHttpInvalidBody(t *testing.T) {
-	buf := &bytes.Buffer{}
-	buf.WriteString("{-}")
-
-	req, err := http.NewRequest(http.MethodPut, "http://localhost/prometheus/write", buf)
-	assert.NoError(t, err)
-
-	var n int
-	svc := HttpService{
-		receiver.Publisher{Func: func(record *define.Record) { n++ }},
-		pipeline.Validator{Func: func(record *define.Record) (define.StatusCode, string, error) {
-			return define.StatusCodeOK, "", nil
-		}},
-	}
-	rw := httptest.NewRecorder()
-	svc.Write(rw, req)
-	assert.Equal(t, rw.Code, http.StatusBadRequest)
-	assert.Equal(t, 0, n)
-}
-
-func TestHttpPreCheckFailed(t *testing.T) {
-	buf := &bytes.Buffer{}
+func readContent() []byte {
 	content, err := os.ReadFile("../../example/fixtures/remotewrite.bytes")
-	assert.NoError(t, err)
-	buf.Write(content)
-
-	req, err := http.NewRequest(http.MethodPut, "http://localhost/prometheus/write", buf)
-	assert.NoError(t, err)
-
-	var n int
-	svc := HttpService{
-		receiver.Publisher{Func: func(record *define.Record) { n++ }},
-		pipeline.Validator{Func: func(record *define.Record) (define.StatusCode, string, error) {
-			return define.StatusBadRequest, "", errors.New("MUST ERROR")
-		}},
+	if err != nil {
+		panic(err)
 	}
-	rw := httptest.NewRecorder()
-	svc.Write(rw, req)
-	assert.Equal(t, rw.Code, http.StatusBadRequest)
-	assert.Equal(t, 0, n)
+	return content
 }
 
-func TestHttpTokenAfterPreCheck(t *testing.T) {
-	buf := &bytes.Buffer{}
-	content, err := os.ReadFile("../../example/fixtures/remotewrite.bytes")
-	assert.NoError(t, err)
-	buf.Write(content)
-
-	req, err := http.NewRequest(http.MethodPut, "http://localhost/prometheus/write", buf)
-	assert.NoError(t, err)
-
-	var n int
+func newSvc(code define.StatusCode, msg string, err error) (HttpService, *atomic.Int64) {
+	n := atomic.NewInt64(0)
 	svc := HttpService{
-		receiver.Publisher{Func: func(record *define.Record) { n++ }},
+		receiver.Publisher{Func: func(record *define.Record) { n.Inc() }},
 		pipeline.Validator{Func: func(record *define.Record) (define.StatusCode, string, error) {
-			return define.StatusCodeOK, "", nil
+			return code, msg, err
 		}},
 	}
-	rw := httptest.NewRecorder()
-	svc.Write(rw, req)
-	assert.Equal(t, rw.Code, http.StatusOK)
-	assert.Equal(t, 1, n)
+	return svc, n
+}
+
+func TestHttpRequest(t *testing.T) {
+	t.Run("invalid body", func(t *testing.T) {
+		buf := bytes.NewBufferString("{-}")
+		req := httptest.NewRequest(http.MethodPut, localPromWriteURL, buf)
+
+		svc, n := newSvc(define.StatusCodeOK, "", nil)
+		rw := httptest.NewRecorder()
+		svc.Write(rw, req)
+		assert.Equal(t, rw.Code, http.StatusBadRequest)
+		assert.Equal(t, int64(0), n.Load())
+	})
+
+	t.Run("precheck failed", func(t *testing.T) {
+		buf := bytes.NewBuffer(readContent())
+		req := httptest.NewRequest(http.MethodPut, localPromWriteURL, buf)
+
+		svc, n := newSvc(define.StatusBadRequest, "", errors.New("MUST ERROR"))
+		rw := httptest.NewRecorder()
+		svc.Write(rw, req)
+		assert.Equal(t, rw.Code, http.StatusBadRequest)
+		assert.Equal(t, int64(0), n.Load())
+	})
+
+	t.Run("report success", func(t *testing.T) {
+		buf := bytes.NewBuffer(readContent())
+		req := httptest.NewRequest(http.MethodPut, localPromWriteURL, buf)
+
+		svc, n := newSvc(define.StatusCodeOK, "", nil)
+		rw := httptest.NewRecorder()
+		svc.Write(rw, req)
+		assert.Equal(t, rw.Code, http.StatusOK)
+		assert.Equal(t, int64(1), n.Load())
+	})
 }

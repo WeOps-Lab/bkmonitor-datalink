@@ -12,40 +12,17 @@ package metadata
 import (
 	"context"
 	"fmt"
-	"time"
+	"strings"
 
-	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/prompb"
+
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/internal/set"
 )
 
-const (
-	MIN   = "min"
-	MAX   = "max"
-	SUM   = "sum"
-	COUNT = "count"
-	LAST  = "last"
-	MEAN  = "mean"
-	AVG   = "avg"
-
-	MinOT   = "min_over_time"
-	MaxOT   = "max_over_time"
-	SumOT   = "sum_over_time"
-	CountOT = "count_over_time"
-	LastOT  = "last_over_time"
-	AvgOT   = "avg_over_time"
-)
-
-var domSampledFunc = map[string]string{
-	MIN + MinOT:   MIN,
-	MAX + MaxOT:   MAX,
-	SUM + SumOT:   SUM,
-	AVG + AvgOT:   MEAN,
-	MEAN + AvgOT:  MEAN,
-	SUM + CountOT: COUNT,
-}
-
-func SetQueryReference(ctx context.Context, reference QueryReference) error {
+func SetQueryReference(ctx context.Context, reference QueryReference) {
 	md.set(ctx, QueryReferenceKey, reference)
-	return nil
+	return
 }
 
 func GetQueryReference(ctx context.Context) QueryReference {
@@ -59,7 +36,7 @@ func GetQueryReference(ctx context.Context) QueryReference {
 }
 
 // UUID 获取唯一性
-func (q Query) UUID(prefix string) string {
+func (q *Query) UUID(prefix string) string {
 	str := fmt.Sprintf("%s%s%s%s%s%s%s%s%s%s",
 		prefix, q.SourceType, q.ClusterID, q.ClusterName, q.TagsKey,
 		q.RetentionPolicy, q.DB, q.Measurement, q.Field, q.Condition,
@@ -67,32 +44,76 @@ func (q Query) UUID(prefix string) string {
 	return str
 }
 
-func (q Query) GetDownSampleFunc(hints *storage.SelectHints) (string, time.Duration, []string) {
-	var (
-		dims   []string
-		window = time.Duration(hints.Range * 1e6)
-		step   = time.Duration(hints.Step * 1e6)
+// MetricLabels 获取真实指标名称
+func (q *Query) MetricLabels(ctx context.Context) *prompb.Label {
+	if GetQueryParams(ctx).IsReference {
+		return nil
+	}
 
-		grouping time.Duration
+	var (
+		metrics    []string
+		encodeFunc = GetPromDataFormat(ctx).EncodeFunc()
 	)
 
-	// 为了保持数据的精度，如果 step 小于 window 则使用 step 的聚合，否则使用 window
-	if step < window {
-		grouping = step
-	} else {
-		grouping = window
+	if q.DataSource != "" {
+		metrics = append(metrics, q.DataSource)
 	}
 
-	if len(q.AggregateMethodList) > 0 {
-		method := q.AggregateMethodList[0]
-		if method.Without {
-			return "", grouping, dims
-		}
+	for _, n := range strings.Split(q.TableID, ".") {
+		metrics = append(metrics, n)
+	}
+	metrics = append(metrics, q.MetricName)
 
-		if name, ok := domSampledFunc[method.Name+hints.Func]; ok {
-			return name, grouping, method.Dimensions
-		}
+	metricName := strings.Join(metrics, ":")
+	if encodeFunc != nil {
+		metricName = encodeFunc(metricName)
 	}
 
-	return "", grouping, dims
+	return &prompb.Label{
+		Name:  labels.MetricName,
+		Value: metricName,
+	}
+}
+
+// CheckDruidQuery 判断是否是 druid 查询
+func (q *Query) CheckDruidQuery(ctx context.Context, dims *set.Set[string]) bool {
+	checkDims := set.New[string]([]string{"bk_obj_id", "bk_inst_id"}...)
+
+	// 判断查询条件中是否有以上两个维度中的任意一个
+	isDruid := func() bool {
+		for _, conditions := range q.AllConditions {
+			for _, con := range conditions {
+				if checkDims.Existed(con.DimensionName) {
+					return true
+				}
+			}
+		}
+
+		if dims.Intersection(checkDims).Size() > 0 {
+			return true
+		}
+
+		return false
+	}()
+
+	// 如果是查询 druid 的数据，vt 名称需要进行替换
+	if isDruid {
+		replaceLabels := make(ReplaceLabels)
+
+		// 替换 vmrt 的值
+		oldVmRT := q.VmRt
+		newVmRT := strings.TrimSuffix(oldVmRT, MaDruidQueryRawSuffix) + MaDruidQueryCmdbSuffix
+
+		if newVmRT != oldVmRT {
+			q.VmRt = newVmRT
+
+			replaceLabels["result_table_id"] = ReplaceLabel{
+				Source: oldVmRT,
+				Target: newVmRT,
+			}
+		}
+
+		q.VmCondition = ReplaceVmCondition(q.VmCondition, replaceLabels)
+	}
+	return isDruid
 }

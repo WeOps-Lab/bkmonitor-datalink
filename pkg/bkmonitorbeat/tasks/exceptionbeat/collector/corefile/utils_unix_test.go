@@ -8,13 +8,13 @@
 // specific language governing permissions and limitations under the License.
 
 //go:build aix || darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris || zos
-// +build aix darwin dragonfly freebsd linux netbsd openbsd solaris zos
 
 package corefile
 
 import (
 	"os"
 	"path"
+	"regexp"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -102,7 +102,7 @@ type DimensionTestCase struct {
 }
 
 func TestBuildDimensionKey(t *testing.T) {
-	var testData = []struct {
+	testData := []struct {
 		dimensions beat.MapStr
 		result     string
 	}{
@@ -133,13 +133,11 @@ func TestBuildDimensionKey(t *testing.T) {
 	}
 }
 
-var (
-	corePatternPathV2 = path.Join(os.TempDir(), "corefile_pattern")
-)
+var corePatternPathV2 = path.Join(os.TempDir(), "corefile_pattern")
 
 func TestCoreFileCollectorGetCoreFilePath(t *testing.T) {
 	CorePatternFile = corePatternPathV2
-	err := os.WriteFile(corePatternPathV2, []byte("/data/corefile/core_%e_%t.%p\n"), 0644)
+	err := os.WriteFile(corePatternPathV2, []byte("/data/corefile/core_%e_%t.%p\n"), 0o644)
 	if err != nil {
 		panic(err)
 	}
@@ -193,234 +191,274 @@ func TestCoreFileCollector_fillDimension(t *testing.T) {
 		fields fields
 		args   args
 		want   beat.MapStr
+		reg    *regexp.Regexp
 		want1  bool
 	}{
 		{
-			"路径和信号",
-			fields{
+			name: "路径和信号",
+			fields: fields{
 				pattern:   "corefile-%E-%e-%I-%i-%s-%t",
 				isUsesPid: false,
 			},
-			args{
+			args: args{
 				filePath: "/corefile/corefile-!tmp!test!test-test-25486-25486-8-1607502386",
 			},
-			beat.MapStr{
+			want: beat.MapStr{
 				"executable_path": "/tmp/test/test",
 				"executable":      "test",
 				"signal":          "SIGFPE",
 				"event_time":      "1607502386",
 			},
-			true,
+			want1: true,
 		},
 		{
-			"路径和信号带pid扩展名",
-			fields{
+			name: "路径和信号带pid扩展名",
+			fields: fields{
 				pattern:   "corefile-%E-%e-%I-%i-%s-%t",
 				isUsesPid: true,
 			},
-			args{
+			args: args{
 				filePath: "/corefile/corefile-!tmp!test!test-test-25486-25486-8-1607502386.25486",
 			},
-			beat.MapStr{
+			want: beat.MapStr{
 				"executable_path": "/tmp/test/test",
 				"executable":      "test",
 				"signal":          "SIGFPE",
 				"event_time":      "1607502386",
 			},
-			true,
+			want1: true,
 		},
 		{
-			"pattern和文件名不匹配",
-			fields{
+			name: "pattern和文件名不匹配",
+			fields: fields{
 				pattern:   "corefile-%E-%e-%I-%i-%s-%t",
 				isUsesPid: false,
 			},
-			args{
+			args: args{
 				filePath: "/corefile/corefile-!tmp!test!t～ded。est-tes8-1607502386.25486",
 			},
-			beat.MapStr{},
-			false,
+			want:  beat.MapStr{},
+			want1: false,
 		},
 		{
-			"分隔符包含正则元字符",
-			fields{
+			name: "分隔符包含正则元字符",
+			fields: fields{
 				pattern:   "corefile-%E.%e\\%I~%i-%stt%t",
 				isUsesPid: false,
 			},
-			args{
+			args: args{
 				filePath: "/corefile/corefile-!tmp!test!test.test\\25486~25486-8tt1607502386",
 			},
-			beat.MapStr{
+			want: beat.MapStr{
 				"executable_path": "/tmp/test/test",
 				"executable":      "test",
 				"signal":          "SIGFPE",
 				"event_time":      "1607502386",
 			},
-			true,
+			want1: true,
 		},
 		{
-			"分隔符和内容冲突-!",
-			fields{
+			name: "分隔符和内容冲突-!",
+			fields: fields{
 				pattern:   "corefile-%E!%e-%I-%i-%s-%t",
 				isUsesPid: false,
 			},
-			args{
+			args: args{
 				filePath: "/corefile/corefile-!tmp!test!test!test-25486-25486-8-1607502386",
 			},
-			beat.MapStr{
+			want: beat.MapStr{
 				"event_time": "1607502386",
 				"signal":     "SIGFPE",
 			},
-			true,
+			want1: true,
 		},
 		{
-			"分隔符和内容冲突-8",
-			fields{
+			name: "分隔符和内容冲突-8",
+			fields: fields{
 				pattern:   "corefile-%E-%e-%I-%i8%s-%t",
 				isUsesPid: false,
 			},
-			args{
+			args: args{
 				filePath: "/corefile/corefile-!tmp!test!test-test-25486-2548688-1607502386",
 			},
-			beat.MapStr{
+			want: beat.MapStr{
 				"event_time":      "1607502386",
 				"executable":      "test",
 				"executable_path": "/tmp/test/test",
 			},
-			true,
+			want1: true,
 		},
 		{
-			"根据%E补充%e维度",
-			fields{
+			name: "根据%E补充%e维度",
+			fields: fields{
 				pattern:   "corefile-%E-%I-%i8%s-%t",
 				isUsesPid: false,
 			},
-			args{
+			args: args{
 				filePath: "/corefile/corefile-!tmp!test!test1-25486-2548688-1607502386",
 			},
-			beat.MapStr{
+			want: beat.MapStr{
 				"event_time":      "1607502386",
 				"executable_path": "/tmp/test/test1",
 				"executable":      "test1",
 			},
-			true,
+			want1: true,
 		},
 		{
-			"存在不可用的占位符",
-			fields{
+			name: "存在不可用的占位符",
+			fields: fields{
 				pattern:   "core_%w_%e",
 				isUsesPid: false,
 			},
-			args{
+			args: args{
 				filePath: "/data/corefile/core__demo",
 			},
-			beat.MapStr{
+			want: beat.MapStr{
 				"executable": "demo",
 			},
-			true,
+			want1: true,
 		},
 		{
-			"测试将pid占位符加入",
-			fields{
+			name: "测试将pid占位符加入",
+			fields: fields{
 				pattern:   "core_%e_%p",
 				isUsesPid: false,
 			},
-			args{
+			args: args{
 				filePath: "/data/corefile/core_demo_77190",
 			},
-			beat.MapStr{
+			want: beat.MapStr{
 				"executable": "demo",
 			},
-			true,
+			want1: true,
 		},
 		{
-			"测试特意将pid占位符，而且存在不可用的占位符 加入到pattern中的情形",
-			fields{
+			name: "测试特意将pid占位符，而且存在不可用的占位符 加入到pattern中的情形",
+			fields: fields{
 				pattern:   "core_%w_%e_%t_%p",
 				isUsesPid: false,
 			},
-			args{
+			args: args{
 				filePath: "/data/corefile/core__demo_1616056187_77190",
 			},
-			beat.MapStr{
+			want: beat.MapStr{
 				"executable": "demo",
 				"event_time": "1616056187",
 			},
-			true,
+			want1: true,
 		},
 		{
-			"设置了use_pid，但是实际上已经手动匹配过了，此时不需要划分后缀",
-			fields{
+			name: "设置了use_pid，但是实际上已经手动匹配过了，此时不需要划分后缀",
+			fields: fields{
 				pattern:   "core_%w_%e_%t_%p",
 				isUsesPid: true,
 			},
-			args{
+			args: args{
 				filePath: "/data/corefile/core__demo_1616056187_77190",
 			},
-			beat.MapStr{
+			want: beat.MapStr{
 				"executable": "demo",
 				"event_time": "1616056187",
 			},
-			true,
+			want1: true,
 		},
 		{
-			"第一个自身匹配出分隔符",
-			fields{
+			name: "第一个自身匹配出分隔符",
+			fields: fields{
 				pattern:   "core_%e_%t",
 				isUsesPid: true,
 			},
-			args{
+			args: args{
 				filePath: "/data/corefile/core_gen_core_test_1668062442.10453",
 			},
-			beat.MapStr{
+			want: beat.MapStr{
 				"executable": "gen_core_test",
 				"event_time": "1668062442",
 			},
-			true,
+			want1: true,
 		},
 		{
-			"匹配出上一个分隔符造成歧义",
-			fields{
+			name: "匹配出上一个分隔符造成歧义",
+			fields: fields{
 				pattern:   "core_%et%h_%t",
 				isUsesPid: true,
 			},
-			args{
+			args: args{
 				filePath: "/data/corefile/core_gen_test_centos_1668062442.10453",
 			},
-			beat.MapStr{
+			want: beat.MapStr{
 				"event_time": "1668062442",
 			},
-			true,
+			want1: true,
 		},
 		{
-			"连续三个有歧义",
-			fields{
+			name: "连续三个有歧义",
+			fields: fields{
 				pattern:   "core_%et%ht%E_%t",
 				isUsesPid: true,
 			},
-			args{
+			args: args{
 				filePath: "/data/corefile/core_gen_test_centos_test_path_1668062442.10453",
 			},
-			beat.MapStr{
+			want: beat.MapStr{
 				"event_time": "1668062442",
 			},
-			true,
+			want1: true,
 		},
 		{
-			"匹配出前后分隔符但和前后都不匹配",
-			fields{
+			name: "匹配出前后分隔符但和前后都不匹配",
+			fields: fields{
 				pattern:   "core_%t_%e_%s",
 				isUsesPid: false,
 			},
-			args{
+			args: args{
 				filePath: "/data/corefile/core_1668062442_gen_core_test_8",
 			},
-			beat.MapStr{
+			want: beat.MapStr{
 				"executable": "gen_core_test",
 				"event_time": "1668062442",
 				"signal":     "SIGFPE",
 			},
-			true,
+			want1: true,
+		},
+		{
+			name: "正则过滤(success)",
+			fields: fields{
+				pattern:   "core_%t_%e_%s",
+				isUsesPid: false,
+			},
+			args: args{
+				filePath: "/data/corefile/core_gen_core_test",
+			},
+			reg:   regexp.MustCompile("gen_core_test"),
+			want:  beat.MapStr{},
+			want1: true,
+		},
+		{
+			name: "正则过滤(failed) - 1",
+			fields: fields{
+				pattern:   "core_%t_%e_%s",
+				isUsesPid: false,
+			},
+			args: args{
+				filePath: "/data/corefile/core_gen_core_xtest",
+			},
+			reg:   regexp.MustCompile("gen_core_test"),
+			want:  beat.MapStr{},
+			want1: false,
+		},
+		{
+			name: "正则过滤(failed) - 2",
+			fields: fields{
+				pattern:   "core_%e_%t",
+				isUsesPid: false,
+			},
+			args: args{
+				filePath: "/data/corefile/alarms.txt",
+			},
+			reg:   regexp.MustCompile("core_*"),
+			want:  beat.MapStr{},
+			want1: false,
 		},
 	}
 	for _, tt := range tests {
@@ -428,6 +466,7 @@ func TestCoreFileCollector_fillDimension(t *testing.T) {
 			c := &CoreFileCollector{
 				pattern:   tt.fields.pattern,
 				isUsesPid: tt.fields.isUsesPid,
+				matchRegx: tt.reg,
 			}
 			err := c.checkPattern()
 			assert.NoError(t, err, "checkPattern", tt.fields.pattern)

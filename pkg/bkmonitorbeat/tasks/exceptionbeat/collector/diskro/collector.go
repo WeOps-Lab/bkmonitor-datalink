@@ -8,7 +8,6 @@
 // specific language governing permissions and limitations under the License.
 
 //go:build aix || darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris || zos
-// +build aix darwin dragonfly freebsd linux netbsd openbsd solaris zos
 
 package diskro
 
@@ -152,16 +151,16 @@ func (c *DiskROCollector) getRODisk() []beat.MapStr {
 			shouldReport = true
 		}
 
+		// 如果命中黑名单规则 则不再继续判断
+		if mp.IsMatchRule(c.blackList) {
+			logger.Infof("mount_point->[%s] match black list, nothing will report.", mp.MountPoint)
+			continue
+		}
+
 		// 判断是否存在RW 到RO的变化
 		if mp.IsReadOnlyStatusChange() {
 			logger.Info("mount_point->[%s] is detect change now, will report it.")
 			shouldReport = true
-		}
-
-		// 如果需要上报，则需要判断是否存在黑名单的过滤
-		if shouldReport && mp.IsMatchRule(c.blackList) {
-			logger.Infof("mount_point->[%s] should report but match black list, nothing will report.")
-			shouldReport = false
 		}
 
 		// 最终判断是否需要上报
@@ -180,7 +179,6 @@ func (c *DiskROCollector) getRODisk() []beat.MapStr {
 			continue
 		}
 		logger.Debugf("mount_point->[%s] status is saved now.", mp.MountPoint)
-
 	}
 	for device, exists := range c.deviceMap {
 		if !exists {

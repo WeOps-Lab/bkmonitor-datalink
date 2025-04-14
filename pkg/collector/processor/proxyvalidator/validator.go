@@ -10,13 +10,13 @@
 package proxyvalidator
 
 import (
-	"regexp"
 	"time"
 
 	"github.com/pkg/errors"
 	"github.com/spf13/cast"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/utils"
 )
 
 const (
@@ -28,8 +28,6 @@ type Validator interface {
 	Validate(*define.ProxyData) error
 }
 
-var namePattern = regexp.MustCompile("^[a-zA-Z_][a-zA-Z0-9_]*$")
-
 type noneValidator struct{}
 
 func (noneValidator) Validate(*define.ProxyData) error {
@@ -39,10 +37,9 @@ func (noneValidator) Validate(*define.ProxyData) error {
 type nameValidator struct{}
 
 func (nv *nameValidator) Validate(s string) error {
-	if !namePattern.MatchString(s) {
+	if !utils.IsNameNormalized(s) {
 		return errors.Errorf("name '%s' required match regex [^[a-zA-Z_][a-zA-Z0-9_]*$]", s)
 	}
-
 	return nil
 }
 
@@ -203,8 +200,10 @@ func (tc *timeSeriesValidator) Validate(pd *define.ProxyData) error {
 		if err != nil {
 			return err
 		}
-		mapObj["timestamp"] = timestamp
+		mapObj["timestamp"] = int64(timestamp)
 	}
+
+	pd.Type = define.ProxyMetricType
 	return nil
 }
 
@@ -284,7 +283,9 @@ func (tc *eventValidator) Validate(pd *define.ProxyData) error {
 		if err != nil {
 			return err
 		}
-		mapObj["timestamp"] = timestamp
+		mapObj["timestamp"] = int64(timestamp)
 	}
+
+	pd.Type = define.ProxyEventType
 	return nil
 }

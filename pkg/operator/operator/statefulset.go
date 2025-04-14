@@ -22,7 +22,8 @@ import (
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/common/define"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/common/k8sutils"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/common/kits"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/common/notifier"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/configs"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/operator/discover"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/logger"
 )
@@ -38,7 +39,7 @@ const (
 func (c *Operator) listWatchStatefulSetWorker() error {
 	informer, err := informers.NewInformersForResource(
 		informers.NewKubeInformerFactories(
-			map[string]struct{}{ConfMonitorNamespace: {}},
+			map[string]struct{}{configs.G().MonitorNamespace: {}},
 			nil,
 			c.client,
 			define.ReSyncPeriod,
@@ -104,7 +105,7 @@ func (c *Operator) handleStatefulSetWorkerUpdate(oldObj, newObj interface{}) {
 	}
 
 	if old.ResourceVersion == cur.ResourceVersion {
-		logger.Debugf("StatefulSet %+v does not change", old)
+		logger.Debugf("StatefulSet '%s/%s' does not change", old.Namespace, old.Name)
 		return
 	}
 
@@ -118,7 +119,7 @@ func (c *Operator) handleStatefulSetWorkerUpdate(oldObj, newObj interface{}) {
 func (c *Operator) listWatchStatefulSetSecrets() error {
 	informer, err := informers.NewInformersForResource(
 		informers.NewKubeInformerFactories(
-			map[string]struct{}{ConfMonitorNamespace: {}},
+			map[string]struct{}{configs.G().MonitorNamespace: {}},
 			nil,
 			c.client,
 			define.ReSyncPeriod,
@@ -178,34 +179,60 @@ func (c *Operator) handleStatefulSetSecretUpdate(oldObj, newObj interface{}) {}
 func (c *Operator) reconcileStatefulSetWorker(configCount int) {
 	n := calcShouldStatefulSetWorker(configCount)
 	logger.Infof("statefulset workers count should be %d, childConfigs count: %d", n, configCount)
+	c.mm.SetStatefulSetWorkerCount(n)
 
 	// 2 分钟内最多只允许调度 1 次
 	if time.Now().Unix()-c.statefulSetWorkerScaled.Unix() < 120 {
 		return
 	}
 
-	if c.statefulSetWorker != n {
-		c.statefulSetWorkerScaled = time.Now()
-		scale, err := c.client.AppsV1().StatefulSets(ConfMonitorNamespace).GetScale(c.ctx, statefulSetWorkerName, metav1.GetOptions{})
+	// 期待的 workers 没有变化 不做任何处理
+	if c.statefulSetWorker == n {
+		return
+	}
+
+	statefulsetClient := c.client.AppsV1().StatefulSets(configs.G().MonitorNamespace)
+	c.statefulSetWorkerScaled = time.Now()
+	scale, err := statefulsetClient.GetScale(c.ctx, statefulSetWorkerName, metav1.GetOptions{})
+	if err != nil {
+		logger.Errorf("failed to get statefulset worker scale: %v", err)
+		c.mm.IncScaledStatefulSetFailedCounter()
+		return
+	}
+	sc := *scale
+	sc.Spec.Replicas = int32(n)
+
+	_, err = statefulsetClient.UpdateScale(c.ctx, statefulSetWorkerName, &sc, metav1.UpdateOptions{})
+	if err != nil {
+		logger.Errorf("failed to scale statefulset worker replicas from %d to %d: %v", c.statefulSetWorker, n, err)
+		c.mm.IncScaledStatefulSetFailedCounter()
+		return
+	}
+	logger.Infof("scale statefulset worker replicas from %d to %d", c.statefulSetWorker, n)
+	c.mm.IncScaledStatefulSetSuccessCounter()
+
+	// 尽力确保 statefulset worker 已经扩容完成再进行任务调度
+	// 避免影响到原有的数据采集（但此操作会卡住 operator 的调度流程）
+	maxRetry := configs.G().StatefulSetWorkerScaleMaxRetry
+	if maxRetry <= 0 {
+		maxRetry = 12 // 1min
+	}
+
+	start := time.Now()
+	for i := 0; i < maxRetry; i++ {
+		time.Sleep(notifier.WaitPeriod)
+		statefulset, err := statefulsetClient.Get(c.ctx, statefulSetWorkerName, metav1.GetOptions{})
 		if err != nil {
-			logger.Errorf("failed to get statefulset worker scale, err: %v", err)
-			c.mm.IncScaledStatefulSetFailedCounter()
+			logger.Errorf("failed to get statefulset worker: %v", err)
 			return
 		}
-		sc := *scale
-		sc.Spec.Replicas = int32(n)
 
-		_, err = c.client.AppsV1().StatefulSets(ConfMonitorNamespace).UpdateScale(c.ctx, statefulSetWorkerName, &sc, metav1.UpdateOptions{})
-		if err != nil {
-			logger.Errorf("failed to scale statefulset worker replicas from %d to %d, err: %v", c.statefulSetWorker, n, err)
-			c.mm.IncScaledStatefulSetFailedCounter()
+		// 扩容完成
+		if int(statefulset.Status.ReadyReplicas) == n {
+			logger.Infof("scacle statefulset worker finished, take %s", time.Since(start))
 			return
 		}
-		logger.Infof("scale statefulset worker replicas from %d to %d", c.statefulSetWorker, n)
-		c.mm.IncScaledStatefulSetSuccessCounter()
-
-		// 等待一个采集任务调度周期（尽力）确保 replicas 变更已经被 watch 到
-		time.Sleep(kits.WaitPeriod)
+		logger.Infof("waiting for statefulset operation, round: %d", i+1)
 	}
 }
 
@@ -218,15 +245,15 @@ func (c *Operator) reconcileStatefulSetWorker(configCount int) {
 func calcShouldStatefulSetWorker(n int) int {
 	// 判断是否需要开启 HPA 如果不开启的话使用 ConfStatefulSetReplicas
 	// 如果采集任务数量为 0 也保证最少有 ConfStatefulSetReplicas 个 worker
-	if !ConfStatefulSetWorkerHpa || n <= 0 {
-		if ConfStatefulSetReplicas <= 0 {
+	if !configs.G().StatefulSetWorkerHpa || n <= 0 {
+		if configs.G().StatefulSetReplicas <= 0 {
 			return 1
 		}
-		return ConfStatefulSetReplicas
+		return configs.G().StatefulSetReplicas
 	}
 
 	// 如果开启 HPA 的话 需要先检查每个 worker 最多允许多少个采集任务
-	factor := ConfStatefulSetWorkerFactor
+	factor := configs.G().StatefulSetWorkerFactor
 	if factor <= 0 {
 		factor = defaultStatefulSetWorkerFactor
 	}
@@ -234,13 +261,18 @@ func calcShouldStatefulSetWorker(n int) int {
 	// 按采集数量分配 计算出总共需要多少 workers 四舍五入
 	expectedWorkers := int(math.Round(float64(n) / float64(factor)))
 	// 确保 worker 数量不能超过 ConfStatefulSetMaxReplicas
-	if expectedWorkers >= ConfStatefulSetMaxReplicas {
-		expectedWorkers = ConfStatefulSetMaxReplicas
+	if expectedWorkers >= configs.G().StatefulSetMaxReplicas {
+		expectedWorkers = configs.G().StatefulSetMaxReplicas
 	}
 
 	// 保证最少有一个 worker
 	if expectedWorkers <= 0 {
 		expectedWorkers = 1
+	}
+
+	// 保证 workers 数量不低于 ConfStatefulSetReplicas
+	if configs.G().StatefulSetReplicas > expectedWorkers {
+		expectedWorkers = configs.G().StatefulSetReplicas
 	}
 
 	return expectedWorkers

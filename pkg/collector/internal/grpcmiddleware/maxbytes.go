@@ -11,16 +11,25 @@ package grpcmiddleware
 
 import (
 	"google.golang.org/grpc"
+
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/utils"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/logger"
 )
 
 const (
-	maxRequestBytes = 1024 * 1024 * 4 // 4MB（grpc 默认配置 调整此参数请评估影响）
+	// Note: grpc 默认配置 调整此参数请评估影响）
+	defaultMaxRequestBytes = 1024 * 1024 * 8 // 8MB
+	optMaxRequestBytes     = "maxRequestBytes"
 )
 
 func init() {
-	Register("maxbytes", MaxBytes())
+	Register("maxbytes", MaxBytes)
 }
 
-func MaxBytes() grpc.ServerOption {
-	return grpc.MaxRecvMsgSize(maxRequestBytes)
+func MaxBytes(opt string) grpc.ServerOption {
+	om := utils.NewOptMap(opt)
+	n := om.GetIntDefault(optMaxRequestBytes, defaultMaxRequestBytes)
+	logger.Infof("maxbytes middleware opts: %s(%d)", optMaxRequestBytes, n)
+
+	return grpc.MaxRecvMsgSize(n)
 }

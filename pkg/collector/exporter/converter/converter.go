@@ -15,12 +15,13 @@ import (
 
 	"github.com/elastic/beats/libbeat/common"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
 )
 
 var (
-	converterFailedTotal = prometheus.NewCounterVec(
+	converterFailedTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: define.MonitoringNamespace,
 			Name:      "converter_failed_total",
@@ -29,7 +30,7 @@ var (
 		[]string{"record_type", "id"},
 	)
 
-	converterSpanKindTotal = prometheus.NewCounterVec(
+	converterSpanKindTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: define.MonitoringNamespace,
 			Name:      "converter_span_kind_total",
@@ -38,13 +39,6 @@ var (
 		[]string{"id", "kind"},
 	)
 )
-
-func init() {
-	prometheus.MustRegister(
-		converterFailedTotal,
-		converterSpanKindTotal,
-	)
-}
 
 var DefaultMetricMonitor = &metricMonitor{}
 
@@ -90,6 +84,14 @@ func (c commonConverter) Convert(record *define.Record, f define.GatherFunc) {
 		ProxyConverter.Convert(record, f)
 	case define.RecordPingserver:
 		PingserverConverter.Convert(record, f)
+	case define.RecordProfiles:
+		ProfilesConverter.Convert(record, f)
+	case define.RecordFta:
+		FtaConverter.Convert(record, f)
+	case define.RecordBeat:
+		BeatConverter.Convert(record, f)
+	case define.RecordTars:
+		TarsConverter.Convert(record, f)
 	}
 }
 

@@ -59,6 +59,18 @@ config_templates:
               items:
                 title: interface
                 type: string
+            corefile_pattern:
+              title: corefile_pattern
+              type: string
+            corefile_match_regex:
+              title: corefile_match_regex
+              type: string
+            disable_resource_limit:
+              title: disable_resource_limit
+              type: string
+            enable_audit_tasks:
+              title: enable_audit_tasks
+              type: string
   - plugin_version: "*"
     name: bkmonitorbeat_prometheus.conf
     version: 1

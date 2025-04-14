@@ -10,7 +10,6 @@
 package accumulator
 
 import (
-	"fmt"
 	"math"
 	"sort"
 	"strconv"
@@ -19,18 +18,20 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/fasttime"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/labels"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/labelstore"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/metricsbuilder"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/utils"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/processor/tracesderiver/labelstore"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/fasttime"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/logger"
 )
 
 var (
-	seriesExceededTotal = prometheus.NewCounterVec(
+	seriesExceededTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: define.MonitoringNamespace,
 			Name:      "accumulator_series_exceeded_total",
@@ -39,7 +40,7 @@ var (
 		[]string{"record_type", "id"},
 	)
 
-	seriesCount = prometheus.NewGaugeVec(
+	seriesCount = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: define.MonitoringNamespace,
 			Name:      "accumulator_series_count",
@@ -48,7 +49,7 @@ var (
 		[]string{"record_type", "id"},
 	)
 
-	addedSeriesTotal = prometheus.NewCounterVec(
+	addedSeriesTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: define.MonitoringNamespace,
 			Name:      "accumulator_added_series_total",
@@ -57,7 +58,7 @@ var (
 		[]string{"record_type", "id"},
 	)
 
-	gcDuration = prometheus.NewHistogram(
+	gcDuration = promauto.NewHistogram(
 		prometheus.HistogramOpts{
 			Namespace: define.MonitoringNamespace,
 			Name:      "accumulator_gc_duration_seconds",
@@ -66,7 +67,7 @@ var (
 		},
 	)
 
-	publishDuration = prometheus.NewHistogram(
+	publishDuration = promauto.NewHistogram(
 		prometheus.HistogramOpts{
 			Namespace: define.MonitoringNamespace,
 			Name:      "accumulator_published_duration_seconds",
@@ -75,16 +76,6 @@ var (
 		},
 	)
 )
-
-func init() {
-	prometheus.MustRegister(
-		seriesExceededTotal,
-		seriesCount,
-		addedSeriesTotal,
-		gcDuration,
-		publishDuration,
-	)
-}
 
 var DefaultMetricMonitor = &metricMonitor{}
 
@@ -143,50 +134,51 @@ type recorder struct {
 	stopped atomic.Bool
 	wg      sync.WaitGroup
 
-	metricName string
-	dataID     int32
-	storID     string
-	gcInterval time.Duration
-	maxSeries  int
-	buckets    []float64
+	metricName          string
+	dataID              int32
+	storID              string
+	gcInterval          time.Duration
+	maxSeries           int
+	buckets             []float64
+	maxSeriesGrowthRate int
 
-	stor labelstore.Storage
-	mut  sync.RWMutex
+	storage *labelstore.Storage
+	mut     sync.RWMutex
 
 	// https://github.com/golang/go/issues/9477
 	// map 中如果 values 为指针类型 gc 扫描的开销会增大不少
 	// 参见 benchmark
-	statsMap map[uint64]rStats
-	exceeded int
+	statsMap         map[uint64]rStats
+	exceeded         int
+	seriesGrowthRate int
 }
 
 type recorderOptions struct {
-	metricName string
-	maxSeries  int
-	dataID     int32
-	buckets    []float64
-	gcInterval time.Duration
-	storID     string
+	metricName          string
+	maxSeries           int
+	dataID              int32
+	buckets             []float64
+	gcInterval          time.Duration
+	maxSeriesGrowthRate int
 }
 
-func newRecorder(opts recorderOptions, stor labelstore.Storage) *recorder {
+func newRecorder(opts recorderOptions) *recorder {
 	buckets := opts.buckets
 	sort.Float64s(buckets)
 	r := &recorder{
-		done:       make(chan struct{}, 1),
-		metricName: opts.metricName,
-		dataID:     opts.dataID,
-		storID:     opts.storID,
-		gcInterval: opts.gcInterval,
-		maxSeries:  opts.maxSeries,
-		buckets:    toNanoseconds(buckets),
-		stor:       stor,
-		statsMap:   map[uint64]rStats{},
+		done:                make(chan struct{}, 1),
+		metricName:          opts.metricName,
+		dataID:              opts.dataID,
+		gcInterval:          opts.gcInterval,
+		maxSeries:           opts.maxSeries,
+		buckets:             toNanoseconds(buckets),
+		maxSeriesGrowthRate: opts.maxSeriesGrowthRate,
+		storage:             labelstore.New(),
+		statsMap:            map[uint64]rStats{},
 	}
 
 	r.wg.Add(1)
 	go r.updateMetrics()
-	logger.Debugf("create new recorder, storid=%s", opts.storID)
 	return r
 }
 
@@ -208,12 +200,7 @@ func (r *recorder) updateMetrics() {
 	for {
 		select {
 		case <-r.done:
-			// 退出前清理 Storage
-			if err := r.stor.Clean(); err != nil {
-				logger.Errorf("failed to clean storage, storid=%s, err: %v", r.storID, err)
-			}
-			// 从全局表中清除
-			labelstore.RemoveStorage(r.storID)
+			r.storage.Clean() // 退出前释放
 			return
 
 		case <-ticker.C:
@@ -235,18 +222,18 @@ func (r *recorder) Total() int {
 }
 
 // Set 更新 labels 缓存
-func (r *recorder) Set(lbs labels.Labels, value float64) bool {
+func (r *recorder) Set(dims map[string]string, value float64) bool {
 	if r.stopped.Load() {
 		return false
 	}
 
-	h := lbs.Hash()
+	h := labels.HashFromMap(dims)
 
 	r.mut.Lock()
 	defer r.mut.Unlock()
 
 	if len(r.statsMap) >= r.maxSeries {
-		logger.Debugf("got exceeded series labels: %v", lbs)
+		logger.Debugf("got exceeded series labels: %v", dims)
 		DefaultMetricMonitor.IncSeriesExceededCounter(r.dataID)
 		r.exceeded++
 		return false
@@ -254,6 +241,16 @@ func (r *recorder) Set(lbs labels.Labels, value float64) bool {
 
 	s, ok := r.statsMap[h]
 	if !ok {
+		if r.enableLimitGrowRate() {
+			r.seriesGrowthRate += 1
+			if r.seriesGrowthRate > r.maxSeriesGrowthRate {
+				logger.Debugf("growth rate exceeded, series labels: %v", dims)
+				DefaultMetricMonitor.IncSeriesExceededCounter(r.dataID)
+				r.exceeded++
+				return false
+			}
+		}
+
 		DefaultMetricMonitor.IncAddedSeriesCounter(r.dataID)
 		s = rStats{}
 		s.min = MaxValue
@@ -280,11 +277,13 @@ func (r *recorder) Set(lbs labels.Labels, value float64) bool {
 	s.updated = fasttime.UnixTimestamp()
 	r.statsMap[h] = s
 
-	if err := r.stor.SetIf(h, lbs); err != nil {
-		logger.Errorf("failed to set labels: %v, err: %v", lbs, err)
-		return false
+	// fastpath: 大多数请求都会命中缓存
+	if exist := r.storage.Exist(h); exist {
+		return true
 	}
 
+	// slowpath: alloc labels 开销较大 尽量减少此操作
+	r.storage.SetIf(h, dims)
 	return true
 }
 
@@ -305,11 +304,13 @@ func (r *recorder) Clean() {
 	for h := range dropped {
 		r.mut.Lock() // 尽量减少锁临界区
 		delete(r.statsMap, h)
-		if err := r.stor.Del(h); err != nil {
-			logger.Errorf("failed to delete series labels: %v", err)
-		}
+		r.storage.Del(h)
 		r.mut.Unlock()
 	}
+}
+
+func (r *recorder) ResetGrowthRate() {
+	r.seriesGrowthRate = 0
 }
 
 func (r *recorder) Min() <-chan *define.Record {
@@ -340,14 +341,18 @@ func (r *recorder) Bucket() <-chan *define.Record {
 	return r.buildMetrics(TypeBucket)
 }
 
+func (r *recorder) enableLimitGrowRate() bool {
+	return r.maxSeriesGrowthRate > 0
+}
+
 type LeValue struct {
 	Le    string
 	Value float64
 }
 
 func (r *recorder) calc(kind string, k uint64, stat rStats) (rStats, []metricsbuilder.Metric) {
-	lbs, err := r.stor.Get(k)
-	if err != nil {
+	lbs, ok := r.storage.Get(k)
+	if !ok {
 		return stat, nil
 	}
 
@@ -397,15 +402,13 @@ func (r *recorder) calc(kind string, k uint64, stat rStats) (rStats, []metricsbu
 		}
 	}
 
-	logger.Debugf("%s stats: %+v", kind, stat)
-
 	var metrics []metricsbuilder.Metric
 	unixNano := uint64(time.Now().UnixNano())
 
 	// histogram 类型处理
 	if len(leValues) > 0 {
 		for _, lev := range leValues {
-			dims := lbs.Map() // 复制新的 labels 保证读写安全
+			dims := utils.CloneMap(lbs) // 复制新的 labels 保证读写安全
 			dims["le"] = lev.Le
 			metrics = append(metrics, metricsbuilder.Metric{
 				Val:        lev.Value,
@@ -419,7 +422,7 @@ func (r *recorder) calc(kind string, k uint64, stat rStats) (rStats, []metricsbu
 		metrics = append(metrics, metricsbuilder.Metric{
 			Val:        val,
 			Ts:         pcommon.Timestamp(unixNano),
-			Dimensions: lbs.Map(),
+			Dimensions: utils.CloneMap(lbs),
 		})
 	}
 
@@ -488,12 +491,13 @@ func (r *recorder) buildMetrics(kind string) <-chan *define.Record {
 }
 
 type Config struct {
-	MetricName      string
-	MaxSeries       int
-	GcInterval      time.Duration
-	PublishInterval time.Duration
-	Buckets         []float64
-	Type            string
+	MetricName          string
+	MaxSeries           int
+	GcInterval          time.Duration
+	PublishInterval     time.Duration
+	Buckets             []float64
+	Type                string
+	MaxSeriesGrowthRate int
 }
 
 // Validate 验证配置默认值
@@ -530,6 +534,7 @@ func New(conf *Config, publishFunc func(r *define.Record)) *Accumulator {
 		gcInterval:      conf.GcInterval / 2, // 以 0.5*gcInterval 频率进行清理
 	}
 	go accumulator.gc()
+	go accumulator.resetGrowthRateLoop()
 
 	if publishFunc != nil {
 		go accumulator.publish()
@@ -623,6 +628,19 @@ func (a *Accumulator) doGc() {
 	DefaultMetricMonitor.ObserveGcDuration(start)
 }
 
+func (a *Accumulator) resetGrowthRate() {
+	a.mut.RLock()
+	rs := make([]*recorder, 0, len(a.recorders))
+	for _, r := range a.recorders {
+		rs = append(rs, r)
+	}
+	a.mut.RUnlock()
+
+	for _, r := range rs {
+		r.ResetGrowthRate()
+	}
+}
+
 func (a *Accumulator) gc() {
 	ticker := time.NewTicker(a.gcInterval)
 	defer ticker.Stop()
@@ -633,6 +651,23 @@ func (a *Accumulator) gc() {
 			return
 		case <-ticker.C:
 			a.doGc()
+		}
+	}
+}
+
+func (a *Accumulator) resetGrowthRateLoop() {
+	if !a.enableLimitGrowRate() {
+		return
+	}
+
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-a.done:
+			return
+		case <-ticker.C:
+			a.resetGrowthRate()
 		}
 	}
 }
@@ -674,7 +709,7 @@ func (a *Accumulator) Accumulate(dataID int32, dims map[string]string, value flo
 	}
 	a.mut.RUnlock()
 	if r != nil {
-		return r.Set(labels.FromMap(dims), value)
+		return r.Set(dims, value)
 	}
 
 	// 写锁保护
@@ -682,19 +717,21 @@ func (a *Accumulator) Accumulate(dataID int32, dims map[string]string, value flo
 	if v, ok := a.recorders[dataID]; ok {
 		r = v
 	} else {
-		id := fmt.Sprintf("%s:%d", a.conf.MetricName, dataID)
-		stor := labelstore.GetOrCreateStorage(id)
 		opts := recorderOptions{
-			metricName: a.conf.MetricName,
-			maxSeries:  a.conf.MaxSeries,
-			dataID:     dataID,
-			storID:     id,
-			buckets:    a.conf.GetBuckets(),
-			gcInterval: a.conf.GcInterval,
+			metricName:          a.conf.MetricName,
+			maxSeries:           a.conf.MaxSeries,
+			dataID:              dataID,
+			buckets:             a.conf.GetBuckets(),
+			gcInterval:          a.conf.GcInterval,
+			maxSeriesGrowthRate: a.conf.MaxSeriesGrowthRate,
 		}
-		r = newRecorder(opts, stor)
+		r = newRecorder(opts)
 		a.recorders[dataID] = r
 	}
 	a.mut.Unlock()
-	return r.Set(labels.FromMap(dims), value)
+	return r.Set(dims, value)
+}
+
+func (a *Accumulator) enableLimitGrowRate() bool {
+	return a.conf.MaxSeriesGrowthRate > 0
 }

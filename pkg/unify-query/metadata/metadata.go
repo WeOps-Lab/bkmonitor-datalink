@@ -11,10 +11,8 @@ package metadata
 
 import (
 	"context"
-	"fmt"
 
 	cache "github.com/patrickmn/go-cache"
-	"go.opentelemetry.io/otel/trace"
 )
 
 // metaData 元数据存储
@@ -24,16 +22,14 @@ type metaData struct {
 
 // Get 通过 traceID + key 获取缓存
 func (m *metaData) get(ctx context.Context, key string) (interface{}, bool) {
-	span := trace.SpanFromContext(ctx)
-	traceID := span.SpanContext().TraceID().String()
-	k := fmt.Sprintf("%s_%s", traceID, key)
+	id := hashID(ctx)
+	k := id + "_" + key
 	return m.c.Get(k)
 }
 
 // Set 通过 traceID + key 写入缓存
 func (m *metaData) set(ctx context.Context, key string, value interface{}) {
-	span := trace.SpanFromContext(ctx)
-	traceID := span.SpanContext().TraceID().String()
-	k := fmt.Sprintf("%s_%s", traceID, key)
+	id := hashID(ctx)
+	k := id + "_" + key
 	m.c.SetDefault(k, value)
 }

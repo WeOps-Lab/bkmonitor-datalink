@@ -183,6 +183,24 @@ type MockPayload struct {
 	recorder *MockPayloadMockRecorder
 }
 
+func (m *MockPayload) SetETLRecord(record *define.ETLRecord) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (m *MockPayload) GetETLRecord() *define.ETLRecord {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (m *MockPayload) SetFlag(flag define.PayloadFlag) {}
+
+func (m *MockPayload) AddFlag(flag define.PayloadFlag) {}
+
+func (m *MockPayload) Flag() define.PayloadFlag {
+	return 0
+}
+
 // MockPayloadMockRecorder is the mock recorder for MockPayload.
 type MockPayloadMockRecorder struct {
 	mock *MockPayload

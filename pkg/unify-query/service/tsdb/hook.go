@@ -42,18 +42,20 @@ func setDefaultConfig() {
 	// victoriaMetrics 配置
 	viper.SetDefault(VmTimeoutConfigPath, "30s")
 	viper.SetDefault(VmContentTypeConfigPath, "application/json")
-	viper.SetDefault(VmMaxConditionNumConfigPath, 2000)
+	viper.SetDefault(VmMaxConditionNumConfigPath, 2e4)
 
 	// vm 支持 influxdb 的查询配置
 	viper.SetDefault(VmInfluxCompatibleConfigPath, true)
 	viper.SetDefault(VmUseNativeOrConfigPath, true)
 
-	viper.SetDefault(VmAuthenticationMethodConfigPath, "token")
+	viper.SetDefault(BkSqlTimeoutConfigPath, "30s")
+	viper.SetDefault(BkSqlLimitConfigPath, 2e6)
+	viper.SetDefault(BkSqlToleranceConfigPath, 5)
+	viper.SetDefault(BkSqlContentTypeConfigPath, "application/json")
 
-	viper.SetDefault(OfflineDataArchiveAddressConfigPath, "bk-datalink-offline-data-archive:8089")
-	viper.SetDefault(OfflineDataArchiveTimeoutConfigPath, "10m")
-	viper.SetDefault(OfflineDataArchiveGrpcMaxCallRecvMsgSizeConfigPath, 1024*1024*10)
-	viper.SetDefault(OfflineDataArchiveGrpcMaxCallSendMsgSizeConfigPath, 1024*1024*10)
+	viper.SetDefault(EsTimeoutConfigPath, "30s")
+	viper.SetDefault(EsMaxSizeConfigPath, 1e4)
+	viper.SetDefault(EsMaxRoutingConfigPath, 10)
 }
 
 // initConfig 加载配置
@@ -73,23 +75,22 @@ func initConfig() {
 	InfluxDBRouterPrefix = viper.GetString(InfluxDBRouterPrefixConfigPath)
 
 	// victoriaMetrics 配置
-	VmAddress = viper.GetString(VmAddressConfigPath)
 	VmTimeout = viper.GetDuration(VmTimeoutConfigPath)
-	VmUriPath = viper.GetString(VmUriPathConfigPath)
 	VmContentType = viper.GetString(VmContentTypeConfigPath)
-	VmCode = viper.GetString(VmCodeConfigPath)
-	VmSecret = viper.GetString(VmSecretConfigPath)
-	VmToken = viper.GetString(VmTokenConfigPath)
-	VmAuthenticationMethod = viper.GetString(VmAuthenticationMethodConfigPath)
 	VmMaxConditionNum = viper.GetInt(VmMaxConditionNumConfigPath)
 
 	VmInfluxCompatible = viper.GetBool(VmInfluxCompatibleConfigPath)
 	VmUseNativeOr = viper.GetBool(VmUseNativeOrConfigPath)
 
-	OfflineDataArchiveAddress = viper.GetString(OfflineDataArchiveAddressConfigPath)
-	OfflineDataArchiveTimeout = viper.GetDuration(OfflineDataArchiveTimeoutConfigPath)
-	OfflineDataArchiveGrpcMaxCallRecvMsgSize = viper.GetInt(OfflineDataArchiveGrpcMaxCallRecvMsgSizeConfigPath)
-	OfflineDataArchiveGrpcMaxCallSendMsgSize = viper.GetInt(OfflineDataArchiveGrpcMaxCallSendMsgSizeConfigPath)
+	// bksql 配置
+	BkSqlTimeout = viper.GetDuration(BkSqlTimeoutConfigPath)
+	BkSqlLimit = viper.GetInt(BkSqlLimitConfigPath)
+	BkSqlTolerance = viper.GetInt(BkSqlToleranceConfigPath)
+	BkSqlContentType = viper.GetString(BkSqlContentTypeConfigPath)
+
+	EsTimeout = viper.GetDuration(EsTimeoutConfigPath)
+	EsMaxRouting = viper.GetInt(EsMaxRoutingConfigPath)
+	EsMaxSize = viper.GetInt(EsMaxSizeConfigPath)
 }
 
 // init 初始化，通过 eventBus 加载配置读取前和读取后操作

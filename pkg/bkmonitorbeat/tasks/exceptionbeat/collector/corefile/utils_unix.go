@@ -8,7 +8,6 @@
 // specific language governing permissions and limitations under the License.
 
 //go:build aix || darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris || zos
-// +build aix darwin dragonfly freebsd linux netbsd openbsd solaris zos
 
 package corefile
 
@@ -91,7 +90,6 @@ func buildDimensionKey(info beat.MapStr) string {
 		} else {
 			result = append(result, "")
 		}
-
 	}
 
 	return strings.Join(result, "-")
@@ -135,7 +133,7 @@ func (c *CoreFileCollector) handleCoreFileEvent(event fsnotify.Event, e chan<- d
 	// 只关注文件创建，后续文件的写入或者其他的变化都一律认为属于收敛不再关注
 	if strings.Contains(event.Name, c.corePath) && event.Op&fsnotify.Create == fsnotify.Create {
 		// 如果发现创建的事件属于路径，则跳过不处理
-		info, err := os.Stat(event.Name)
+		info, err := os.Lstat(event.Name)
 		if err != nil {
 			logger.Errorf("failed to stat file->[%s] stat for err->[%s], nothing will do any more.", event.Name, err)
 			return
@@ -173,7 +171,6 @@ func (c *CoreFileCollector) handleCoreFileEvent(event fsnotify.Event, e chan<- d
 
 // checkSystemFile 检查系统配置变更
 func (c *CoreFileCollector) checkSystemFile() {
-
 	if !c.isCorePathAddSuccess && c.corePath != "" {
 		logger.Infof("corePath->[%s] add failed before, will retry now.", c.corePath)
 		if err := c.coreWatcher.Add(c.corePath); err != nil {
@@ -208,7 +205,7 @@ func (c *CoreFileCollector) checkSystemFile() {
 
 // handleSendEvent 处理上报
 func (c *CoreFileCollector) handleSendEvent(e chan<- define.Event) {
-	var now = time.Now()
+	now := time.Now()
 	// 遍历检查是否存在需要发送的缓存事件
 	for key, reportInfo := range c.reportTimeInfo {
 		// 如果有上报时间已经超过的，而且存在上报记录信息的，需要上报
@@ -357,7 +354,7 @@ func (c *CoreFileCollector) getCoreFilePath() (string, error) {
 		defer func() {
 			_ = file.Close()
 		}()
-		var corePatternArr = make([]byte, 512)
+		corePatternArr := make([]byte, 512)
 		_, err = file.Read(corePatternArr)
 		if err != nil {
 			return "", err
@@ -488,10 +485,20 @@ func (c *CoreFileCollector) parseDimensions(groups []regexGroup) beat.MapStr {
 	return dimensions
 }
 
+func (c *CoreFileCollector) fillDimension(filePath string) (beat.MapStr, bool) {
+	m, ok := c.fillDimensionV0(filePath)
+	// 正则匹配模式下，不需要关心是否 dimensions 能否匹配到
+	if c.matchRegx != nil {
+		matched := c.matchRegx.MatchString(filepath.Base(filePath))
+		return m, matched
+	}
+
+	return m, ok
+}
+
 // fillDimension: 填充维度信息到dimensions当中，如果解析失败，那么直接返回dimensions，不对其中的任何内容进行修改
 // 返回内容表示是否可以按照正则正常解析；如果正则解析失败的，很可能是用户自己瞎写的文件，不应该触发告警
-func (c *CoreFileCollector) fillDimension(filePath string) (beat.MapStr, bool) {
-
+func (c *CoreFileCollector) fillDimensionV0(filePath string) (beat.MapStr, bool) {
 	// 获取core file文件名
 	fileName, errFileName := c.getCoreFileName(filePath)
 	if errFileName != nil {
@@ -591,7 +598,7 @@ func (c *CoreFileCollector) setCoreUsesPid() error {
 	defer func() {
 		_ = file.Close()
 	}()
-	var coreUsesPidArr = make([]byte, 512)
+	coreUsesPidArr := make([]byte, 512)
 	_, err = file.Read(coreUsesPidArr)
 	if err != nil {
 		logger.Errorf("read %s failed", CoreUsesPidFile)

@@ -29,6 +29,117 @@ import (
 	_ "github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/processor/tracesderiver"
 )
 
+func TestParseProcessor(t *testing.T) {
+	t.Run("Invalid processor", func(t *testing.T) {
+		content := `
+processorx:
+    - name: ""
+      config:
+`
+		conf := confengine.MustLoadConfigContent(content)
+		_, err := parseProcessors("x", conf, nil)
+		assert.Error(t, err)
+	})
+
+	t.Run("Empty processor name", func(t *testing.T) {
+		content := `
+processor:
+    - name: ""
+      config:
+`
+		conf := confengine.MustLoadConfigContent(content)
+		_, err := parseProcessors("x", conf, nil)
+		assert.NoError(t, err)
+	})
+
+	t.Run("Duplicated processor", func(t *testing.T) {
+		content := `
+processor:
+    - name: "apdex_calculator/fixed"
+      config:
+    - name: "apdex_calculator/fixed"
+      config:
+`
+		conf := confengine.MustLoadConfigContent(content)
+		_, err := parseProcessors("x", conf, nil)
+		assert.NoError(t, err)
+	})
+
+	t.Run("No exist processor", func(t *testing.T) {
+		content := `
+processor:
+    - name: "whatever/fixed"
+      config:
+`
+		conf := confengine.MustLoadConfigContent(content)
+		_, err := parseProcessors("x", conf, nil)
+		assert.NoError(t, err)
+	})
+}
+
+func TestParsePipeline(t *testing.T) {
+	t.Run("Invalid pipeline", func(t *testing.T) {
+		content := `
+pipelinex:
+    - name: ""
+      config:
+`
+		conf := confengine.MustLoadConfigContent(content)
+		_, err := parsePipelines("x", conf, nil)
+		assert.Error(t, err)
+	})
+
+	t.Run("Empty pipeline name", func(t *testing.T) {
+		content := `
+pipeline:
+    - name: ""
+      config:
+`
+		conf := confengine.MustLoadConfigContent(content)
+		_, err := parsePipelines("x", conf, nil)
+		assert.NoError(t, err)
+	})
+
+	t.Run("Unknown pipeline type", func(t *testing.T) {
+		content := `
+pipeline:
+    - name: "metrics_pipeline/common"
+      type: "undefined"
+      processors:
+        - "token_checker/aes256"
+        - "rate_limiter/token_bucket"
+`
+		conf := confengine.MustLoadConfigContent(content)
+		_, err := parsePipelines("x", conf, nil)
+		assert.NoError(t, err)
+	})
+
+	t.Run("Validate failed", func(t *testing.T) {
+		content := `
+pipeline:
+    - name: "metrics_pipeline/common"
+      type: "metrics"
+      processors:
+        - "sampler/status_code"
+        - "token_checker/aes256"
+        - "rate_limiter/token_bucket"
+`
+		conf := confengine.MustLoadConfigContent(content)
+		_, err := parsePipelines("x", conf, nil)
+		assert.NoError(t, err)
+	})
+}
+
+func TestParseReportV2Configs(t *testing.T) {
+	t.Run("Invalid type", func(t *testing.T) {
+		content := `
+type: report_v2
+`
+		conf := confengine.MustLoadConfigContent(content)
+		parseReportV2Configs([]*confengine.Config{conf})
+	})
+}
+
 func TestSubConfigParseAndLoad(t *testing.T) {
 	patterns := []string{"../example/fixtures/*.yml"}
 	configs := parseProcessorSubConfigs(confengine.LoadConfigPatterns(patterns))
@@ -204,58 +315,72 @@ func TestNewManager(t *testing.T) {
 		"sampler/random",
 	})
 
-	// assert processors
-	assert.Equal(t, len(manager.processors), 7)
+	t.Run("Processors", func(t *testing.T) {
+		assert.Equal(t, len(manager.processors), 7)
 
-	tokenChecker, ok := manager.processors["token_checker/fixed"]
-	assert.True(t, ok)
+		tokenChecker, ok := manager.processors["token_checker/fixed"]
+		assert.True(t, ok)
 
-	type T1 struct {
-		TracesDataId  int32 `mapstructure:"traces_dataid"`
-		MetricsDataId int32 `mapstructure:"metrics_dataid"`
-		LogsDataId    int32 `mapstructure:"logs_dataid"`
-	}
+		type TokenCheckerConfig struct {
+			TracesDataId  int32 `mapstructure:"traces_dataid"`
+			MetricsDataId int32 `mapstructure:"metrics_dataid"`
+			LogsDataId    int32 `mapstructure:"logs_dataid"`
+		}
 
-	var tokenCheckerConfig T1
-	err = mapstructure.Decode(tokenChecker.MainConfig(), &tokenCheckerConfig)
-	assert.NoError(t, err)
+		var tokenCheckerConfig TokenCheckerConfig
+		err = mapstructure.Decode(tokenChecker.MainConfig(), &tokenCheckerConfig)
+		assert.NoError(t, err)
+		assert.Equal(t, TokenCheckerConfig{
+			TracesDataId:  11000,
+			MetricsDataId: 11001,
+			LogsDataId:    11002,
+		}, tokenCheckerConfig)
 
-	t1 := T1{
-		TracesDataId:  11000,
-		MetricsDataId: 11001,
-		LogsDataId:    11002,
-	}
-	assert.Equal(t, t1, tokenCheckerConfig)
+		sampler, ok := manager.processors["sampler/random"]
+		assert.True(t, ok)
 
-	sampler, ok := manager.processors["sampler/random"]
-	assert.True(t, ok)
+		type SamplerConfig struct {
+			SamplingPercentage float64 `mapstructure:"sampling_percentage"`
+		}
 
-	type T2 struct {
-		SamplingPercentage float64 `mapstructure:"sampling_percentage"`
-	}
+		var samplerConfig SamplerConfig
+		err = mapstructure.Decode(sampler.MainConfig(), &samplerConfig)
+		assert.NoError(t, err)
+		assert.Equal(t, SamplerConfig{
+			SamplingPercentage: 100,
+		}, samplerConfig)
+	})
 
-	var samplerConfig T2
-	err = mapstructure.Decode(sampler.MainConfig(), &samplerConfig)
-	assert.NoError(t, err)
+	t.Run("Privileged", func(t *testing.T) {
+		traceDeriver, ok := manager.processors["traces_deriver/max"]
+		assert.True(t, ok)
 
-	t2 := T2{
-		SamplingPercentage: 100,
-	}
-	assert.Equal(t, t2, samplerConfig)
+		type OperationsConfig struct {
+			Operations []struct {
+				MaxSeriesGrowthRate int `config:"max_series_growth_rate" mapstructure:"max_series_growth_rate"`
+			} `config:"operations" mapstructure:"operations"`
+		}
 
-	// assert pipelines
-	assert.Len(t, manager.pipelines, 5)
-	assert.NotNil(t, manager.GetProcessor("token_checker/fixed"))
-	assert.Nil(t, manager.GetProcessor("token_checker/not_exist"))
+		var operationsConfig OperationsConfig
+		err = mapstructure.Decode(traceDeriver.MainConfig(), &operationsConfig)
+		assert.NoError(t, err)
+		assert.Equal(t, 100, operationsConfig.Operations[0].MaxSeriesGrowthRate)
+	})
 
-	tracesPipeline := manager.GetPipeline(define.RecordTraces)
-	assert.Len(t, tracesPipeline.AllProcessors(), 5)
-	assert.Len(t, tracesPipeline.PreCheckProcessors(), 1)
-	assert.Len(t, tracesPipeline.SchedProcessors(), 4)
+	t.Run("Pipelines", func(t *testing.T) {
+		assert.Len(t, manager.pipelines, 5)
+		assert.NotNil(t, manager.GetProcessor("token_checker/fixed"))
+		assert.Nil(t, manager.GetProcessor("token_checker/not_exist"))
 
-	metricsDerived := manager.GetPipeline(define.RecordMetricsDerived)
-	assert.Len(t, metricsDerived.AllProcessors(), 3)
+		tracesPipeline := manager.GetPipeline(define.RecordTraces)
+		assert.Len(t, tracesPipeline.AllProcessors(), 5)
+		assert.Len(t, tracesPipeline.PreCheckProcessors(), 1)
+		assert.Len(t, tracesPipeline.SchedProcessors(), 4)
 
-	pushGatewayPipeline := manager.GetPipeline(define.RecordPushGateway)
-	assert.Equal(t, []string{"token_checker/fixed"}, pushGatewayPipeline.AllProcessors())
+		metricsDerived := manager.GetPipeline(define.RecordMetricsDerived)
+		assert.Len(t, metricsDerived.AllProcessors(), 3)
+
+		pushGatewayPipeline := manager.GetPipeline(define.RecordPushGateway)
+		assert.Equal(t, []string{"token_checker/fixed"}, pushGatewayPipeline.AllProcessors())
+	})
 }

@@ -16,8 +16,6 @@ import (
 	"sync"
 	"time"
 
-	tkexversiond "github.com/Tencent/bk-bcs/bcs-scenarios/kourse/pkg/client/clientset/versioned"
-	gover "github.com/hashicorp/go-version"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	batchv1beta1 "k8s.io/api/batch/v1beta1"
@@ -25,11 +23,22 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/metadata"
+	"k8s.io/client-go/metadata/metadatainformer"
 	"k8s.io/client-go/tools/cache"
 
+	bkversioned "github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/client/clientset/versioned"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/common/define"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/common/k8sutils"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/configs"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/logger"
+)
+
+type Action string
+
+const (
+	ActionCreateOrUpdate Action = "CreateOrUpdate"
+	ActionDelete         Action = "Delete"
 )
 
 // OwnerRef 代表 Owner 对象引用信息
@@ -42,7 +51,10 @@ type OwnerRef struct {
 type Object struct {
 	ID        ObjectID
 	OwnerRefs []OwnerRef
-	NodeName  string
+
+	// Metadata 属性
+	Labels      map[string]string
+	Annotations map[string]string
 }
 
 // ObjectID 代表 workload 对象标识
@@ -90,19 +102,6 @@ func (o *Objects) Del(oid ObjectID) {
 	delete(o.objs, oid.String())
 }
 
-func (o *Objects) GetByNodeName(nodeName string) []Object {
-	o.mut.Lock()
-	defer o.mut.Unlock()
-
-	var ret []Object
-	for _, obj := range o.objs {
-		if obj.NodeName == nodeName {
-			ret = append(ret, obj)
-		}
-	}
-	return ret
-}
-
 func (o *Objects) GetAll() []Object {
 	o.mut.Lock()
 	defer o.mut.Unlock()
@@ -137,6 +136,10 @@ func NewObjects(kind string) *Objects {
 const (
 	kindNode            = "Node"
 	kindPod             = "Pod"
+	kindService         = "Service"
+	kindEndpoints       = "Endpoints"
+	kindIngress         = "Ingress"
+	kindSecret          = "Secret"
 	kindDeployment      = "Deployment"
 	kindReplicaSet      = "ReplicaSet"
 	kindStatefulSet     = "StatefulSet"
@@ -145,11 +148,16 @@ const (
 	kindCronJob         = "CronJob"
 	kindGameStatefulSet = "GameStatefulSet"
 	kindGameDeployment  = "GameDeployment"
+	kindBkLogConfig     = "BkLogConfig"
 )
 
 const (
-	resourceNodes = "nodes"
-	resourcePods  = "pods"
+	resourceNodes     = "nodes"
+	resourcePods      = "pods"
+	resourceServices  = "services"
+	resourceEndpoints = "endpoints"
+	resourceIngresses = "ingresses"
+	resourceSecrets   = "secrets"
 
 	// builtin workload
 	resourceReplicaSets  = "replicasets"
@@ -162,29 +170,53 @@ const (
 	// extend workload
 	resourceGameStatefulSets = "gamestatefulsets"
 	resourceGameDeployments  = "gamedeployments"
+
+	// logging
+	resourceBkLogConfigs = "bklogconfigs"
 )
+
+func partialObjectMetadataStrip(obj interface{}) (interface{}, error) {
+	partialMeta, ok := obj.(*metav1.PartialObjectMetadata)
+	if !ok {
+		// Don't do anything if the cast isn't successful.
+		// The object might be of type "cache.DeletedFinalStateUnknown".
+		return obj, nil
+	}
+
+	partialMeta.Annotations = nil
+	partialMeta.Labels = nil
+	partialMeta.ManagedFields = nil
+	partialMeta.Finalizers = nil
+
+	return partialMeta, nil
+}
 
 // ObjectsController 负责获取并更新 workload 资源的元信息
 type ObjectsController struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	client              kubernetes.Interface
-	podObjs             *Objects
+	client kubernetes.Interface
+
 	replicaSetObjs      *Objects
 	deploymentObjs      *Objects
 	daemonSetObjs       *Objects
 	statefulSetObjs     *Objects
 	jobObjs             *Objects
 	cronJobObjs         *Objects
-	gameStatefulSetObjs *Objects // tkex gameStatefulSetObjs 资源监听
-	gameDeploymentsObjs *Objects // tkex gameDeploymentsObjs 资源监听
-	nodeObjs            *NodeMap
+	gameStatefulSetObjs *Objects
+	gameDeploymentsObjs *Objects
+	secretObjs          *Objects
 
-	mm *metricMonitor
+	podObjs         *PodMap
+	nodeObjs        *NodeMap
+	serviceObjs     *ServiceMap
+	endpointsObjs   *EndpointsMap
+	ingressObjs     *IngressMap
+	bkLogConfigObjs *BkLogConfigMap
 }
 
-func NewController(ctx context.Context, client kubernetes.Interface, tkexClient tkexversiond.Interface) (*ObjectsController, error) {
+func NewController(ctx context.Context, client kubernetes.Interface, mClient metadata.Interface, bkClient bkversioned.Interface) (*ObjectsController, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	controller := &ObjectsController{
 		client: client,
@@ -192,45 +224,12 @@ func NewController(ctx context.Context, client kubernetes.Interface, tkexClient 
 		cancel: cancel,
 	}
 
-	version, err := client.Discovery().ServerVersion()
-	if err != nil {
-		return nil, err
-	}
-	KubernetesServerVersion = version.String()
-	setClusterVersion(KubernetesServerVersion)
+	var err error
+	resources := listServerPreferredResources(client.Discovery())
 
+	// Standard/SharedInformer
 	sharedInformer := informers.NewSharedInformerFactoryWithOptions(client, define.ReSyncPeriod, informers.WithNamespace(metav1.NamespaceAll))
 	controller.podObjs, err = newPodObjects(ctx, sharedInformer)
-	if err != nil {
-		return nil, err
-	}
-
-	controller.replicaSetObjs, err = newReplicaSetObjects(ctx, sharedInformer)
-	if err != nil {
-		return nil, err
-	}
-
-	controller.deploymentObjs, err = newDeploymentObjects(ctx, sharedInformer)
-	if err != nil {
-		return nil, err
-	}
-
-	controller.daemonSetObjs, err = newDaemenSetObjects(ctx, sharedInformer)
-	if err != nil {
-		return nil, err
-	}
-
-	controller.statefulSetObjs, err = newStatefulSetObjects(ctx, sharedInformer)
-	if err != nil {
-		return nil, err
-	}
-
-	controller.jobObjs, err = newJobObjects(ctx, sharedInformer)
-	if err != nil {
-		return nil, err
-	}
-
-	controller.cronJobObjs, err = newCronJobObjects(ctx, sharedInformer, KubernetesServerVersion)
 	if err != nil {
 		return nil, err
 	}
@@ -240,14 +239,73 @@ func NewController(ctx context.Context, client kubernetes.Interface, tkexClient 
 		return nil, err
 	}
 
-	tkexObjs, err := newTkexObjects(ctx, tkexClient, client.Discovery())
+	controller.serviceObjs, err = newServiceObjects(ctx, sharedInformer)
+	if err != nil {
+		return nil, err
+	}
+
+	controller.endpointsObjs, err = newEndpointsObjects(ctx, sharedInformer)
+	if err != nil {
+		return nil, err
+	}
+
+	controller.ingressObjs, err = newIngressObjects(ctx, sharedInformer, resources)
+	if err != nil {
+		return nil, err
+	}
+
+	// Metadata/SharedInformer
+	metaSharedInformer := metadatainformer.NewFilteredSharedInformerFactory(mClient, define.ReSyncPeriod, metav1.NamespaceAll, nil)
+	controller.replicaSetObjs, err = newReplicaSetObjects(ctx, metaSharedInformer)
+	if err != nil {
+		return nil, err
+	}
+
+	controller.deploymentObjs, err = newDeploymentObjects(ctx, metaSharedInformer)
+	if err != nil {
+		return nil, err
+	}
+
+	controller.daemonSetObjs, err = newDaemenSetObjects(ctx, metaSharedInformer)
+	if err != nil {
+		return nil, err
+	}
+
+	controller.statefulSetObjs, err = newStatefulSetObjects(ctx, metaSharedInformer)
+	if err != nil {
+		return nil, err
+	}
+
+	controller.jobObjs, err = newJobObjects(ctx, metaSharedInformer)
+	if err != nil {
+		return nil, err
+	}
+
+	controller.cronJobObjs, err = newCronJobObjects(ctx, metaSharedInformer, resources)
+	if err != nil {
+		return nil, err
+	}
+
+	// configs.G().MonitorNamespace SharedInformer
+	monitorSharedInformer := metadatainformer.NewFilteredSharedInformerFactory(mClient, define.ReSyncPeriod, configs.G().MonitorNamespace, nil)
+	controller.secretObjs, err = newSecretObjects(ctx, monitorSharedInformer)
+	if err != nil {
+		return nil, err
+	}
+
+	// Extend/Workload
+	tkexObjs, err := newTkexObjects(ctx, metaSharedInformer, resources)
 	if err != nil {
 		return nil, err
 	}
 	controller.gameStatefulSetObjs = tkexObjs.gamestatefulset
 	controller.gameDeploymentsObjs = tkexObjs.gamedeployment
 
-	controller.mm = newMetricMonitor()
+	controller.bkLogConfigObjs, err = newBklogConfigObjects(ctx, bkClient, resources)
+	if err != nil {
+		return nil, err
+	}
+
 	go controller.recordMetrics()
 
 	return controller, nil
@@ -257,12 +315,28 @@ func (oc *ObjectsController) NodeNames() []string {
 	return oc.nodeObjs.Names()
 }
 
+func (oc *ObjectsController) NodeIPs() map[string]struct{} {
+	return oc.nodeObjs.IPs()
+}
+
 func (oc *ObjectsController) NodeCount() int {
 	return oc.nodeObjs.Count()
 }
 
 func (oc *ObjectsController) NodeNameExists(s string) (string, bool) {
 	return oc.nodeObjs.NameExists(s)
+}
+
+func (oc *ObjectsController) NodeLabels(s string) map[string]string {
+	return oc.nodeObjs.NodeLabels(s)
+}
+
+func (oc *ObjectsController) SecretObjs() []Object {
+	return oc.secretObjs.GetAll()
+}
+
+func (oc *ObjectsController) NodeObjs() []*corev1.Node {
+	return oc.nodeObjs.GetAll()
 }
 
 func (oc *ObjectsController) Stop() {
@@ -279,40 +353,75 @@ func (oc *ObjectsController) recordMetrics() {
 			return
 
 		case <-ticker.C:
-			for ns, count := range oc.podObjs.Counter() {
-				oc.mm.SetWorkloadCount(count, ns, kindPod)
+			stats := make(map[string]int)
+			for _, count := range oc.podObjs.Counter() {
+				stats[kindPod] += count
 			}
 			for kind, objs := range oc.objsMap() {
-				for ns, count := range objs.Counter() {
-					oc.mm.SetWorkloadCount(count, ns, kind)
+				for _, count := range objs.Counter() {
+					stats[kind] += count
 				}
 			}
+			stats[kindService] = oc.serviceObjs.Count()
+			stats[kindIngress] = oc.ingressObjs.Count()
+			stats[kindEndpoints] = oc.endpointsObjs.Count()
+			stats[kindBkLogConfig] = oc.bkLogConfigObjs.Count()
+			stats[kindNode] = oc.nodeObjs.Count()
+			SetWorkloadCount(stats)
 		}
 	}
 }
 
-func newPodObjects(ctx context.Context, sharedInformer informers.SharedInformerFactory) (*Objects, error) {
+func newPodObjects(ctx context.Context, sharedInformer informers.SharedInformerFactory) (*PodMap, error) {
 	genericInformer, err := sharedInformer.ForResource(corev1.SchemeGroupVersion.WithResource(resourcePods))
 	if err != nil {
 		return nil, err
 	}
-	objs := NewObjects(kindPod)
+	objs := NewPodMap()
 
 	informer := genericInformer.Informer()
-	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	err = informer.SetTransform(func(obj interface{}) (interface{}, error) {
+		pod, ok := obj.(*corev1.Pod)
+		if !ok {
+			logger.Errorf("excepted Pod type, got %T", obj)
+			return obj, nil // 原路返回
+		}
+		newObj := &corev1.Pod{}
+		newObj.Name = pod.Name
+		newObj.Namespace = pod.Namespace
+		newObj.OwnerReferences = pod.OwnerReferences
+		newObj.Spec.NodeName = pod.Spec.NodeName
+		newObj.Labels = pod.Labels
+		newObj.Annotations = pod.Annotations
+		newObj.Status.PodIP = pod.Status.PodIP
+		newObj.Status.ContainerStatuses = pod.Status.ContainerStatuses
+		newObj.Spec.Containers = pod.Spec.Containers
+
+		return newObj, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			pod, ok := obj.(*corev1.Pod)
 			if !ok {
 				logger.Errorf("excepted Pod type, got %T", obj)
 				return
 			}
-			objs.Set(Object{
+
+			objs.Set(PodObject{
 				ID: ObjectID{
 					Name:      pod.Name,
 					Namespace: pod.Namespace,
 				},
-				OwnerRefs: toRefs(pod.OwnerReferences),
-				NodeName:  pod.Spec.NodeName,
+				OwnerRefs:   toRefs(pod.OwnerReferences),
+				NodeName:    pod.Spec.NodeName,
+				Labels:      pod.Labels,
+				Annotations: pod.Annotations,
+				PodIP:       pod.Status.PodIP,
+				Containers:  toContainerKey(pod),
 			})
 		},
 		UpdateFunc: func(_, newObj interface{}) {
@@ -321,13 +430,18 @@ func newPodObjects(ctx context.Context, sharedInformer informers.SharedInformerF
 				logger.Errorf("excepted Pod type, got %T", newObj)
 				return
 			}
-			objs.Set(Object{
+
+			objs.Set(PodObject{
 				ID: ObjectID{
 					Name:      pod.Name,
 					Namespace: pod.Namespace,
 				},
-				OwnerRefs: toRefs(pod.OwnerReferences),
-				NodeName:  pod.Spec.NodeName,
+				OwnerRefs:   toRefs(pod.OwnerReferences),
+				NodeName:    pod.Spec.NodeName,
+				Labels:      pod.Labels,
+				Annotations: pod.Annotations,
+				PodIP:       pod.Status.PodIP,
+				Containers:  toContainerKey(pod),
 			})
 		},
 		DeleteFunc: func(obj interface{}) {
@@ -342,6 +456,10 @@ func newPodObjects(ctx context.Context, sharedInformer informers.SharedInformerF
 			})
 		},
 	})
+	if err != nil {
+		return nil, err
+	}
+
 	go informer.Run(ctx.Done())
 
 	synced := k8sutils.WaitForNamedCacheSync(ctx, kindPod, informer)
@@ -351,19 +469,79 @@ func newPodObjects(ctx context.Context, sharedInformer informers.SharedInformerF
 	return objs, nil
 }
 
-func newReplicaSetObjects(ctx context.Context, sharedInformer informers.SharedInformerFactory) (*Objects, error) {
-	genericInformer, err := sharedInformer.ForResource(appsv1.SchemeGroupVersion.WithResource(resourceReplicaSets))
+func newSecretObjects(ctx context.Context, sharedInformer metadatainformer.SharedInformerFactory) (*Objects, error) {
+	genericInformer := sharedInformer.ForResource(corev1.SchemeGroupVersion.WithResource(resourceSecrets))
+	objs := NewObjects(kindSecret)
+
+	informer := genericInformer.Informer()
+	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			secret, ok := obj.(*metav1.PartialObjectMetadata)
+			if !ok {
+				logger.Errorf("excepted Secret/PartialObjectMetadata type, got %T", obj)
+				return
+			}
+			objs.Set(Object{
+				ID: ObjectID{
+					Name:      secret.Name,
+					Namespace: secret.Namespace,
+				},
+				Labels: secret.Labels,
+			})
+		},
+		UpdateFunc: func(_, newObj interface{}) {
+			secret, ok := newObj.(*metav1.PartialObjectMetadata)
+			if !ok {
+				logger.Errorf("excepted Secret/PartialObjectMetadata type, got %T", newObj)
+				return
+			}
+			objs.Set(Object{
+				ID: ObjectID{
+					Name:      secret.Name,
+					Namespace: secret.Namespace,
+				},
+				Labels: secret.Labels,
+			})
+		},
+		DeleteFunc: func(obj interface{}) {
+			secret, ok := obj.(*metav1.PartialObjectMetadata)
+			if !ok {
+				logger.Errorf("excepted Secret/PartialObjectMetadata type, got %T", obj)
+				return
+			}
+			objs.Del(ObjectID{
+				Name:      secret.Name,
+				Namespace: secret.Namespace,
+			})
+		},
+	})
 	if err != nil {
 		return nil, err
 	}
+
+	go informer.Run(ctx.Done())
+
+	synced := k8sutils.WaitForNamedCacheSync(ctx, kindSecret, informer)
+	if !synced {
+		return nil, errors.New("failed to sync Secret caches")
+	}
+	return objs, nil
+}
+
+func newReplicaSetObjects(ctx context.Context, sharedInformer metadatainformer.SharedInformerFactory) (*Objects, error) {
+	genericInformer := sharedInformer.ForResource(appsv1.SchemeGroupVersion.WithResource(resourceReplicaSets))
 	objs := NewObjects(kindReplicaSet)
 
 	informer := genericInformer.Informer()
-	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	if err := informer.SetTransform(partialObjectMetadataStrip); err != nil {
+		return nil, err
+	}
+
+	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			replicaSet, ok := obj.(*appsv1.ReplicaSet)
+			replicaSet, ok := obj.(*metav1.PartialObjectMetadata)
 			if !ok {
-				logger.Errorf("excepted ReplicaSet type, got %T", obj)
+				logger.Errorf("excepted ReplicaSet/PartialObjectMetadata type, got %T", obj)
 				return
 			}
 			objs.Set(Object{
@@ -375,9 +553,9 @@ func newReplicaSetObjects(ctx context.Context, sharedInformer informers.SharedIn
 			})
 		},
 		UpdateFunc: func(_, newObj interface{}) {
-			replicaSet, ok := newObj.(*appsv1.ReplicaSet)
+			replicaSet, ok := newObj.(*metav1.PartialObjectMetadata)
 			if !ok {
-				logger.Errorf("excepted ReplicaSet type, got %T", newObj)
+				logger.Errorf("excepted ReplicaSet/PartialObjectMetadata type, got %T", newObj)
 				return
 			}
 			objs.Set(Object{
@@ -389,9 +567,9 @@ func newReplicaSetObjects(ctx context.Context, sharedInformer informers.SharedIn
 			})
 		},
 		DeleteFunc: func(obj interface{}) {
-			replicaSet, ok := obj.(*appsv1.ReplicaSet)
+			replicaSet, ok := obj.(*metav1.PartialObjectMetadata)
 			if !ok {
-				logger.Errorf("excepted ReplicaSet type, got %T", obj)
+				logger.Errorf("excepted ReplicaSet/PartialObjectMetadata type, got %T", obj)
 				return
 			}
 			objs.Del(ObjectID{
@@ -400,6 +578,10 @@ func newReplicaSetObjects(ctx context.Context, sharedInformer informers.SharedIn
 			})
 		},
 	})
+	if err != nil {
+		return nil, err
+	}
+
 	go informer.Run(ctx.Done())
 
 	synced := k8sutils.WaitForNamedCacheSync(ctx, kindReplicaSet, informer)
@@ -409,19 +591,20 @@ func newReplicaSetObjects(ctx context.Context, sharedInformer informers.SharedIn
 	return objs, nil
 }
 
-func newDeploymentObjects(ctx context.Context, sharedInformer informers.SharedInformerFactory) (*Objects, error) {
-	genericInformer, err := sharedInformer.ForResource(appsv1.SchemeGroupVersion.WithResource(resourceDeployments))
-	if err != nil {
-		return nil, err
-	}
+func newDeploymentObjects(ctx context.Context, sharedInformer metadatainformer.SharedInformerFactory) (*Objects, error) {
+	genericInformer := sharedInformer.ForResource(appsv1.SchemeGroupVersion.WithResource(resourceDeployments))
 	objs := NewObjects(kindDeployment)
 
 	informer := genericInformer.Informer()
-	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	if err := informer.SetTransform(partialObjectMetadataStrip); err != nil {
+		return nil, err
+	}
+
+	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			deployment, ok := obj.(*appsv1.Deployment)
+			deployment, ok := obj.(*metav1.PartialObjectMetadata)
 			if !ok {
-				logger.Errorf("excepted Deployment type, got %T", obj)
+				logger.Errorf("excepted Deployment/PartialObjectMetadata type, got %T", obj)
 				return
 			}
 			objs.Set(Object{
@@ -433,9 +616,9 @@ func newDeploymentObjects(ctx context.Context, sharedInformer informers.SharedIn
 			})
 		},
 		UpdateFunc: func(_, newObj interface{}) {
-			deployment, ok := newObj.(*appsv1.Deployment)
+			deployment, ok := newObj.(*metav1.PartialObjectMetadata)
 			if !ok {
-				logger.Errorf("excepted Deployment type, got %T", newObj)
+				logger.Errorf("excepted Deployment/PartialObjectMetadata type, got %T", newObj)
 				return
 			}
 			objs.Set(Object{
@@ -447,9 +630,9 @@ func newDeploymentObjects(ctx context.Context, sharedInformer informers.SharedIn
 			})
 		},
 		DeleteFunc: func(obj interface{}) {
-			deployment, ok := obj.(*appsv1.Deployment)
+			deployment, ok := obj.(*metav1.PartialObjectMetadata)
 			if !ok {
-				logger.Errorf("excepted Deployment type, got %T", obj)
+				logger.Errorf("excepted Deployment/PartialObjectMetadata type, got %T", obj)
 				return
 			}
 			objs.Del(ObjectID{
@@ -458,6 +641,10 @@ func newDeploymentObjects(ctx context.Context, sharedInformer informers.SharedIn
 			})
 		},
 	})
+	if err != nil {
+		return nil, err
+	}
+
 	go informer.Run(ctx.Done())
 
 	synced := k8sutils.WaitForNamedCacheSync(ctx, kindDeployment, informer)
@@ -467,19 +654,20 @@ func newDeploymentObjects(ctx context.Context, sharedInformer informers.SharedIn
 	return objs, nil
 }
 
-func newDaemenSetObjects(ctx context.Context, sharedInformer informers.SharedInformerFactory) (*Objects, error) {
-	genericInformer, err := sharedInformer.ForResource(appsv1.SchemeGroupVersion.WithResource(resourceDaemonSets))
-	if err != nil {
-		return nil, err
-	}
+func newDaemenSetObjects(ctx context.Context, sharedInformer metadatainformer.SharedInformerFactory) (*Objects, error) {
+	genericInformer := sharedInformer.ForResource(appsv1.SchemeGroupVersion.WithResource(resourceDaemonSets))
 	objs := NewObjects(kindDaemonSet)
 
 	informer := genericInformer.Informer()
-	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	if err := informer.SetTransform(partialObjectMetadataStrip); err != nil {
+		return nil, err
+	}
+
+	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			daemonSet, ok := obj.(*appsv1.DaemonSet)
+			daemonSet, ok := obj.(*metav1.PartialObjectMetadata)
 			if !ok {
-				logger.Errorf("excepted DaemonSet type, got %T", obj)
+				logger.Errorf("excepted DaemonSet/PartialObjectMetadata type, got %T", obj)
 				return
 			}
 			objs.Set(Object{
@@ -491,9 +679,9 @@ func newDaemenSetObjects(ctx context.Context, sharedInformer informers.SharedInf
 			})
 		},
 		UpdateFunc: func(_, newObj interface{}) {
-			daemonSet, ok := newObj.(*appsv1.DaemonSet)
+			daemonSet, ok := newObj.(*metav1.PartialObjectMetadata)
 			if !ok {
-				logger.Errorf("excepted DaemonSet type, got %T", newObj)
+				logger.Errorf("excepted DaemonSet/PartialObjectMetadata type, got %T", newObj)
 				return
 			}
 			objs.Set(Object{
@@ -505,9 +693,9 @@ func newDaemenSetObjects(ctx context.Context, sharedInformer informers.SharedInf
 			})
 		},
 		DeleteFunc: func(obj interface{}) {
-			daemonSet, ok := obj.(*appsv1.DaemonSet)
+			daemonSet, ok := obj.(*metav1.PartialObjectMetadata)
 			if !ok {
-				logger.Errorf("excepted DaemonSet type, got %T", obj)
+				logger.Errorf("excepted DaemonSet/PartialObjectMetadata type, got %T", obj)
 				return
 			}
 			objs.Del(ObjectID{
@@ -516,6 +704,10 @@ func newDaemenSetObjects(ctx context.Context, sharedInformer informers.SharedInf
 			})
 		},
 	})
+	if err != nil {
+		return nil, err
+	}
+
 	go informer.Run(ctx.Done())
 
 	synced := k8sutils.WaitForNamedCacheSync(ctx, kindDaemonSet, informer)
@@ -525,19 +717,20 @@ func newDaemenSetObjects(ctx context.Context, sharedInformer informers.SharedInf
 	return objs, nil
 }
 
-func newStatefulSetObjects(ctx context.Context, sharedInformer informers.SharedInformerFactory) (*Objects, error) {
-	genericInformer, err := sharedInformer.ForResource(appsv1.SchemeGroupVersion.WithResource(resourceStatefulSets))
-	if err != nil {
-		return nil, err
-	}
+func newStatefulSetObjects(ctx context.Context, sharedInformer metadatainformer.SharedInformerFactory) (*Objects, error) {
+	genericInformer := sharedInformer.ForResource(appsv1.SchemeGroupVersion.WithResource(resourceStatefulSets))
 	objs := NewObjects(kindStatefulSet)
 
 	informer := genericInformer.Informer()
-	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	if err := informer.SetTransform(partialObjectMetadataStrip); err != nil {
+		return nil, err
+	}
+
+	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			statefulSet, ok := obj.(*appsv1.StatefulSet)
+			statefulSet, ok := obj.(*metav1.PartialObjectMetadata)
 			if !ok {
-				logger.Errorf("excepted StatefulSet type, got %T", obj)
+				logger.Errorf("excepted StatefulSet/PartialObjectMetadata type, got %T", obj)
 				return
 			}
 			objs.Set(Object{
@@ -549,9 +742,9 @@ func newStatefulSetObjects(ctx context.Context, sharedInformer informers.SharedI
 			})
 		},
 		UpdateFunc: func(_, newObj interface{}) {
-			statefulSet, ok := newObj.(*appsv1.StatefulSet)
+			statefulSet, ok := newObj.(*metav1.PartialObjectMetadata)
 			if !ok {
-				logger.Errorf("excepted StatefulSet type, got %T", newObj)
+				logger.Errorf("excepted StatefulSet/PartialObjectMetadata type, got %T", newObj)
 				return
 			}
 			objs.Set(Object{
@@ -563,9 +756,9 @@ func newStatefulSetObjects(ctx context.Context, sharedInformer informers.SharedI
 			})
 		},
 		DeleteFunc: func(obj interface{}) {
-			statefulSet, ok := obj.(*appsv1.StatefulSet)
+			statefulSet, ok := obj.(*metav1.PartialObjectMetadata)
 			if !ok {
-				logger.Errorf("excepted StatefulSet type, got %T", obj)
+				logger.Errorf("excepted StatefulSet/PartialObjectMetadata type, got %T", obj)
 				return
 			}
 			objs.Del(ObjectID{
@@ -574,6 +767,10 @@ func newStatefulSetObjects(ctx context.Context, sharedInformer informers.SharedI
 			})
 		},
 	})
+	if err != nil {
+		return nil, err
+	}
+
 	go informer.Run(ctx.Done())
 
 	synced := k8sutils.WaitForNamedCacheSync(ctx, kindStatefulSet, informer)
@@ -583,19 +780,20 @@ func newStatefulSetObjects(ctx context.Context, sharedInformer informers.SharedI
 	return objs, nil
 }
 
-func newJobObjects(ctx context.Context, sharedInformer informers.SharedInformerFactory) (*Objects, error) {
-	genericInformer, err := sharedInformer.ForResource(batchv1.SchemeGroupVersion.WithResource(resourceJobs))
-	if err != nil {
-		return nil, err
-	}
+func newJobObjects(ctx context.Context, sharedInformer metadatainformer.SharedInformerFactory) (*Objects, error) {
+	genericInformer := sharedInformer.ForResource(batchv1.SchemeGroupVersion.WithResource(resourceJobs))
 	objs := NewObjects(kindJob)
 
 	informer := genericInformer.Informer()
-	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	if err := informer.SetTransform(partialObjectMetadataStrip); err != nil {
+		return nil, err
+	}
+
+	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			job, ok := obj.(*batchv1.Job)
+			job, ok := obj.(*metav1.PartialObjectMetadata)
 			if !ok {
-				logger.Errorf("excepted Job type, got %T", obj)
+				logger.Errorf("excepted Job/PartialObjectMetadata type, got %T", obj)
 				return
 			}
 			objs.Set(Object{
@@ -607,9 +805,9 @@ func newJobObjects(ctx context.Context, sharedInformer informers.SharedInformerF
 			})
 		},
 		UpdateFunc: func(_, newObj interface{}) {
-			job, ok := newObj.(*batchv1.Job)
+			job, ok := newObj.(*metav1.PartialObjectMetadata)
 			if !ok {
-				logger.Errorf("excepted Job type, got %T", newObj)
+				logger.Errorf("excepted Job/PartialObjectMetadata type, got %T", newObj)
 				return
 			}
 			objs.Set(Object{
@@ -621,9 +819,9 @@ func newJobObjects(ctx context.Context, sharedInformer informers.SharedInformerF
 			})
 		},
 		DeleteFunc: func(obj interface{}) {
-			job, ok := obj.(*batchv1.Job)
+			job, ok := obj.(*metav1.PartialObjectMetadata)
 			if !ok {
-				logger.Errorf("excepted Job type, got %T", obj)
+				logger.Errorf("excepted Job/PartialObjectMetadata type, got %T", obj)
 				return
 			}
 			objs.Del(ObjectID{
@@ -632,6 +830,10 @@ func newJobObjects(ctx context.Context, sharedInformer informers.SharedInformerF
 			})
 		},
 	})
+	if err != nil {
+		return nil, err
+	}
+
 	go informer.Run(ctx.Done())
 
 	synced := k8sutils.WaitForNamedCacheSync(ctx, kindJob, informer)
@@ -641,32 +843,36 @@ func newJobObjects(ctx context.Context, sharedInformer informers.SharedInformerF
 	return objs, nil
 }
 
-func newCronJobObjects(ctx context.Context, sharedInformer informers.SharedInformerFactory, version string) (*Objects, error) {
-	v, err := gover.NewVersion(version)
-	if err != nil {
-		return nil, err
+func newCronJobObjects(ctx context.Context, sharedInformer metadatainformer.SharedInformerFactory, resources map[GVRK]struct{}) (*Objects, error) {
+	gvrk := GVRK{
+		Group:    "batch",
+		Version:  "v1",
+		Resource: "cronjobs",
+		Kind:     "CronJob",
 	}
 
-	v125, _ := gover.NewVersion("1.25")
-	if v.GreaterThanOrEqual(v125) {
+	_, ok := resources[gvrk]
+	if ok {
 		return newCronJobV1Objects(ctx, sharedInformer)
 	}
-	return newCronJobBetaV1Objects(ctx, sharedInformer)
+
+	return newCronJobV1BetaObjects(ctx, sharedInformer)
 }
 
-func newCronJobBetaV1Objects(ctx context.Context, sharedInformer informers.SharedInformerFactory) (*Objects, error) {
-	genericInformer, err := sharedInformer.ForResource(batchv1beta1.SchemeGroupVersion.WithResource(resourceCronJobs))
-	if err != nil {
-		return nil, err
-	}
+func newCronJobV1BetaObjects(ctx context.Context, sharedInformer metadatainformer.SharedInformerFactory) (*Objects, error) {
+	genericInformer := sharedInformer.ForResource(batchv1beta1.SchemeGroupVersion.WithResource(resourceCronJobs))
 	objs := NewObjects(kindCronJob)
 
 	informer := genericInformer.Informer()
-	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	if err := informer.SetTransform(partialObjectMetadataStrip); err != nil {
+		return nil, err
+	}
+
+	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			cronJob, ok := obj.(*batchv1beta1.CronJob)
+			cronJob, ok := obj.(*metav1.PartialObjectMetadata)
 			if !ok {
-				logger.Errorf("excepted CronJob type, got %T", obj)
+				logger.Errorf("excepted CronJob/PartialObjectMetadata type, got %T", obj)
 				return
 			}
 			objs.Set(Object{
@@ -678,9 +884,9 @@ func newCronJobBetaV1Objects(ctx context.Context, sharedInformer informers.Share
 			})
 		},
 		UpdateFunc: func(_, newObj interface{}) {
-			cronJob, ok := newObj.(*batchv1beta1.CronJob)
+			cronJob, ok := newObj.(*metav1.PartialObjectMetadata)
 			if !ok {
-				logger.Errorf("excepted CronJob type, got %T", newObj)
+				logger.Errorf("excepted CronJob/PartialObjectMetadata type, got %T", newObj)
 				return
 			}
 			objs.Set(Object{
@@ -692,9 +898,9 @@ func newCronJobBetaV1Objects(ctx context.Context, sharedInformer informers.Share
 			})
 		},
 		DeleteFunc: func(obj interface{}) {
-			cronJob, ok := obj.(*batchv1beta1.CronJob)
+			cronJob, ok := obj.(*metav1.PartialObjectMetadata)
 			if !ok {
-				logger.Errorf("excepted CronJob type, got %T", obj)
+				logger.Errorf("excepted CronJob/PartialObjectMetadata type, got %T", obj)
 				return
 			}
 			objs.Del(ObjectID{
@@ -703,6 +909,10 @@ func newCronJobBetaV1Objects(ctx context.Context, sharedInformer informers.Share
 			})
 		},
 	})
+	if err != nil {
+		return nil, err
+	}
+
 	go informer.Run(ctx.Done())
 
 	synced := k8sutils.WaitForNamedCacheSync(ctx, kindCronJob, informer)
@@ -712,19 +922,20 @@ func newCronJobBetaV1Objects(ctx context.Context, sharedInformer informers.Share
 	return objs, nil
 }
 
-func newCronJobV1Objects(ctx context.Context, sharedInformer informers.SharedInformerFactory) (*Objects, error) {
-	genericInformer, err := sharedInformer.ForResource(batchv1.SchemeGroupVersion.WithResource(resourceCronJobs))
-	if err != nil {
-		return nil, err
-	}
+func newCronJobV1Objects(ctx context.Context, sharedInformer metadatainformer.SharedInformerFactory) (*Objects, error) {
+	genericInformer := sharedInformer.ForResource(batchv1.SchemeGroupVersion.WithResource(resourceCronJobs))
 	objs := NewObjects(kindCronJob)
 
 	informer := genericInformer.Informer()
-	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	if err := informer.SetTransform(partialObjectMetadataStrip); err != nil {
+		return nil, err
+	}
+
+	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			cronJob, ok := obj.(*batchv1.CronJob)
+			cronJob, ok := obj.(*metav1.PartialObjectMetadata)
 			if !ok {
-				logger.Errorf("excepted CronJob type, got %T", obj)
+				logger.Errorf("excepted CronJob/PartialObjectMetadata type, got %T", obj)
 				return
 			}
 			objs.Set(Object{
@@ -736,9 +947,9 @@ func newCronJobV1Objects(ctx context.Context, sharedInformer informers.SharedInf
 			})
 		},
 		UpdateFunc: func(_, newObj interface{}) {
-			cronJob, ok := newObj.(*batchv1.CronJob)
+			cronJob, ok := newObj.(*metav1.PartialObjectMetadata)
 			if !ok {
-				logger.Errorf("excepted CronJob type, got %T", newObj)
+				logger.Errorf("excepted CronJob/PartialObjectMetadata type, got %T", newObj)
 				return
 			}
 			objs.Set(Object{
@@ -750,9 +961,9 @@ func newCronJobV1Objects(ctx context.Context, sharedInformer informers.SharedInf
 			})
 		},
 		DeleteFunc: func(obj interface{}) {
-			cronJob, ok := obj.(*batchv1.CronJob)
+			cronJob, ok := obj.(*metav1.PartialObjectMetadata)
 			if !ok {
-				logger.Errorf("excepted CronJob type, got %T", obj)
+				logger.Errorf("excepted CronJob/PartialObjectMetadata type, got %T", obj)
 				return
 			}
 			objs.Del(ObjectID{
@@ -761,60 +972,15 @@ func newCronJobV1Objects(ctx context.Context, sharedInformer informers.SharedInf
 			})
 		},
 	})
+	if err != nil {
+		return nil, err
+	}
+
 	go informer.Run(ctx.Done())
 
 	synced := k8sutils.WaitForNamedCacheSync(ctx, kindCronJob, informer)
 	if !synced {
 		return nil, errors.New("failed to sync CronJob caches")
-	}
-	return objs, nil
-}
-
-func newNodeObjects(ctx context.Context, sharedInformer informers.SharedInformerFactory) (*NodeMap, error) {
-	genericInformer, err := sharedInformer.ForResource(corev1.SchemeGroupVersion.WithResource(resourceNodes))
-	if err != nil {
-		return nil, err
-	}
-	objs := NewNodeMap()
-
-	informer := genericInformer.Informer()
-	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			node, ok := obj.(*corev1.Node)
-			if !ok {
-				logger.Errorf("excepted Node type, got %T", obj)
-				return
-			}
-			incClusterNodeCount()
-			if err := objs.Set(node); err != nil {
-				logger.Errorf("failed to set node obj, err: %v", err)
-			}
-		},
-		UpdateFunc: func(_, newObj interface{}) {
-			node, ok := newObj.(*corev1.Node)
-			if !ok {
-				logger.Errorf("excepted Node type, got %T", newObj)
-				return
-			}
-			if err := objs.Set(node); err != nil {
-				logger.Errorf("failed to set node obj, err: %v", err)
-			}
-		},
-		DeleteFunc: func(obj interface{}) {
-			node, ok := obj.(*corev1.Node)
-			if !ok {
-				logger.Errorf("excepted Node type, got %T", obj)
-				return
-			}
-			decClusterNodeCount()
-			objs.Del(node.Name)
-		},
-	})
-	go informer.Run(ctx.Done())
-
-	synced := k8sutils.WaitForNamedCacheSync(ctx, kindNode, informer)
-	if !synced {
-		return nil, errors.New("failed to sync Node caches")
 	}
 	return objs, nil
 }

@@ -30,7 +30,9 @@ func TestMakeRouteFromTableID(t *testing.T) {
 		err     error
 	}{
 		"empty table id": {
-			"", &Route{}, ErrEmptyTableID,
+			"", &Route{
+				dataSource: BkMonitor,
+			}, ErrEmptyTableID,
 		},
 		"valid table id": {
 			"system.cpu_summary",
@@ -49,9 +51,10 @@ func TestMakeRouteFromTableID(t *testing.T) {
 		},
 		"wrong table id": {
 			"system.cpu_detail.usage", &Route{
-				dataSource: BkMonitor,
-				db:         "cpu_summary",
-			}, ErrWrongTableIDFormat,
+				dataSource:  BkMonitor,
+				db:          "system",
+				measurement: "cpu_detail",
+			}, nil,
 		},
 	}
 
@@ -132,6 +135,13 @@ func TestMakeRouteFromMetricName(t *testing.T) {
 			"bkbase:::usage", &Route{
 				dataSource: "bkbase",
 				metricName: "usage",
+			}, nil,
+		},
+		"custom +  metric": {
+			"custom:tars_devcloud_1:tars_requests_total", &Route{
+				dataSource: "custom",
+				db:         "tars_devcloud_1",
+				metricName: "tars_requests_total",
 			}, nil,
 		},
 	}

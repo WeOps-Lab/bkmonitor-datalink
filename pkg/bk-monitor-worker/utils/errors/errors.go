@@ -56,9 +56,13 @@ func (e *Error) Error() string {
 	if e.Code != Unspecified {
 		b.WriteString(e.Code.String())
 	}
+	if e.Op != "" {
+		b.WriteString(" Op: ")
+		b.WriteString(string(e.Op))
+	}
 	if e.Err != nil {
 		if b.Len() > 0 {
-			b.WriteString(": ")
+			b.WriteString(" : ")
 		}
 		b.WriteString(e.Err.Error())
 	}
@@ -130,6 +134,7 @@ func E(args ...interface{}) error {
 		panic("call to errors.E with no arguments")
 	}
 	e := &Error{}
+	var errs []error
 	for _, arg := range args {
 		switch arg := arg.(type) {
 		case Op:
@@ -137,15 +142,17 @@ func E(args ...interface{}) error {
 		case Code:
 			e.Code = arg
 		case error:
-			e.Err = arg
+			errs = append(errs, arg)
 		case string:
-			e.Err = errors.New(arg)
+			errs = append(errs, errors.New(arg))
 		default:
 			_, file, line, _ := runtime.Caller(1)
 			logger.Errorf("errors.E: bad call from %s:%d: %v", file, line, args)
 			return fmt.Errorf("unknown type %T, value %v in error call", arg, arg)
 		}
 	}
+	e.Err = errors.Join(errs...)
+
 	return e
 }
 
@@ -278,16 +285,34 @@ func New(text string) error { return errors.New(text) }
 // It is exported from this package for import convenience.
 func Is(err, target error) bool { return errors.Is(err, target) }
 
-// As finds the first error in err's chain that matches target, and if so, sets target to that error value and returns true.
+// As finds the first error in err's chain that matches target,
+// and if so, sets target to that error value and returns true.
 // Otherwise, it returns false.
 //
 // This function is the errors.As function from the standard library (https://golang.org/pkg/errors/#As).
 // It is exported from this package for import convenience.
 func As(err error, target interface{}) bool { return errors.As(err, target) }
 
-// Unwrap returns the result of calling the Unwrap method on err, if err's type contains an Unwrap method returning error.
+// Unwrap returns the result of calling the Unwrap method on err,
+// if err's type contains an Unwrap method returning error.
 // Otherwise, Unwrap returns nil.
 //
 // This function is the errors.Unwrap function from the standard library (https://golang.org/pkg/errors/#Unwrap).
 // It is exported from this package for import convenience.
 func Unwrap(err error) error { return errors.Unwrap(err) }
+
+// CombineErrors takes a slice of errors as input and combines all the error messages into a single error.
+// Each error message is separated by a newline character, making it easier to read and display.
+func CombineErrors(e []error) error {
+	if len(e) == 0 {
+		return nil
+	}
+
+	var errorMessages []string
+	for _, err := range e {
+		errorMessages = append(errorMessages, err.Error())
+	}
+
+	combinedMessage := strings.Join(errorMessages, "\n")
+	return errors.New(combinedMessage)
+}

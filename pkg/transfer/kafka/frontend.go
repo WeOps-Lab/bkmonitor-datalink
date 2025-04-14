@@ -11,6 +11,8 @@ package kafka
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/sha512"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -24,6 +26,7 @@ import (
 	"github.com/Shopify/sarama"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/xdg/scram"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/transfer/config"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/transfer/define"
@@ -34,7 +37,7 @@ import (
 
 var (
 	NewKafkaConsumerGroup  = sarama.NewConsumerGroup
-	NewKafkaConsumerConfig = func(conf define.Configuration) (*sarama.Config, error) {
+	NewKafkaConsumerConfig = func(conf define.Configuration, opts map[string]interface{}) (*sarama.Config, error) {
 		c, err := NewKafkaConfig(conf)
 		if err != nil {
 			return nil, err
@@ -49,6 +52,25 @@ var (
 			c.Consumer.Offsets.Initial = conf.GetInt64(ConfKafkaConsumerOffsetInitial)
 		}
 
+		m := utils.NewMapHelper(opts)
+		offset, ok := m.GetInt(config.PipelineConfigOptKafkaInitialOffset)
+		if ok && offset < 0 {
+			// OffsetNewest stands for the log head offset, i.e. the offset that will be
+			// assigned to the next message that will be produced to the partition. You
+			// can send this to a client's GetOffset method to get this offset, or when
+			// calling ConsumePartition to start consuming new messages.
+			//
+			// OffsetNewest int64 = -1
+
+			// OffsetOldest stands for the oldest offset available on the broker for a
+			// partition. You can send this to a client's GetOffset method to get this
+			// offset, or when calling ConsumePartition to start consuming from the
+			// oldest offset that is still available on the broker.
+			//
+			// OffsetOldest int64 = -2
+			c.Consumer.Offsets.Initial = int64(offset)
+		}
+
 		return c, c.Validate()
 	}
 )
@@ -61,6 +83,8 @@ const (
 	sslCertificateKey         = "ssl_certificate_key"
 
 	prefixBase64 = "base64://"
+
+	optSaslMechanisms = "sasl_mechanisms"
 )
 
 func decodeSslContent(s string) ([]byte, error) {
@@ -337,6 +361,31 @@ func (f *Frontend) Close() error {
 	return err
 }
 
+var (
+	SHA256 scram.HashGeneratorFcn = sha256.New
+	SHA512 scram.HashGeneratorFcn = sha512.New
+)
+
+type XDGSCRAMClient struct {
+	*scram.Client
+	*scram.ClientConversation
+	scram.HashGeneratorFcn
+}
+
+func (x *XDGSCRAMClient) Begin(userName, password, authzID string) (err error) {
+	x.Client, err = x.HashGeneratorFcn.NewClient(userName, password, authzID)
+	if err != nil {
+		return err
+	}
+	x.ClientConversation = x.Client.NewConversation()
+	return nil
+}
+
+func (x *XDGSCRAMClient) Step(challenge string) (response string, err error) {
+	response, err = x.ClientConversation.Step(challenge)
+	return
+}
+
 func (f *Frontend) init() error {
 	var (
 		conf        = config.FromContext(f.ctx)
@@ -352,13 +401,15 @@ func (f *Frontend) init() error {
 	// 所以使用时间作为其 values 值，这样查询的时候可以使用 max 语法查询出来
 	define.MonitorFrontendKafka.WithLabelValues(dataID, define.ConfClusterID, kafkaConfig.GetDomain(), kafkaConfig.GetTopic()).Set(float64(time.Now().UnixMilli()))
 
-	c, err := NewKafkaConsumerConfig(conf)
+	pipelineConfig := config.PipelineConfigFromContext(f.ctx)
+	c, err := NewKafkaConsumerConfig(conf, pipelineConfig.Option)
 	if err != nil {
 		logging.Errorf("frontend %v make config error %v", f, err)
 		return err
 	}
 
-	auth := config.NewAuthInfo(config.MQConfigFromContext(f.ctx))
+	mqConfig := config.MQConfigFromContext(f.ctx)
+	auth := config.NewAuthInfo(mqConfig)
 	userName, err := auth.GetUserName()
 	if err != nil {
 		logging.Warnf("kafka may not establish connection %v: username", define.ErrGetAuth)
@@ -379,8 +430,25 @@ func (f *Frontend) init() error {
 		c.Net.SASL.User = userName
 		c.Net.SASL.Password = passWord
 		c.Net.SASL.Enable = true
+
+		// 目前仅支持 sha512/sha256
+		info := utils.NewMapHelper(mqConfig.AuthInfo)
+		if mechanisms, ok := info.GetString(optSaslMechanisms); ok {
+			switch mechanisms {
+			case "SCRAM-SHA-512":
+				c.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
+				c.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient {
+					return &XDGSCRAMClient{HashGeneratorFcn: SHA512}
+				}
+			case "SCRAM-SHA-256":
+				c.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA256
+				c.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient {
+					return &XDGSCRAMClient{HashGeneratorFcn: SHA256}
+				}
+			}
+		}
 	}
-	logging.Infof("KAFKA MaxProcessTime: %s", c.Consumer.MaxProcessingTime)
+
 	if err != nil {
 		logging.Warnf("create kafka config error: %v", err)
 		return err

@@ -13,8 +13,12 @@ import (
 	"context"
 	"math"
 	"net"
+	"net/http"
+	"os"
+	"strconv"
 	"strings"
 
+	"github.com/TarsCloud/TarsGo/tars/util/current"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"google.golang.org/grpc/peer"
 )
@@ -31,9 +35,22 @@ func ParseRequestIP(source string) string {
 	return ""
 }
 
+func GetContentLength(header http.Header) int {
+	l := header.Get("Content-Length")
+	i, _ := strconv.Atoi(l)
+	return i
+}
+
 func GetGrpcIpFromContext(ctx context.Context) string {
 	if p, ok := peer.FromContext(ctx); ok {
 		return ParseRequestIP(p.Addr.String())
+	}
+	return ""
+}
+
+func GetTarsIpFromContext(ctx context.Context) string {
+	if ip, ok := current.GetClientIPFromContext(ctx); ok {
+		return ip
 	}
 	return ""
 }
@@ -60,4 +77,12 @@ func CalcSpanDuration(span ptrace.Span) float64 {
 		return 0 // 特殊处理 避免出现超大值
 	}
 	return float64(span.EndTimestamp() - span.StartTimestamp())
+}
+
+func PathExist(path string) bool {
+	_, err := os.Stat(path)
+	if err != nil && os.IsNotExist(err) {
+		return false
+	}
+	return true
 }

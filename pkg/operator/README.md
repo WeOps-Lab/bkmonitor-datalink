@@ -20,6 +20,8 @@ bkmonitor-operator 整体架构如下：
 * k8seventdataid：内置事件 dataid。
 * k8smetricdataid：内置指标 dataid。
 
+请参考 [dataid 介绍](docs/dataId.md) 文档。
+
 为了管理区分，operator 注入的 serviceMonitor 采集会使用内置 dataid，这个是通过在 `metadata.annotations` 声明 `isSystem: "true"` 指定的。而用户的数据上报会用自定义 dataid。当然，我们也对 dataid 进行了扩展，用户可以在监控这边申请新的 dataid，用于匹配特性维度的 serviceMonitor，以便对数据进行隔离，如果量太大的话，我们会对 dataid 进行存储集群的划分。
 
 在集群接入后，dataid 资源就绪后，operator 就会开始工作了。operator 涉及到多个组件，这里一一做介绍：
@@ -53,11 +55,11 @@ bkmonitor-operator 沿用了 prometheus-operator 的 monitor CRD，包括 podMon
 
 bkmonitor-operator 对 prometheus discovery 机制做了链接共享优化，在 prometheus 的设计里，每个 discovery 有着自己独立的 apiserver 长链接，消费来自 k8s 的事件。但实际上，这些链接是可以共享的，对相同 namespace 资源监听可以缓存，并在内存中使用一套订阅分发机制。
 
-如果集群中有 500 个 serviceMonitor 分布在 30 个 namespace 下，那 prometheus-operator 需要 500 个 tcp 长链，而 bkmonitor-operator 只需要 30 个。bkmonitor-operator 在保证数据准确性的前提下大大优化了监听性能。
+如果集群中有 500 个 serviceMonitor 分布在 30 个 namespace 下，那 prometheus-operator 需要 500 个 TCP 长链，而 bkmonitor-operator 只需要 30 个。bkmonitor-operator 在保证数据准确性的前提下大大优化了监听性能。
 
 ### Monitor Secrets
 
-bkmonitor-operator 的采集任务通过 secrets 资源进行分发，每个 secrets 会包含多个采集任务，写入时使用 gzip 压缩，减少数据量。三种不同的 worker 分别对应着不同的 secrets 前缀：
+bkmonitor-operator 的采集任务通过 secrets 资源进行分发，每个 secrets 会包含多个采集任务，写入时使用 gzip 压缩以减少数据量。三种不同的 worker 分别对应着不同的 secrets 前缀：
 
 * event-worker-*
 * daemonset-worker-*

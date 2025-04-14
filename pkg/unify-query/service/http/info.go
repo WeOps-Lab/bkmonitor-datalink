@@ -14,10 +14,9 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
-	headerutil "github.com/golang/gddo/httputil/header"
-	oleltrace "go.opentelemetry.io/otel/trace"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/consul"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/featureFlag"
@@ -34,6 +33,8 @@ import (
 type TagValuesData struct {
 	Values map[string][]string `json:"values"`
 }
+
+type SeriesDataList []*SeriesData
 
 // SeriesData
 type SeriesData struct {
@@ -271,26 +272,6 @@ func (d *InfoData) Fill(tables *influxdb.Tables) error {
 
 }
 
-// HandleShowTagKeys :
-func HandleShowTagKeys(c *gin.Context) {
-	handleTsQueryInfosRequest(infos.TagKeys, c)
-}
-
-// HandleShowTagValues :
-func HandleShowTagValues(c *gin.Context) {
-	handleTsQueryInfosRequest(infos.TagValues, c)
-}
-
-// HandleShowFieldKeys :
-func HandleShowFieldKeys(c *gin.Context) {
-	handleTsQueryInfosRequest(infos.FieldKeys, c)
-}
-
-// HandleShowSeries :
-func HandleShowSeries(c *gin.Context) {
-	handleTsQueryInfosRequest(infos.Series, c)
-}
-
 // HandleTimeSeries :
 func HandleTimeSeries(c *gin.Context) {
 	handleTsQueryInfosRequest(infos.TimeSeries, c)
@@ -302,6 +283,10 @@ func HandlePrint(c *gin.Context) {
 	c.String(200, res)
 }
 
+func HandlerHealth(c *gin.Context) {
+	c.Status(200)
+}
+
 // HandleFeatureFlag  打印特性开关配置信息，refresh 不为空则强制刷新
 func HandleFeatureFlag(c *gin.Context) {
 	ctx := c.Request.Context()
@@ -309,11 +294,6 @@ func HandleFeatureFlag(c *gin.Context) {
 	refresh := c.Query("r")
 
 	if refresh != "" {
-		err := metadata.GetQueryRouter().PublishVmQuery(ctx)
-		if err != nil {
-			res += fmt.Sprintf("publish vm query error: %s\n", err.Error())
-		}
-
 		res += "refresh feature flag\n"
 		path := consul.GetFeatureFlagsPath()
 		res += fmt.Sprintf("consul feature flags path: %s\n", path)
@@ -331,9 +311,6 @@ func HandleFeatureFlag(c *gin.Context) {
 		}
 		res += fmt.Sprintln("-------------------------------")
 	}
-
-	res += metadata.GetQueryRouter().Print() + "\n"
-	res += fmt.Sprintln("-------------------------------")
 
 	res += featureFlag.Print() + "\n"
 	res += fmt.Sprintln("-----------------------------------")
@@ -392,7 +369,7 @@ func HandleSpacePrint(c *gin.Context) {
 	res := ""
 	if refresh {
 		res += fmt.Sprintf("Refresh %s \n", typeKey)
-		err = router.LoadRouter(ctx, typeKey)
+		err = router.LoadRouter(ctx, typeKey, true)
 		if err != nil {
 			res += fmt.Sprintf("Error: %v\n", err)
 		}
@@ -419,6 +396,7 @@ func HandleSpaceKeyPrint(c *gin.Context) {
 	if refresh {
 		res += fmt.Sprintf("Refresh %s + %s\n", typeKey, hashKey)
 		refreshMapping := map[string]string{
+			routerInfluxdb.BkAppToSpaceKey:           routerInfluxdb.BkAppToSpaceChannelKey,
 			routerInfluxdb.SpaceToResultTableKey:     routerInfluxdb.SpaceToResultTableChannelKey,
 			routerInfluxdb.FieldToResultTableKey:     routerInfluxdb.FieldToResultTableChannelKey,
 			routerInfluxdb.DataLabelToResultTableKey: routerInfluxdb.DataLabelToResultTableChannelKey,
@@ -430,7 +408,7 @@ func HandleSpaceKeyPrint(c *gin.Context) {
 		}
 		res += fmt.Sprintln("--------------------------------")
 	}
-	val := router.Get(ctx, typeKey, hashKey, toCached)
+	val := router.Get(ctx, typeKey, hashKey, toCached, false)
 	if val != nil {
 		res += fmt.Sprintf("Count: %v\n", val.Length())
 		if content {
@@ -442,18 +420,79 @@ func HandleSpaceKeyPrint(c *gin.Context) {
 	c.String(200, res)
 }
 
+func HandleTsDBPrint(c *gin.Context) {
+	ctx := c.Request.Context()
+	spaceId := c.Query("space_id")
+	tableId := structured.TableID(c.Query("table_id"))
+	fieldName := c.Query("field_name")
+
+	results := make([]string, 0)
+	option := structured.TsDBOption{
+		SpaceUid:  spaceId,
+		TableID:   tableId,
+		FieldName: fieldName,
+		IsRegexp:  false,
+	}
+
+	tsDBs, err := structured.GetTsDBList(ctx, &option)
+	results = append(results, fmt.Sprintf("GetTsDBList count: %d, result: %v, err: %v", len(tsDBs), tsDBs, err))
+
+	router, err := influxdb.GetSpaceTsDbRouter()
+	if err != nil {
+		results = append(results, fmt.Sprintf("GetSpaceTsDbRouter err: %v", err))
+	}
+	space := router.GetSpace(ctx, spaceId)
+	if space == nil {
+		results = append(results, fmt.Sprintf("Space: %s, %v ", spaceId, space))
+	} else {
+		results = append(results, fmt.Sprintf("Space: %s, num: %v ", spaceId, len(space)))
+	}
+	rtIds := make([]string, 0)
+	if len(tableId) == 0 {
+		for rtId, _ := range space {
+			rt := router.GetResultTable(ctx, rtId, true)
+			if rt != nil {
+				for _, rtFieldName := range rt.Fields {
+					if rtFieldName == fieldName {
+						rtIds = append(rtIds, rt.TableId)
+						break
+					}
+				}
+			}
+		}
+		results = append(results, fmt.Sprintf("FieldToResulTable: %s, %v", fieldName, rtIds))
+	} else {
+		if !strings.Contains(string(tableId), ".") {
+			rtIds = router.GetDataLabelRelatedRts(ctx, string(tableId))
+			results = append(results, fmt.Sprintf("DataLabelToResulTable: %s, %v", tableId, rtIds))
+		} else {
+			rtIds = append(rtIds, string(tableId))
+		}
+	}
+	for _, rtId := range rtIds {
+		if space != nil {
+			spaceRt, ok := space[rtId]
+			results = append(results, fmt.Sprintf("SpaceResultTable: %s, %v", rtId, spaceRt))
+			if ok {
+				rt := router.GetResultTable(ctx, rtId, true)
+				results = append(results, fmt.Sprintf("ResultTableDetail: %s, %+v", rtId, rt))
+			}
+		}
+	}
+	c.String(200, strings.Join(results, "\n\n"))
+}
+
 // HandleTsQueryInfosRequest 查询info数据接口
 func handleTsQueryInfosRequest(infoType infos.InfoType, c *gin.Context) {
 	var (
 		ctx  = c.Request.Context()
-		span oleltrace.Span
+		err  error
+		user = metadata.GetUser(ctx)
 	)
 
 	// 这里开始context就使用trace生成的了
-	ctx, span = trace.IntoContext(ctx, trace.TracerName, "handle-ts-info")
-	if span != nil {
-		defer span.End()
-	}
+	ctx, span := trace.NewSpan(ctx, "handle-ts-info")
+	defer span.End(&err)
 
 	// 获取body中的具体参数
 	queryStmt, err := io.ReadAll(c.Request.Body)
@@ -463,26 +502,19 @@ func handleTsQueryInfosRequest(infoType infos.InfoType, c *gin.Context) {
 		return
 	}
 
-	trace.InsertStringIntoSpan("info-request-header", fmt.Sprintf("%+v", c.Request.Header), span)
-	trace.InsertStringIntoSpan("info-request-data", string(queryStmt), span)
+	span.Set("info-request-header", c.Request.Header)
+	span.Set("info-request-data", string(queryStmt))
 
 	// 如果header中有bkbizid，则以header中的值为最优先
-	bizIDs := headerutil.ParseList(c.Request.Header, BizHeader)
-	spaceUid := c.Request.Header.Get(SpaceUIDHeader)
+	spaceUid := user.SpaceUid
 
-	trace.InsertStringIntoSpan("request-space-uid", spaceUid, span)
-	trace.InsertStringSliceIntoSpan("request-biz-ids", bizIDs, span)
+	span.Set("request-space-uid", spaceUid)
 
-	log.Debugf(context.TODO(), "recevice query info: %s, X-Bk-Scope-Biz-Id:%v ", string(queryStmt), bizIDs)
 	params, err := infos.AnalysisQuery(string(queryStmt))
 	if err != nil {
 		log.Errorf(context.TODO(), "analysis info query failed for->[%s]", err)
 		c.JSON(400, ErrResponse{Err: err.Error()})
 		return
-	}
-
-	if len(bizIDs) > 0 {
-		structured.ReplaceOrAddCondition(&params.Conditions, structured.BizID, bizIDs)
 	}
 
 	result, err := infos.QueryAsync(ctx, infoType, params, spaceUid)

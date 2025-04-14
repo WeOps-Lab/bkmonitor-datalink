@@ -27,6 +27,28 @@ const (
 	ConditionNotRegEqual = "nreq"
 	ConditionContains    = "contains"
 	ConditionNotContains = "ncontains"
+
+	ConditionExisted    = "existed"
+	ConditionNotExisted = "nexisted"
+)
+
+const (
+	ConditionExact = "exact"
+	ConditionGt    = "gt"
+	ConditionGte   = "gte"
+	ConditionLt    = "lt"
+	ConditionLte   = "lte"
+)
+
+const (
+	SqlEqual    = "="
+	SqlNotEqual = "!="
+	SqlReg      = "REGEXP"
+	SqlNotReg   = "NOT REGEXP"
+	SqlGt       = ">"
+	SqlGte      = ">="
+	SqlLt       = "<"
+	SqlLte      = "<="
 )
 
 // 特殊处理的字段
@@ -60,6 +82,8 @@ type ConditionField struct {
 	Value []string `json:"value" example:"2"`
 	// Operator 操作符，包含：eq,ne,erq,nreq,contains,ncontains
 	Operator string `json:"op" example:"contains"`
+	// IsWildcard 是否是通配符
+	IsWildcard bool `json:"is_wildcard,omitempty"`
 }
 
 // String
@@ -84,9 +108,43 @@ func (c *ConditionField) ToPromOperator() labels.MatchType {
 	case ConditionNotRegEqual:
 		return labels.MatchNotRegexp
 	default:
-		log.Errorf(context.TODO(), "failed to translate op->[%s] to prom op.Will return default op", c.Operator)
 		return labels.MatchEqual
 	}
+}
+
+func (c *ConditionField) BkSql() *ConditionField {
+	if len(c.Value) == 0 {
+		return nil
+	}
+
+	// bksql 查询遇到单引号需要转义
+	for k, v := range c.Value {
+		if strings.Contains(v, "'") {
+			v = strings.ReplaceAll(v, "'", "''")
+			c.Value[k] = v
+		}
+	}
+
+	switch c.Operator {
+	case ConditionEqual, ConditionExact, ConditionContains:
+		c.Operator = SqlEqual
+	case ConditionNotEqual, ConditionNotContains:
+		c.Operator = SqlNotEqual
+	case ConditionRegEqual:
+		c.Operator = SqlReg
+	case ConditionNotRegEqual:
+		c.Operator = SqlNotReg
+	case ConditionGt:
+		c.Operator = SqlGt
+	case ConditionGte:
+		c.Operator = SqlGte
+	case ConditionLt:
+		c.Operator = SqlLt
+	case ConditionLte:
+		c.Operator = SqlLte
+	}
+
+	return c
 }
 
 // ContainsToPromReg 将结构化查询中的contains条件改为 正则 "x|y" 的方式
@@ -110,6 +168,10 @@ func (c *ConditionField) ContainsToPromReg() *ConditionField {
 	isRegx := false
 	// value 个数大于 1，转换为正则表达式处理
 	switch c.Operator {
+	case ConditionEqual:
+		c.Operator = ConditionRegEqual
+	case ConditionNotEqual:
+		c.Operator = ConditionNotRegEqual
 	case ConditionContains:
 		c.Operator = ConditionRegEqual
 	case ConditionNotContains:

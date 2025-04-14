@@ -77,8 +77,8 @@ func getLegacyContainerName(line string, currentOomInstance *OomInstance) error 
 	if parsedLine == nil {
 		return nil
 	}
-	currentOomInstance.ContainerName = path.Join("/", parsedLine[1])
-	currentOomInstance.VictimContainerName = path.Join("/", parsedLine[2])
+	currentOomInstance.VictimContainerName = path.Join("/", parsedLine[1])
+	currentOomInstance.ContainerName = path.Join("/", parsedLine[2])
 	return nil
 }
 
@@ -167,7 +167,7 @@ func (p *OomParser) StreamOoms(ctx context.Context, outStream chan<- *OomInstanc
 				outStream <- oomCurrentInstance
 			}
 		case <-ctx.Done():
-			logger.Errorf("exiting analyzeLines. OOM events will not be reported.")
+			logger.Info("exiting analyzeLines. OOM events will not be reported.")
 			return
 		}
 	}

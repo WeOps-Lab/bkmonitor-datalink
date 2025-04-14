@@ -13,18 +13,29 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
+	"sync"
+	"time"
 
-	"github.com/uptrace/opentelemetry-go-extra/otelzap"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
-	oleltrace "go.opentelemetry.io/otel/trace"
 
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/internal/json"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/log"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/trace"
 )
 
 const (
 	Get  = "GET"
 	Post = "POST"
+)
+
+var (
+	bufPool = sync.Pool{
+		New: func() any {
+			return bytes.NewBuffer(make([]byte, 0, 1024))
+		},
+	}
 )
 
 // Options Curl 入参
@@ -35,53 +46,90 @@ type Options struct {
 
 	UserName string
 	Password string
+
+	Timeout time.Duration
 }
 
 type Curl interface {
-	Request(ctx context.Context, method string, opt Options) (*http.Response, error)
+	WithDecoder(decoder func(ctx context.Context, reader io.Reader, resp interface{}) (int, error))
+	Request(ctx context.Context, method string, opt Options, res interface{}) (int, error)
 }
 
 // HttpCurl http 请求方法
 type HttpCurl struct {
-	Log *otelzap.Logger
+	Log     *log.Logger
+	decoder func(ctx context.Context, reader io.Reader, res interface{}) (int, error)
 }
 
-// Request 公共调用方法实现
-func (c *HttpCurl) Request(ctx context.Context, method string, opt Options) (*http.Response, error) {
-	var (
-		span oleltrace.Span
-	)
-	ctx, span = trace.IntoContext(ctx, trace.TracerName, "http-curl")
-	if span != nil {
-		defer span.End()
-	}
+func (c *HttpCurl) WithDecoder(decoder func(ctx context.Context, reader io.Reader, res interface{}) (int, error)) {
+	c.decoder = decoder
+}
+
+func (c *HttpCurl) Request(ctx context.Context, method string, opt Options, res interface{}) (size int, err error) {
+
+	ctx, span := trace.NewSpan(ctx, "http-curl")
+	defer span.End(&err)
 
 	client := http.Client{
 		Transport: otelhttp.NewTransport(http.DefaultTransport),
+		Timeout:   opt.Timeout,
 	}
 
-	c.Log.Ctx(ctx).Debug(fmt.Sprintf("[%s] %s", method, opt.UrlPath))
+	if opt.UrlPath == "" {
+		err = fmt.Errorf("url is emtpy")
+		return
+	}
 
 	req, err := http.NewRequestWithContext(ctx, method, opt.UrlPath, bytes.NewBuffer(opt.Body))
 	if err != nil {
-		c.Log.Ctx(ctx).Error(fmt.Sprintf("client new request error:%s", err))
-		return nil, err
+		c.Log.Errorf(ctx, "client new request error:%v", err)
+		return
 	}
 
 	if opt.UserName != "" {
 		req.SetBasicAuth(opt.UserName, opt.Password)
 	}
 
-	trace.InsertStringIntoSpan("req-http-method", method, span)
-	trace.InsertStringIntoSpan("req-http-path", opt.UrlPath, span)
-	trace.InsertStringIntoSpan("req-http-headers", fmt.Sprintf("%+v", opt.Headers), span)
-	trace.InsertStringIntoSpan("req-http-body", string(opt.Body), span)
+	span.Set("req-http-method", method)
+	span.Set("req-http-path", opt.UrlPath)
 
-	key := fmt.Sprintf("%s%s", opt.UrlPath, opt.Body)
+	c.Log.Infof(ctx, "curl request: %s[%s] body:%s", method, opt.UrlPath, opt.Body)
+
 	for k, v := range opt.Headers {
-		key = fmt.Sprintf("%s%s%s", key, k, v)
-		req.Header.Set(k, v)
+		if k != "" && v != "" {
+			req.Header.Set(k, v)
+		}
 	}
 
-	return client.Do(req)
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+
+	buf := bufPool.Get().(*bytes.Buffer)
+	defer func() {
+		_ = resp.Body.Close()
+		buf.Reset()
+		bufPool.Put(buf)
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		err = fmt.Errorf("http code error: %s", resp.Status)
+		return
+	}
+
+	if c.decoder != nil {
+		size, err = c.decoder(ctx, resp.Body, res)
+		return
+	} else {
+		_, err = io.Copy(buf, resp.Body)
+		if err != nil {
+			return
+		}
+		size = buf.Len()
+
+		decoder := json.NewDecoder(buf)
+		err = decoder.Decode(&res)
+		return
+	}
 }

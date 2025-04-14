@@ -22,11 +22,11 @@ output.bkpipe:
   endpoint: '{{ plugin_path.endpoint }}'
   # 地址分配方式，static：静态 dynamic：动态
   bk_addressing: {{ cmdb_instance.host.bk_addressing|default('static', true) }}
-{%- if nodeman is defined %}
-  hostip: {{ nodeman.host.inner_ip }}
-{%- else %}
-  hostip: {{ cmdb_instance.host.bk_host_innerip_v6 if cmdb_instance.host.bk_host_innerip_v6 and not cmdb_instance.host.bk_host_innerip else cmdb_instance.host.bk_host_innerip }}
-{%- endif %}
+#{%- if nodeman is defined %}
+#  hostip: {{ nodeman.host.inner_ip }}
+#{%- else %}
+#  hostip: {{ cmdb_instance.host.bk_host_innerip_v6 if cmdb_instance.host.bk_host_innerip_v6 and not cmdb_instance.host.bk_host_innerip else cmdb_instance.host.bk_host_innerip }}
+#{%- endif %}
   cloudid: {{ cmdb_instance.host.bk_cloud_id[0].id if cmdb_instance.host.bk_cloud_id is iterable and cmdb_instance.host.bk_cloud_id is not string else cmdb_instance.host.bk_cloud_id }}
   hostid: {{ cmdb_instance.host.bk_host_id }}
 
@@ -52,9 +52,13 @@ EOF
 EOF
     cat <<EOF >> "$path"
 resource_limit:
+{%- if extra_vars is defined and extra_vars.disable_resource_limit is defined and extra_vars.disable_resource_limit == "true" %}
+  enabled: false
+{%- else %}
   enabled: true
   cpu: 1    # CPU 资源限制 单位 core(float64)
   mem: -1 # 内存资源限制 单位 MB(int)，-1 代表无限制
+{%- endif %}
 
 EOF
   fi
@@ -102,6 +106,10 @@ bkmonitorbeat:
     child_dataid: 1100002
     period: 60s
     publish_immediately: true
+
+  # 任务执行状态配置
+  gather_up_beat:
+    dataid: 1100017
 
 EOF
   cat <<EOF >> "$path"
@@ -154,7 +162,7 @@ EOF
       info_timeout: 30s
     disk:
       stat_times: 1
-      mountpoint_black_list: ["docker","container","k8s","kubelet"]
+      mountpoint_black_list: ["docker","container","k8s","kubelet","blueking"]
 {%- if extra_vars is defined and extra_vars.fs_type_white_list is defined %}
       fs_type_white_list: {{ extra_vars.fs_type_white_list | default(["overlay","btrfs","ext2","ext3","ext4","reiser","xfs","ffs","ufs","jfs","jfs2","vxfs","hfs","apfs","refs","ntfs","fat32","zfs"], true) }}
 {%- else %}
@@ -199,7 +207,14 @@ EOF
     check_disk_space_interval: 60
     check_oom_interval: 10
     used_max_disk_space_percent: 95
-
+    free_min_disk_space: 10
+{%- if extra_vars is defined and extra_vars.corefile_pattern is defined %}
+    corefile_pattern: {{ extra_vars.corefile_pattern or '' }}
+{%- endif %}
+{%- if extra_vars is defined and extra_vars.corefile_match_regex is defined %}
+    corefile_match_regex: {{ extra_vars.corefile_match_regex or '' }}
+{%- endif %}
+    disk_ro_black_list: ["docker","container","k8s","kubelet","blueking"]
 EOF
   cat <<EOF >> "$path"
   # 进程采集：同步 CMDB 进程配置文件到 bkmonitorbeat 子任务文件夹下
@@ -232,6 +247,58 @@ EOF
 #    task_id: 104
 #    period: 1m
 #    dst_dir: '{{ plugin_path.subconfig_path }}'
+
+EOF
+fi
+  if [ "$system" = "linux" ]; then
+        cat <<EOF >> "$path"
+{%- if extra_vars is defined and extra_vars.enable_audit_tasks is defined and extra_vars.enable_audit_tasks == "true" %}
+  # 登录日志采集
+  loginlog_task:
+    dataid: 1100021
+    task_id: 110
+    period: 10m
+
+  # shellhistory 采集
+  shellhistory_task:
+    task_id: 111
+    dataid: 1100020
+    period: 10m
+    last_bytes: 1048576 # 1MB
+    history_files:
+    - ".bash_history"
+
+  # 进程快照采集
+  procsnapshot_task:
+    task_id: 112
+    dataid: 1100018
+    period: 1m
+
+  # 网络快照采集
+  socketsnapshot_task:
+    task_id: 113
+    dataid: 1100019
+    period: 1m
+    detector: netlink
+
+  # rpmpackge 数据采集
+  rpmpackage_task:
+    task_id: 114
+    dataid: 1100022
+    period: 24h
+    block_write_bytes: 5242880
+    block_read_bytes: 5242880
+    block_write_iops: 10
+    block_read_iops: 10
+
+  # 二进制属性快照采集
+  procbin_task:
+    task_id: 115
+    dataid: 1100024
+    period: 1h
+    max_bytes: 10485760
+# ---------
+{%- endif %}
 
 EOF
 fi

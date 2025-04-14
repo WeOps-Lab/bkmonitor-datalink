@@ -11,7 +11,6 @@ package skywalking
 
 import (
 	"bytes"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -53,8 +52,11 @@ func init() {
 
 var metricMonitor = receiver.DefaultMetricMonitor.Source(define.SourceSkywalking)
 
-func Ready() {
-	receiver.RegisterHttpRoute(define.SourceSkywalking, []receiver.RouteWithFunc{
+func Ready(config receiver.ComponentConfig) {
+	if !config.Skywalking.Enabled {
+		return
+	}
+	receiver.RegisterRecvHttpRoute(define.SourceSkywalking, []receiver.RouteWithFunc{
 		{
 			Method:       http.MethodPost,
 			RelativePath: routeV3Segment,
@@ -67,7 +69,7 @@ func Ready() {
 		},
 	})
 
-	receiver.RegisterGrpcRoute(func(s *grpc.Server) {
+	receiver.RegisterRecvGrpcRoute(func(s *grpc.Server) {
 		confv3.RegisterConfigurationDiscoveryServiceServer(s, &ConfigurationDiscoveryService{})
 		eventv3.RegisterEventServiceServer(s, &EventService{})
 		managementv3.RegisterManagementServiceServer(s, &ManagementService{})
@@ -85,7 +87,7 @@ func Ready() {
 func extractMetadata(s string) (token, serviceInstance string, err error) {
 	parts := strings.SplitN(s, splitKey, 2) // token 不会携带 splitKey
 	if len(parts) != 2 {
-		return "", "", fmt.Errorf("skywalking: invalid metadata '%s'", s)
+		return "", "", errors.Errorf("skywalking: invalid metadata '%s'", s)
 	}
 	token, serviceInstance = parts[0], parts[1]
 	return token, serviceInstance, nil
@@ -100,7 +102,7 @@ func (s HttpService) reportV3Segment(w http.ResponseWriter, req *http.Request) {
 	_, err := io.Copy(buf, req.Body)
 	if err != nil {
 		metricMonitor.IncInternalErrorCounter(define.RequestHttp, define.RecordTraces)
-		receiver.WriteResponse(w, define.ContentTypeJson, http.StatusInternalServerError, []byte(err.Error()))
+		receiver.WriteErrResponse(w, define.ContentTypeJson, http.StatusInternalServerError, err)
 		logger.Errorf("failed to read request body, error: %s", err)
 		return
 	}
@@ -108,14 +110,14 @@ func (s HttpService) reportV3Segment(w http.ResponseWriter, req *http.Request) {
 	data := &agentv3.SegmentObject{}
 	if err = json.Unmarshal(buf.Bytes(), data); err != nil {
 		metricMonitor.IncInternalErrorCounter(define.RequestHttp, define.RecordTraces)
-		receiver.WriteResponse(w, define.ContentTypeJson, http.StatusBadRequest, []byte(err.Error()))
+		receiver.WriteErrResponse(w, define.ContentTypeJson, http.StatusBadRequest, err)
 		logger.Errorf("failed to unmarshal segment, error: %s", err)
 		return
 	}
 
 	token, serviceInstance, err := extractMetadata(data.GetServiceInstance())
 	if err != nil {
-		receiver.WriteResponse(w, define.ContentTypeJson, http.StatusBadRequest, []byte(err.Error()))
+		receiver.WriteErrResponse(w, define.ContentTypeJson, http.StatusBadRequest, err)
 		logger.Warnf("failed to extract metadata, ip=%v, error: %s", ip, err)
 		return
 	}
@@ -134,7 +136,7 @@ func (s HttpService) reportV3Segment(w http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		err = errors.Wrapf(err, "run pre-check failed, code=%d, ip=%s", code, ip)
 		logger.WarnRate(time.Minute, r.Token.Original, err)
-		receiver.WriteResponse(w, define.ContentTypeJson, int(code), []byte(err.Error()))
+		receiver.WriteErrResponse(w, define.ContentTypeJson, int(code), err)
 		metricMonitor.IncPreCheckFailedCounter(define.RequestHttp, define.RecordTraces, processorName, r.Token.Original, code)
 		return
 	}
@@ -153,7 +155,7 @@ func (s HttpService) reportV3Segments(w http.ResponseWriter, req *http.Request) 
 	_, err := io.Copy(buf, req.Body)
 	if err != nil {
 		metricMonitor.IncInternalErrorCounter(define.RequestHttp, define.RecordTraces)
-		receiver.WriteResponse(w, define.ContentTypeJson, http.StatusInternalServerError, []byte(err.Error()))
+		receiver.WriteErrResponse(w, define.ContentTypeJson, http.StatusInternalServerError, err)
 		logger.Errorf("failed to read request body, error: %s", err)
 		return
 	}
@@ -161,7 +163,7 @@ func (s HttpService) reportV3Segments(w http.ResponseWriter, req *http.Request) 
 	var data []*agentv3.SegmentObject
 	if err = json.Unmarshal(buf.Bytes(), &data); err != nil {
 		metricMonitor.IncInternalErrorCounter(define.RequestHttp, define.RecordTraces)
-		receiver.WriteResponse(w, define.ContentTypeJson, http.StatusBadRequest, []byte(err.Error()))
+		receiver.WriteErrResponse(w, define.ContentTypeJson, http.StatusBadRequest, err)
 		logger.Errorf("failed to unmarshal segments, error: %s", err)
 		return
 	}
@@ -188,7 +190,7 @@ func (s HttpService) reportV3Segments(w http.ResponseWriter, req *http.Request) 
 		if err != nil {
 			err = errors.Wrapf(err, "run pre-check failed, code=%d, ip=%s", code, ip)
 			logger.WarnRate(time.Minute, r.Token.Original, err)
-			receiver.WriteResponse(w, define.ContentTypeJson, int(code), []byte(err.Error()))
+			receiver.WriteErrResponse(w, define.ContentTypeJson, int(code), err)
 			metricMonitor.IncPreCheckFailedCounter(define.RequestHttp, define.RecordTraces, processorName, r.Token.Original, code)
 			return
 		}

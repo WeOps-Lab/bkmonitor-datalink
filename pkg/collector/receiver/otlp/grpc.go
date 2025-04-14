@@ -17,9 +17,11 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
 	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
 	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
+	"google.golang.org/grpc/metadata"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/prettyprint"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/tokenparser"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/utils"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/pipeline"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/receiver"
@@ -57,6 +59,14 @@ func (s tracesService) Export(ctx context.Context, req ptraceotlp.Request) (ptra
 		RequestClient: define.RequestClient{IP: ip},
 		RecordType:    define.RecordTraces,
 		Data:          traces,
+	}
+
+	md, ok := metadata.FromIncomingContext(ctx)
+	if ok {
+		tk := tokenparser.FromGrpcMetadata(md)
+		if len(tk) > 0 {
+			r.Token = define.Token{Original: tk}
+		}
 	}
 	prettyprint.Traces(traces)
 
@@ -98,6 +108,14 @@ func (s metricsService) Export(ctx context.Context, req pmetricotlp.Request) (pm
 		RecordType:    define.RecordMetrics,
 		Data:          metrics,
 	}
+
+	md, ok := metadata.FromIncomingContext(ctx)
+	if ok {
+		tk := tokenparser.FromGrpcMetadata(md)
+		if len(tk) > 0 {
+			r.Token = define.Token{Original: tk}
+		}
+	}
 	prettyprint.Metrics(metrics)
 
 	code, processorName, err := s.Validate(r)
@@ -137,6 +155,14 @@ func (s logsService) Export(ctx context.Context, req plogotlp.Request) (plogotlp
 		RequestClient: define.RequestClient{IP: ip},
 		RecordType:    define.RecordLogs,
 		Data:          logs,
+	}
+
+	md, ok := metadata.FromIncomingContext(ctx)
+	if ok {
+		tk := tokenparser.FromGrpcMetadata(md)
+		if len(tk) > 0 {
+			r.Token = define.Token{Original: tk}
+		}
 	}
 	prettyprint.Logs(logs)
 

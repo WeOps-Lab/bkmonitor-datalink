@@ -12,6 +12,7 @@ package structured
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/log"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/query/promql"
 )
 
@@ -38,8 +40,22 @@ type Conditions struct {
 	ConditionList []string `json:"condition_list,omitempty" example:"and"`
 }
 
+// InsertCondition 从数组顶端写入
+func (c *Conditions) InsertCondition(s string) {
+	cls := make([]string, len(c.ConditionList)+1)
+	cls = append([]string{s}, c.ConditionList...)
+	c.ConditionList = cls
+}
+
+// InsertField 从数组顶端写入
+func (c *Conditions) InsertField(field ConditionField) {
+	cfs := make([]ConditionField, len(c.FieldList)+1)
+	cfs = append([]ConditionField{field}, c.FieldList...)
+	c.FieldList = cfs
+}
+
 // AnalysisConditions
-func (c *Conditions) AnalysisConditions() ([][]ConditionField, error) {
+func (c *Conditions) AnalysisConditions() (AllConditions, error) {
 
 	var (
 		totalBuffer = make([][]ConditionField, 0) // 以or作为分界线，and条件的内容都会放入到一起，然后一起渲染处理
@@ -62,11 +78,11 @@ func (c *Conditions) AnalysisConditions() ([][]ConditionField, error) {
 
 	// 先循环遍历所有的内容，加入到各个列表中
 	for index, field := range c.FieldList {
-		// 不允许值为空，此时可能引起拼接失败
+		// 当 value 为空的时候，直接忽略该查询条件
 		if len(field.Value) == 0 {
-			log.Warnf(context.TODO(), "missing value in condition:%s", field.DimensionName)
-			return nil, errors.Wrap(ErrMissingValue, field.DimensionName)
+			continue
 		}
+
 		// 第一组的只需要增加即可
 		if index == 0 {
 			log.Debugf(context.TODO(), "first element->[%s] will add to row buffer", field.String())
@@ -76,10 +92,10 @@ func (c *Conditions) AnalysisConditions() ([][]ConditionField, error) {
 
 		// 第二组的需要先判断条件是否or
 		if c.ConditionList[index-1] == ConditionAnd {
-			log.Debugf(context.TODO(), "under and condition, element->[%s] will continue add to row buffer", field)
+			log.Debugf(context.TODO(), "under and condition, element->[%v] will continue add to row buffer", field)
 			rowBuffer = append(rowBuffer, field)
 		} else if c.ConditionList[index-1] == ConditionOr {
-			log.Debugf(context.TODO(), "under or condition, will add element->[%s] to new row.", field)
+			log.Debugf(context.TODO(), "under or condition, will add element->[%v] to new row.", field)
 			// 先追加到结果中
 			totalBuffer = append(totalBuffer, rowBuffer)
 			// 然后创建一个新的行数组放置新的内容
@@ -182,27 +198,170 @@ func MergeConditionField(source, target AllConditions) AllConditions {
 	return all
 }
 
-func (c AllConditions) VMString(vMResultTable string) (string, int) {
-	vmLabels := make([]string, 0, len(c))
-	num := 0
+func (c AllConditions) BkSql() string {
+	var conditionsString []string
 	for _, cond := range c {
-		labels := make([]string, 0, len(cond)+1)
-		if vMResultTable != "" {
-			num++
-			labels = append(labels, fmt.Sprintf(`result_table_id="%s"`, vMResultTable))
-		}
-
+		var conditionString []string
 		for _, f := range cond {
-			nf := f.ContainsToPromReg()
-			val := strings.ReplaceAll(nf.Value[0], `\`, `\\`)
-			labels = append(labels, fmt.Sprintf(`%s%s"%s"`, nf.DimensionName, nf.ToPromOperator(), val))
+			nf := f.BkSql()
+			if nf == nil {
+				continue
+			}
+
+			if len(nf.Value) == 1 {
+				conditionString = append(conditionString, fmt.Sprintf("`%s` %s '%s'", nf.DimensionName, nf.Operator, nf.Value[0]))
+			} else {
+				var vals []string
+				for _, v := range nf.Value {
+					vals = append(vals, fmt.Sprintf("`%s` %s '%s'", nf.DimensionName, nf.Operator, v))
+				}
+				logical := promql.OrOperator
+				// 如果是不等于，则要用and连接
+				if nf.Operator == SqlNotEqual || nf.Operator == SqlNotReg {
+					logical = promql.AndOperator
+				}
+
+				if len(vals) > 0 {
+					if len(vals) == 1 {
+						conditionString = append(conditionString, vals[0])
+					} else {
+						conditionString = append(conditionString, fmt.Sprintf("(%s)", strings.Join(vals, fmt.Sprintf(" %s ", logical))))
+					}
+				}
+			}
 		}
 
-		num += len(cond)
-		vmLabels = append(vmLabels, strings.Join(labels, `, `))
+		if len(conditionString) > 0 {
+			if len(conditionString) == 1 {
+				conditionsString = append(conditionsString, conditionString[0])
+			} else {
+				conditionsString = append(conditionsString, fmt.Sprintf("(%s)", strings.Join(conditionString, fmt.Sprintf(" %s ", promql.AndOperator))))
+			}
+		}
 	}
 
-	return strings.Join(vmLabels, ` or `), num
+	return strings.Join(conditionsString, fmt.Sprintf(" %s ", promql.OrOperator))
+}
+
+func (c AllConditions) VMString(vmRt, metric string, isRegexp bool) (metadata.VmCondition, int) {
+	var (
+		defaultLabels = make([]string, 0)
+		and           = ", "
+		or            = " or "
+	)
+
+	if vmRt != "" {
+		defaultLabels = append(defaultLabels, fmt.Sprintf(`result_table_id%s"%s"`, promql.EqualOperator, vmRt))
+	}
+	if metric != "" {
+		operator := promql.EqualOperator
+		if isRegexp {
+			operator = promql.RegexpOperator
+		}
+
+		defaultLabels = append(defaultLabels, fmt.Sprintf(fmt.Sprintf(`%s%s"%s"`, labels.MetricName, operator, metric)))
+	}
+
+	if len(c) == 0 {
+		return metadata.VmCondition(strings.Join(defaultLabels, and)), len(defaultLabels)
+	}
+
+	num := 0
+	vmLabels := make([]string, 0, len(c))
+
+	for _, cond := range c {
+		lbl := make([]string, 0, len(cond)+len(defaultLabels))
+		for _, f := range cond {
+			nf := f.ContainsToPromReg()
+			val := nf.Value[0]
+			val = strings.ReplaceAll(val, `\`, `\\`)
+			val = strings.ReplaceAll(val, `"`, `\"`)
+			lbl = append(lbl, fmt.Sprintf(`%s%s"%s"`, nf.DimensionName, nf.ToPromOperator(), val))
+		}
+		for _, dl := range defaultLabels {
+			lbl = append(lbl, dl)
+		}
+
+		num += len(lbl)
+		vmLabels = append(vmLabels, strings.Join(lbl, and))
+	}
+
+	return metadata.VmCondition(strings.Join(vmLabels, or)), num
+}
+
+// Compare 比较 AllConditions 中的条件 condition
+// 当存在 condition 的维度名与 key 相等，则进行比较操作, 一经出现不满足条件则直接返回 false
+// 当所有的 condition 维度都不与 key 相等 也会放行
+func (c AllConditions) Compare(key, value string) (bool, error) {
+	// 当没有任何条件的时候则默认返回 true
+	if len(c) == 0 {
+		return true, nil
+	}
+
+	// 循环 or 条件，只要任意一个 and 条件满足，则可以跳出该循环，否则继续判断
+	for _, cond := range c {
+		// 循环 and 条件，只要任意一个不满足则跳出该循环认为不满足，所有条件验证之后，则认为满足该判断
+		andCheck, err := func() (bool, error) {
+			for _, field := range cond {
+				// 只针对传入的维度进行判断，例如：bcs_cluster_id
+				if field.DimensionName != key {
+					continue
+				}
+
+				switch field.Operator {
+				case ConditionEqual, ConditionContains:
+					// 等号判断：当出现 value 不属于 field.Value 列表的时候可以判定为 compare 失败
+					if !containElement(field.Value, value) {
+						return false, nil
+					}
+				case ConditionNotEqual, ConditionNotContains:
+					// 不等于判断：当出现 value 属于 field.Value 列表的时候可以判定为 compare 失败
+					if containElement(field.Value, value) {
+						return false, nil
+					}
+				case ConditionRegEqual:
+					// 正则判断：
+					for _, val := range field.Value {
+						reExp, err := regexp.Compile(val)
+						// 编译正则表达式失败的情况下直接返回 false 以及错误信息
+						if err != nil {
+							return false, err
+						}
+						matched := reExp.Match([]byte(value))
+						// 如果出现匹配不上的情况，可以判定 compare 失败
+						if !matched {
+							return false, nil
+						}
+					}
+					// 反正则判断:
+				case ConditionNotRegEqual:
+					for _, val := range field.Value {
+						reExp, err := regexp.Compile(val)
+						// 编译正则表达式失败的情况下直接返回 false 以及错误信息
+						if err != nil {
+							return false, err
+						}
+						matched := reExp.Match([]byte(value))
+						// 如果出现正则匹配上的情况，视为 compare 失败
+						if matched {
+							return false, nil
+						}
+					}
+				}
+			}
+
+			return true, nil
+		}()
+
+		if err != nil {
+			return false, err
+		}
+
+		if andCheck {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // ConvertToPromBuffer
@@ -213,6 +372,11 @@ func ConvertToPromBuffer(totalBuffer [][]ConditionField) [][]promql.ConditionFie
 		var fieldList []promql.ConditionField
 		fieldList = make([]promql.ConditionField, 0, len(buf))
 		for _, item := range buf {
+			// influxdb 不支持 __name__ 查询条件，先过滤掉
+			if item.DimensionName == promql.MetricLabelName {
+				continue
+			}
+
 			// contain和notcontiain，对应将operator转为eq和neq就行了,实际的信息以value为准即可
 			if item.Operator == Contains {
 				item.Operator = "eq"
@@ -227,7 +391,9 @@ func ConvertToPromBuffer(totalBuffer [][]ConditionField) [][]promql.ConditionFie
 				},
 			)
 		}
-		promBuffer = append(promBuffer, fieldList)
+		if len(fieldList) > 0 {
+			promBuffer = append(promBuffer, fieldList)
+		}
 	}
 	return promBuffer
 }

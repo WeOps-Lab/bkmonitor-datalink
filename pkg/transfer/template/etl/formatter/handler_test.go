@@ -141,13 +141,15 @@ func (s *HandlerSuite) TestFillCmdbHandlerCreatorWithDetail() {
 	}{
 		{
 			"有bizId上报,无其他",
-			true, "2", nil, define.ETLRecord{
+			true, "2", nil,
+			define.ETLRecord{
 				Dimensions: map[string]interface{}{define.RecordBizIDFieldName: "2"},
 			},
 		},
 		{
 			"啥都有 transfer 不管上传数据是否合理 均不补充 考虑新老采集器",
-			true, "2", []byte(`[{"bk_biz_id":2,"bk_biz_name":"蓝鲸","bk_module_id":31,"bk_module_name":"","bk_service_status":"1","bk_set_env":"3","bk_set_id":8,"bk_set_name":"配置平台"}]`), define.ETLRecord{
+			true, "2", []byte(`[{"bk_biz_id":2,"bk_biz_name":"蓝鲸","bk_module_id":31,"bk_module_name":"","bk_service_status":"1","bk_set_env":"3","bk_set_id":8,"bk_set_name":"配置平台"}]`),
+			define.ETLRecord{
 				Dimensions: map[string]interface{}{define.RecordBizIDFieldName: "2", define.RecordCMDBLevelFieldName: []byte(`[{"bk_biz_id":2,"bk_biz_name":"蓝鲸","bk_module_id":31,"bk_module_name":"","bk_service_status":"1","bk_set_env":"3","bk_set_id":8,"bk_set_name":"配置平台"}]`)},
 			},
 		},
@@ -182,7 +184,6 @@ func (s *HandlerSuite) TestFillCmdbHandlerCreatorWithDetail() {
 			})
 			s.Equalf(value.cmdbLevel, record.Dimensions[define.RecordCMDBLevelFieldName], "%s", value.name)
 		})
-
 	}
 }
 
@@ -227,7 +228,7 @@ func (s *HandlerSuite) TestFillBizIDHandlerCreator() {
 	})
 }
 
-func (s *HandlerSuite) TestCutterByDbmMetaMatched() {
+func (s *HandlerSuite) TestCutterByDbmMetaV0() {
 	hostInfo := models.CCHostInfo{
 		IP:      "127.0.0.1",
 		CloudID: 1,
@@ -235,16 +236,16 @@ func (s *HandlerSuite) TestCutterByDbmMetaMatched() {
 			BizID: []int{2},
 			Topo:  []map[string]string{},
 		},
-		DbmMeta: `[{"role":"master","cluster":"ssd.nvmessd.dba.db "},{"role":"slave","cluster":"ssd.abcd.dba.db "}]`,
+		DbmMeta: `[{"role":"master","cluster":"ssd.nvmessd.dba.db"},{"role":"slave","cluster":"ssd.abcd.dba.db"}]`,
 	}
 	s.StoreHost(&hostInfo).AnyTimes()
 	s.Store.EXPECT().Get(gomock.Any()).Return(nil, define.ErrItemNotFound).AnyTimes()
 
-	s.runHandler(TransferRecordCutterByExtraMetaCreator(s.Store, true), func(record *define.ETLRecord) {
+	s.runHandler(TransferRecordCutterByDbmMetaCreator(s.Store, true), func(record *define.ETLRecord) {
 		dims := record.Dimensions
 		s.NotNil(dims["role"])
 		s.NotNil(dims["cluster"])
-		s.T().Logf("dbm-meta record: %+v", record)
+		s.T().Logf("dbm-meta/v0 record: %+v", record)
 	}, []handlerCase{
 		// 有biz id 无ip cloud
 		{
@@ -259,7 +260,7 @@ func (s *HandlerSuite) TestCutterByDbmMetaMatched() {
 	})
 }
 
-func (s *HandlerSuite) TestCutterByDbmMetaMiss() {
+func (s *HandlerSuite) TestCutterByDbmMetaV1() {
 	hostInfo := models.CCHostInfo{
 		IP:      "127.0.0.1",
 		CloudID: 1,
@@ -267,23 +268,61 @@ func (s *HandlerSuite) TestCutterByDbmMetaMiss() {
 			BizID: []int{2},
 			Topo:  []map[string]string{},
 		},
-		DbmMeta: `[{"role":"master","cluster":"ssd.nvmessd.dba.db "},{"role":"slave","cluster":"ssd.abcd.dba.db "}]`,
+		DbmMeta: `{"version":"v1","common":{"region":"gz","status":"prod"},"custom":[{"role":"master","cluster":"ssd.nvmessd.dba.db"},{"role":"slave","cluster":"ssd.abcd.dba.db"}]}`,
 	}
 	s.StoreHost(&hostInfo).AnyTimes()
 	s.Store.EXPECT().Get(gomock.Any()).Return(nil, define.ErrItemNotFound).AnyTimes()
 
-	s.runHandler(TransferRecordCutterByExtraMetaCreator(s.Store, true), func(record *define.ETLRecord) {
+	s.runHandler(TransferRecordCutterByDbmMetaCreator(s.Store, true), func(record *define.ETLRecord) {
 		dims := record.Dimensions
-		s.Nil(dims["role"])
-		s.Nil(dims["cluster"])
+		s.NotNil(dims["role"])
+		s.NotNil(dims["cluster"])
+		s.NotNil(dims["region"])
+		s.NotNil(dims["status"])
+		s.T().Logf("dbm-meta/v1 record: %+v", record)
 	}, []handlerCase{
-		// 有biz id 无ip cloud
 		{
-			1, nil, define.ETLRecord{
+			2, nil, define.ETLRecord{
 				Dimensions: map[string]interface{}{
 					define.RecordBizIDFieldName:   3,
 					define.RecordIPFieldName:      "127.0.0.1",
-					define.RecordCloudIDFieldName: "2",
+					define.RecordCloudIDFieldName: "1",
+				},
+			},
+		},
+	})
+}
+
+func (s *HandlerSuite) TestCutterByDbmMetaV2() {
+	hostInfo := models.CCHostInfo{
+		IP:      "127.0.0.1",
+		CloudID: 1,
+		CCTopoBaseModelInfo: &models.CCTopoBaseModelInfo{
+			BizID: []int{2},
+			Topo:  []map[string]string{},
+		},
+		DbmMeta: `{"version": "v2", "content": "H4sIAB6N7mUC/8WXT2vDMAzFv0rxeQz5z9pu5112bm9jhCwxIyyOQ5LRltDvPgtGx047/g4hIAs9ydZ7tlbT5JTyYJ42q6nHsfzN535e4ryYu41aulZtVmQnWzU1/VdZnqrlMkZdOZ5iGqd8vhzj0Hbz4fD8MsxLPTRRvdv3m+MUy7K5aogSIadie11v4dqc6k7TMH0ePv777kvWGr77gaqm3P+CVKnWmH8cxjwt6uBF3E6zYKC3GLR4rmrBoEPgoLmqHVe158hlOejA8dpZ7qwfuLPmOtxyvLbg9fHIdbjjeA1Cc+QKnJAKeGlyHR44DXfcs9BzahbAqjlJ8VzVds9JCiekAp41t+EefCBxHS7chlvu5hLwRQoOPtz04cCZi1Mzy1XtQXKBbQaqGchrDlrKzPV2/QaY+kKyjxcAAA"}`,
+	}
+	s.StoreHost(&hostInfo).AnyTimes()
+	s.Store.EXPECT().Get(gomock.Any()).Return(nil, define.ErrItemNotFound).AnyTimes()
+
+	s.runHandler(TransferRecordCutterByDbmMetaCreator(s.Store, true), func(record *define.ETLRecord) {
+		dims := record.Dimensions
+		s.NotNil(dims["app"])
+		s.NotNil(dims["appid"])
+		s.NotNil(dims["db_type"])
+		s.NotNil(dims["cluster_type"])
+		s.NotNil(dims["cluster_domain"])
+		s.NotNil(dims["instance_port"])
+		s.NotNil(dims["instance_role"])
+		s.T().Logf("dbm-meta/v2 record: %+v", record)
+	}, []handlerCase{
+		{
+			48, nil, define.ETLRecord{
+				Dimensions: map[string]interface{}{
+					define.RecordBizIDFieldName:   3,
+					define.RecordIPFieldName:      "127.0.0.1",
+					define.RecordCloudIDFieldName: "1",
 				},
 			},
 		},

@@ -92,7 +92,7 @@ func (s *TransformByFieldSuite) TestUsage() {
 	}
 
 	for i, c := range cases {
-		fn := etl.NewTransformByField(&c.field)
+		fn := etl.NewTransformByField(&c.field, nil)
 		result, err := fn(c.value)
 		s.NoError(err, i)
 		s.Equal(c.excepted, result)
@@ -146,7 +146,7 @@ func (s *TransformByFieldSuite) TestTimeStamp() {
 		}, now.Format("2006-01-02 15:04:05"), now.Unix()},
 	}
 	for i, c := range cases {
-		fn := etl.NewTransformByField(&c.field)
+		fn := etl.NewTransformByField(&c.field, nil)
 		result, err := fn(c.value)
 		s.NoError(err, i)
 		s.Equal(c.timestamp, result.(types.TimeStamp).Int64(), i)
@@ -169,76 +169,109 @@ func (s *TransformBySeparatorSuite) TestUsage() {
 		input       string
 		transformer etl.TransformFn
 		result      map[string]interface{}
+		err         bool
 	}{
 		{
-			`1,2`,
+			`1,  2`,
 			etl.TransformMapBySeparator(",", []string{"x", "y"}),
 			map[string]interface{}{
-				"x": "1",
-				"y": "2",
+				"x":                       "1",
+				"y":                       "2",
+				config.LogCleanFailedFlag: false,
 			},
+			false,
 		},
 		{
 			`1`,
 			etl.TransformMapBySeparator(",", []string{"x", "y"}),
 			map[string]interface{}{
-				"x": "1",
-				"y": nil,
+				"x":                       "1",
+				"y":                       nil,
+				config.LogCleanFailedFlag: true,
 			},
+			false,
 		},
 		{
 			``,
 			etl.TransformMapBySeparator(",", []string{"x", "y"}),
 			map[string]interface{}{
-				"x": nil,
-				"y": nil,
+				"x":                       nil,
+				"y":                       nil,
+				config.LogCleanFailedFlag: true,
 			},
+			false,
 		},
 		{
 			`1,2`,
 			etl.TransformMapByRegexp(`(?P<x>\w+)[,\s]*(?P<y>\w+)`),
 			map[string]interface{}{
-				"x": "1",
-				"y": "2",
+				"x":                       "1",
+				"y":                       "2",
+				config.LogCleanFailedFlag: false,
 			},
+			false,
 		},
 		{
 			`1`,
 			etl.TransformMapByRegexp(`(?P<x>\w+)[,\s]*(?P<y>\w+)`),
 			map[string]interface{}{
-				"x": nil,
-				"y": nil,
+				"x":                       nil,
+				"y":                       nil,
+				config.LogCleanFailedFlag: true,
 			},
+			false,
 		},
 		{
 			`1`,
 			etl.TransformMapByRegexp(`(?P<x>\w+)[,\s]*(?P<y>\w+)?`),
 			map[string]interface{}{
-				"x": "1",
-				"y": "",
+				"x":                       "1",
+				"y":                       "",
+				config.LogCleanFailedFlag: false,
 			},
+			false,
 		},
 		{
 			``,
 			etl.TransformMapByRegexp(`(?P<x>\w+)[,\s]*(?P<y>\w+)`),
 			map[string]interface{}{
-				"x": nil,
-				"y": nil,
+				"x":                       nil,
+				"y":                       nil,
+				config.LogCleanFailedFlag: true,
 			},
+			false,
 		},
 		{
 			`{"x": "1", "y": 2}`,
-			etl.TransformMapByJSON,
+			etl.TransformMapByJsonWithRetainExtraJSON(&config.MetaResultTableConfig{}),
 			map[string]interface{}{
-				"x": "1",
-				"y": 2.0,
+				"x":                       "1",
+				"y":                       2.0,
+				config.LogCleanFailedFlag: false,
 			},
+			false,
+		},
+		{
+			`{"x": "1", "y"=2}`,
+			etl.TransformMapByJsonWithRetainExtraJSON(&config.MetaResultTableConfig{
+				Option: map[string]interface{}{
+					config.PipelineConfigOptionRetainContent: true,
+				},
+			}),
+			map[string]interface{}{
+				"log":                     `{"x": "1", "y"=2}`,
+				config.LogCleanFailedFlag: true,
+			},
+			true,
 		},
 	}
 
 	for i, c := range cases {
 		value, err := c.transformer(c.input)
-		s.NoError(err, i)
+		if !c.err {
+			s.NoError(err, i)
+		}
+
 		result, ok := value.(map[string]interface{})
 		s.True(ok)
 		s.MapEqual(c.result, result)

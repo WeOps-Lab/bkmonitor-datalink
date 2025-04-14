@@ -12,40 +12,140 @@ package task
 import (
 	"context"
 	"sync"
+	"time"
 
+	"github.com/pkg/errors"
+
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/common"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/config"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/internal/metadata/models/customreport"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/internal/metadata/models/resulttable"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/internal/metadata/models/storage"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/internal/metadata/service"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/store/mysql"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/store/redis"
 	t "github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/task"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/utils/jsonx"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/utils/slicex"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/logger"
 )
 
-// RefreshTimeSeriesMetric : update ts metrics from redis
+// RefreshTimeSeriesMetric : update ts metrics from redis or bkdata
 func RefreshTimeSeriesMetric(ctx context.Context, t *t.Task) error {
 	defer func() {
 		if err := recover(); err != nil {
-			logger.Errorf("Runtime panic caught: %v\n", err)
+			logger.Errorf("RefreshTimeSeriesMetric Runtime panic caught: %v", err)
 		}
 	}()
-	// funcName := runtimex.GetFuncName()
-	dbSession := mysql.GetDBSession()
-	qs := customreport.NewTimeSeriesGroupQuerySet(dbSession.DB)
-	// TODO: 暂时先关闭，需要在优化一下
-	qs = qs.IsEnableEq(true).IsDeleteEq(true)
-	// 过滤满足条件的记录
+	startTime := time.Now() // 记录开始时间
+	logger.Info("RefreshTimeSeriesMetric started!")
+	db := mysql.GetDBSession().DB
 	var tsGroupList []customreport.TimeSeriesGroup
-	if err := qs.All(&tsGroupList); err != nil {
-		logger.Errorf("find ts group record error, %v", err)
-		return err
+	if err := customreport.NewTimeSeriesGroupQuerySet(db).IsEnableEq(true).IsDeleteEq(false).All(&tsGroupList); err != nil {
+		return errors.Wrap(err, "find ts group record error")
 	}
-	// TODO: 先不拆分子任务，观察一下单个任务是不是可以满足需求
-	for _, ts := range tsGroupList {
-		if err := ts.UpdateMetricsFromRedis(); err != nil {
-			logger.Errorf("time_series_group: [%s] try to update metrics from redis failed", ts.TableID)
-		} else {
-			logger.Infof("time_series_group: [%s] metric update from redis success", ts.TableID)
+
+	// 获取结果表对应的计算平台结果表
+	var tableIdList []string
+	for _, tg := range tsGroupList {
+		tableIdList = append(tableIdList, tg.TableID)
+	}
+	rtMapVmRt := make(map[string]string)
+	for _, chunkDataLabels := range slicex.ChunkSlice(tableIdList, 0) {
+		var tempList []storage.AccessVMRecord
+		if err := storage.NewAccessVMRecordQuerySet(db).Select(storage.AccessVMRecordDBSchema.ResultTableId, storage.AccessVMRecordDBSchema.VmResultTableId).ResultTableIdIn(chunkDataLabels...).All(&tempList); err != nil {
+			logger.Errorf("RefreshTimeSeriesMetric get vm table id by monitor table id error, %s", err)
+			continue
+		}
+		for _, rtInfo := range tempList {
+			rtMapVmRt[rtInfo.ResultTableId] = rtInfo.VmResultTableId
 		}
 	}
 
+	// 获取redis中数据
+	client := redis.GetStorageRedisInstance()
+	wlTableIdList := make([]string, 0)
+	if wlTableIdByte, err := client.Get(config.BkDataTableIdListRedisPath); err == nil && wlTableIdByte != nil {
+		if err := jsonx.Unmarshal(wlTableIdByte, &wlTableIdList); err != nil {
+			logger.Errorf("RefreshTimeSeriesMetric get white list table id from redis failed, %v", err)
+		}
+	}
+
+	// 收集需要更新推送redis的table_id
+	tableIdChan := make(chan string, GetGoroutineLimit("refresh_time_series_metric"))
+	var updatedTableIds []string
+	wgReceive := sync.WaitGroup{}
+	go func(wg *sync.WaitGroup) {
+		wg.Add(1)
+		defer wg.Done()
+		for {
+			tableId, ok := <-tableIdChan
+			if !ok {
+				break
+			}
+			updatedTableIds = append(updatedTableIds, tableId)
+		}
+	}(&wgReceive)
+	ch := make(chan struct{}, GetGoroutineLimit("refresh_time_series_metric"))
+	wg := sync.WaitGroup{}
+	wg.Add(len(tsGroupList))
+	for _, eg := range tsGroupList {
+		ch <- struct{}{}
+		// 默认不在白名单中
+		queryFromBkdata := false
+		// 如果不存在 vm rt, 则不会通过bkbase查询
+		vmRt, ok := rtMapVmRt[eg.TableID]
+
+		var ds resulttable.DataSource
+		if err := resulttable.NewDataSourceQuerySet(db).BkDataIdEq(eg.BkDataID).One(&ds); err != nil {
+			logger.Errorf("RefreshTimeSeriesMetric:table_id %s found datasource record error, %v", eg.TableID, err)
+		}
+
+		if !ok {
+			logger.Errorf("RefreshTimeSeriesMetric:can not find vm result table id by monitor table id: %s", eg.TableID)
+			queryFromBkdata = false
+		} else if slicex.IsExistItem(wlTableIdList, eg.TableID) {
+			// 判断是否在白名单中
+			logger.Infof("RefreshTimeSeriesMetric:table_id %s ,data_id %v in white list, will query metrics from bkdata", eg.TableID, eg.BkDataID)
+			queryFromBkdata = true
+		} else if ds.CreatedFrom == common.DataIdFromBkData {
+			logger.Infof("RefreshTimeSeriesMetric:table_id %s ,data_id %v created from bkbase, will query metrics from bkdata", eg.TableID, eg.BkDataID)
+			// 如果TSGroup的创建来源是计算平台，则需从计算平台获取相应的指标
+			queryFromBkdata = true
+		}
+		go func(ts customreport.TimeSeriesGroup, tableIdChan chan string, wg *sync.WaitGroup, ch chan struct{}, vmRt string, queryFromBkdata bool) {
+			defer func() {
+				<-ch
+				wg.Done()
+			}()
+
+			svc := service.NewTimeSeriesGroupSvc(&ts)
+			updated, err := svc.UpdateTimeSeriesMetrics(vmRt, queryFromBkdata)
+			if err != nil {
+				logger.Errorf("RefreshTimeSeriesMetric: time_series_group: [%s] try to update metrics from bkdata or redis failed, %v", ts.TableID, err)
+				return
+			}
+			logger.Infof("RefreshTimeSeriesMetric: time_series_group: [%s] metric update from bkdata or redis success, updated: %v", ts.TableID, updated)
+			if updated {
+				tableIdChan <- svc.TableID
+			}
+		}(eg, tableIdChan, &wg, ch, vmRt, queryFromBkdata)
+	}
+
+	wg.Wait()
+	close(tableIdChan)
+	// 防止数据没有读完
+	wgReceive.Wait()
+	if len(updatedTableIds) != 0 {
+		logger.Info("RefreshTimeSeriesMetric,start to push table id to redis, updatedTableIds %v", updatedTableIds)
+		pusher := service.NewSpacePusher()
+		if err := pusher.PushTableIdDetail(updatedTableIds, true, false); err != nil {
+			return errors.Wrapf(err, "RefreshTimeSeriesMetric,metric update to push table id detaild for [%v] failed", updatedTableIds)
+		}
+		logger.Infof("RefreshTimeSeriesMetric,metric updated of table_id  [%v]", updatedTableIds)
+	}
+	elapsedTime := time.Since(startTime) // 计算耗时
+	logger.Infof("RefreshTimeSeriesMetric finished succuessfully, took %s", elapsedTime)
 	return nil
 }
 
@@ -53,7 +153,7 @@ func RefreshTimeSeriesMetric(ctx context.Context, t *t.Task) error {
 func RefreshEventDimension(ctx context.Context, t *t.Task) error {
 	defer func() {
 		if err := recover(); err != nil {
-			logger.Errorf("Runtime panic caught: %v\n", err)
+			logger.Errorf("RefreshEventDimension Runtime panic caught: %v", err)
 		}
 	}()
 
@@ -88,5 +188,18 @@ func RefreshEventDimension(ctx context.Context, t *t.Task) error {
 	}
 	wg.Wait()
 
+	return nil
+}
+
+// RefreshCustomReport2Nodeman : refresh custom report to nodeman
+func RefreshCustomReport2Nodeman(ctx context.Context, t *t.Task) error {
+	defer func() {
+		if err := recover(); err != nil {
+			logger.Errorf("RefreshCustomReport2Nodeman Runtime panic caught: %v", err)
+		}
+	}()
+	if err := service.NewCustomReportSubscriptionSvc(nil).RefreshCustomReport2Config(nil); err != nil {
+		return errors.Wrap(err, "RefreshCustomReport2Config failed")
+	}
 	return nil
 }

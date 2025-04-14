@@ -19,6 +19,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/atomic"
 	commonv3 "skywalking.apache.org/repo/goapi/collect/common/v3"
 	agentv3 "skywalking.apache.org/repo/goapi/collect/language/agent/v3"
 
@@ -29,8 +30,15 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/receiver"
 )
 
+const (
+	localSegmentURL  = "http://127.0.0.1:4318/v3/segment"
+	localSegmentsURL = "http://127.0.0.1:4318/v3/segments"
+)
+
 func TestReady(t *testing.T) {
-	assert.NotPanics(t, Ready)
+	assert.NotPanics(t, func() {
+		Ready(receiver.ComponentConfig{})
+	})
 }
 
 func TestExtractMetadata(t *testing.T) {
@@ -56,178 +64,109 @@ func TestExtractMetadata(t *testing.T) {
 	})
 }
 
-func TestHttpReportSegments(t *testing.T) {
-	segments := []*agentv3.SegmentObject{mockGrpcTraceSegment(1)}
-	data, err := json.Marshal(segments)
-	assert.NoError(t, err)
-
-	url := "http://127.0.0.1:4318/v3/segments"
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(data))
-	assert.NoError(t, err)
-
-	n := 0
+func newSvc(code define.StatusCode, msg string, err error) (HttpService, *atomic.Int64) {
+	n := atomic.NewInt64(0)
 	svc := HttpService{
-		receiver.Publisher{Func: func(record *define.Record) { n++ }},
+		receiver.Publisher{Func: func(record *define.Record) { n.Inc() }},
 		pipeline.Validator{Func: func(record *define.Record) (define.StatusCode, string, error) {
-			return define.StatusCodeOK, "", nil
+			return code, msg, err
 		}},
 	}
-
-	rw := httptest.NewRecorder()
-	svc.reportV3Segments(rw, req)
-	assert.Equal(t, rw.Code, http.StatusOK)
-	assert.Equal(t, 1, n)
+	return svc, n
 }
 
-func TestHttpReportSegmentsFailedPreCheck(t *testing.T) {
-	segments := []*agentv3.SegmentObject{mockGrpcTraceSegment(1)}
-	data, err := json.Marshal(segments)
-	assert.NoError(t, err)
+func TestHttpRequest(t *testing.T) {
+	t.Run("report segments success", func(t *testing.T) {
+		segments := []*agentv3.SegmentObject{mockGrpcTraceSegment(1)}
+		data, err := json.Marshal(segments)
+		assert.NoError(t, err)
+		req := httptest.NewRequest(http.MethodPost, localSegmentsURL, bytes.NewBuffer(data))
 
-	url := "http://127.0.0.1:4318/v3/segments"
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(data))
-	assert.NoError(t, err)
+		svc, n := newSvc(define.StatusCodeOK, "", nil)
+		rw := httptest.NewRecorder()
+		svc.reportV3Segments(rw, req)
+		assert.Equal(t, rw.Code, http.StatusOK)
+		assert.Equal(t, int64(1), n.Load())
+	})
 
-	n := 0
-	svc := HttpService{
-		receiver.Publisher{Func: func(record *define.Record) { n++ }},
-		pipeline.Validator{Func: func(record *define.Record) (define.StatusCode, string, error) {
-			return define.StatusCodeTooManyRequests, "", errors.New("too many requests")
-		}},
-	}
+	t.Run("segments precheck failed", func(t *testing.T) {
+		segments := []*agentv3.SegmentObject{mockGrpcTraceSegment(1)}
+		data, err := json.Marshal(segments)
+		assert.NoError(t, err)
+		req := httptest.NewRequest(http.MethodPost, localSegmentsURL, bytes.NewBuffer(data))
 
-	rw := httptest.NewRecorder()
-	svc.reportV3Segments(rw, req)
-	assert.Equal(t, rw.Code, http.StatusTooManyRequests)
-	assert.Equal(t, 0, n)
-}
+		svc, n := newSvc(define.StatusCodeTooManyRequests, "", errors.New("too many requests"))
+		rw := httptest.NewRecorder()
+		svc.reportV3Segments(rw, req)
+		assert.Equal(t, rw.Code, http.StatusTooManyRequests)
+		assert.Equal(t, int64(0), n.Load())
+	})
 
-func TestHttpReportSegmentsInvalidBody(t *testing.T) {
-	data := []byte("{-}")
+	t.Run("segments invalid body", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, localSegmentsURL, bytes.NewBuffer([]byte("{-}")))
 
-	url := "http://127.0.0.1:4318/v3/segments"
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(data))
-	assert.NoError(t, err)
+		svc, n := newSvc(define.StatusCodeOK, "", nil)
+		rw := httptest.NewRecorder()
+		svc.reportV3Segments(rw, req)
+		assert.Equal(t, rw.Code, http.StatusBadRequest)
+		assert.Equal(t, int64(0), n.Load())
+	})
 
-	n := 0
-	svc := HttpService{
-		receiver.Publisher{Func: func(record *define.Record) { n++ }},
-		pipeline.Validator{Func: func(record *define.Record) (define.StatusCode, string, error) {
-			return define.StatusCodeOK, "", nil
-		}},
-	}
+	t.Run("segments read failed", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, localSegmentsURL, testkits.NewBrokenReader())
 
-	rw := httptest.NewRecorder()
-	svc.reportV3Segments(rw, req)
-	assert.Equal(t, rw.Code, http.StatusBadRequest)
-	assert.Equal(t, 0, n)
-}
+		svc, n := newSvc(define.StatusCodeOK, "", nil)
+		rw := httptest.NewRecorder()
+		svc.reportV3Segments(rw, req)
+		assert.Equal(t, rw.Code, http.StatusInternalServerError)
+		assert.Equal(t, int64(0), n.Load())
+	})
 
-func TestHttpReportSegmentsReadFailed(t *testing.T) {
-	buf := testkits.NewBrokenReader()
-	url := "http://127.0.0.1:4318/v3/segments"
-	req, err := http.NewRequest("POST", url, buf)
-	assert.NoError(t, err)
+	t.Run("report segment success", func(t *testing.T) {
+		segment := mockGrpcTraceSegment(1)
+		data, err := json.Marshal(segment)
+		assert.NoError(t, err)
+		req := httptest.NewRequest(http.MethodPost, localSegmentURL, bytes.NewBuffer(data))
 
-	n := 0
-	svc := HttpService{
-		receiver.Publisher{Func: func(record *define.Record) { n++ }},
-		pipeline.Validator{Func: func(record *define.Record) (define.StatusCode, string, error) {
-			return define.StatusCodeOK, "", nil
-		}},
-	}
+		svc, n := newSvc(define.StatusCodeOK, "", nil)
+		rw := httptest.NewRecorder()
+		svc.reportV3Segment(rw, req)
+		assert.Equal(t, rw.Code, http.StatusOK)
+		assert.Equal(t, int64(1), n.Load())
+	})
 
-	rw := httptest.NewRecorder()
-	svc.reportV3Segments(rw, req)
-	assert.Equal(t, rw.Code, http.StatusInternalServerError)
-	assert.Equal(t, 0, n)
-}
+	t.Run("segment precheck failed", func(t *testing.T) {
+		segment := mockGrpcTraceSegment(1)
+		data, err := json.Marshal(segment)
+		assert.NoError(t, err)
+		req := httptest.NewRequest(http.MethodPost, localSegmentURL, bytes.NewBuffer(data))
 
-func TestHttpReportSegment(t *testing.T) {
-	segment := mockGrpcTraceSegment(1)
-	data, err := json.Marshal(segment)
-	assert.NoError(t, err)
+		svc, n := newSvc(define.StatusCodeTooManyRequests, "", errors.New("too many requests"))
+		rw := httptest.NewRecorder()
+		svc.reportV3Segment(rw, req)
+		assert.Equal(t, rw.Code, http.StatusTooManyRequests)
+		assert.Equal(t, int64(0), n.Load())
+	})
 
-	url := "http://127.0.0.1:4318/v3/segment"
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(data))
-	assert.NoError(t, err)
+	t.Run("segment invalid body", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, localSegmentURL, bytes.NewBuffer([]byte("{-}")))
 
-	n := 0
-	svc := HttpService{
-		receiver.Publisher{Func: func(record *define.Record) { n++ }},
-		pipeline.Validator{Func: func(record *define.Record) (define.StatusCode, string, error) {
-			return define.StatusCodeOK, "", nil
-		}},
-	}
+		svc, n := newSvc(define.StatusCodeOK, "", nil)
+		rw := httptest.NewRecorder()
+		svc.reportV3Segment(rw, req)
+		assert.Equal(t, rw.Code, http.StatusBadRequest)
+		assert.Equal(t, int64(0), n.Load())
+	})
 
-	rw := httptest.NewRecorder()
-	svc.reportV3Segment(rw, req)
-	assert.Equal(t, rw.Code, http.StatusOK)
-	assert.Equal(t, 1, n)
-}
+	t.Run("segment read failed", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, localSegmentURL, testkits.NewBrokenReader())
 
-func TestHttpReportSegmentFailedPreCheck(t *testing.T) {
-	segment := mockGrpcTraceSegment(1)
-	data, err := json.Marshal(segment)
-	assert.NoError(t, err)
-
-	url := "http://127.0.0.1:4318/v3/segment"
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(data))
-	assert.NoError(t, err)
-
-	n := 0
-	svc := HttpService{
-		receiver.Publisher{Func: func(record *define.Record) { n++ }},
-		pipeline.Validator{Func: func(record *define.Record) (define.StatusCode, string, error) {
-			return define.StatusCodeTooManyRequests, "", errors.New("too many requests")
-		}},
-	}
-
-	rw := httptest.NewRecorder()
-	svc.reportV3Segment(rw, req)
-	assert.Equal(t, rw.Code, http.StatusTooManyRequests)
-	assert.Equal(t, 0, n)
-}
-
-func TestHttpReportSegmentInvalidBody(t *testing.T) {
-	data := []byte("{-}")
-
-	url := "http://127.0.0.1:4318/v3/segment"
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(data))
-	assert.NoError(t, err)
-
-	n := 0
-	svc := HttpService{
-		receiver.Publisher{Func: func(record *define.Record) { n++ }},
-		pipeline.Validator{Func: func(record *define.Record) (define.StatusCode, string, error) {
-			return define.StatusCodeOK, "", nil
-		}},
-	}
-
-	rw := httptest.NewRecorder()
-	svc.reportV3Segment(rw, req)
-	assert.Equal(t, rw.Code, http.StatusBadRequest)
-	assert.Equal(t, 0, n)
-}
-
-func TestHttpReportSegmentReadFailed(t *testing.T) {
-	buf := testkits.NewBrokenReader()
-	url := "http://127.0.0.1:4318/v3/segment"
-	req, err := http.NewRequest("POST", url, buf)
-	assert.NoError(t, err)
-
-	n := 0
-	svc := HttpService{
-		receiver.Publisher{Func: func(record *define.Record) { n++ }},
-		pipeline.Validator{Func: func(record *define.Record) (define.StatusCode, string, error) {
-			return define.StatusCodeOK, "", nil
-		}},
-	}
-
-	rw := httptest.NewRecorder()
-	svc.reportV3Segment(rw, req)
-	assert.Equal(t, rw.Code, http.StatusInternalServerError)
-	assert.Equal(t, 0, n)
+		svc, n := newSvc(define.StatusCodeOK, "", nil)
+		rw := httptest.NewRecorder()
+		svc.reportV3Segment(rw, req)
+		assert.Equal(t, rw.Code, http.StatusInternalServerError)
+		assert.Equal(t, int64(0), n.Load())
+	})
 }
 
 func mockGrpcTraceSegment(sequence int) *agentv3.SegmentObject {

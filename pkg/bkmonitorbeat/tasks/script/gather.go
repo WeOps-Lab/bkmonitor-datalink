@@ -11,11 +11,11 @@ package script
 
 import (
 	"context"
-	"fmt"
 	"sort"
 	"time"
 
 	"github.com/elastic/beats/libbeat/common"
+	"github.com/pkg/errors"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bkmonitorbeat/configs"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bkmonitorbeat/define"
@@ -26,71 +26,76 @@ import (
 )
 
 // ExecCmdLine is so tests can mock out exec.Command usage.
-var ExecCmdLine = utils.RunStringWithoutErr
+var ExecCmdLine = utils.RunString
 
-// Gather gather script task output
 type Gather struct {
 	tasks.BaseTask
 }
 
-// Run run script command line and parse result as promuthes format
 func (g *Gather) Run(ctx context.Context, e chan<- define.Event) {
 	var (
-		err      error
-		taskConf = g.TaskConfig.(*configs.ScriptTaskConfig)
-		event    = NewEvent(g)
+		err         error
+		taskConf    = g.TaskConfig.(*configs.ScriptTaskConfig)
+		originEvent = NewEvent(g)
 	)
-	//init event time
+
 	localtime, utctime, _ := bkcommon.GetDateTime()
-	event.LocalTime = localtime
-	event.UTCTime = utctime
+	originEvent.LocalTime = localtime
+	originEvent.UTCTime = utctime
 
 	g.PreRun(ctx)
 	defer g.PostRun(ctx)
-	logger.Infof("task command %s timeout config %v", taskConf.Command, taskConf.Timeout)
+
+	// 生成当前时间戳和时间处理函数
+	milliTimestamp := time.Now().UnixMilli()
+	timeHandler, _ := tasks.GetTimestampHandler(taskConf.TimestampUnit)
+	if timeHandler == nil {
+		timeHandler, _ = tasks.GetTimestampHandler("ms") // 兜底
+	}
+
 	cmdCtx, cmdCancel := context.WithTimeout(ctx, taskConf.Timeout)
-	// releases resources if execCmd completes before timeout elapses
 	defer cmdCancel()
-	fmtCommand := ShellWordPreProcess(taskConf.Command)
-	logger.Debugf("start to run command line [%s]", taskConf.Command)
+	command := ShellWordPreProcess(taskConf.Command)
 
 	t0 := time.Now()
-	out, err := ExecCmdLine(cmdCtx, fmtCommand, taskConf.UserEnvs)
+	out, err := ExecCmdLine(cmdCtx, command, taskConf.UserEnvs, taskConf.Username)
 	if err != nil {
-		logger.Errorf("execCmd [%s] failed:%s, failed content:%s", fmtCommand, err.Error(), out)
-		event.ScriptFail(define.BeatErrScriptRunError, fmt.Sprintf("[%s]%s", err.Error(), out))
-		e <- event
+		logger.Errorf("execute command (%s) failed, out=(%s), err: %v", command, out, err)
+		if errors.Is(err, utils.ErrScriptTimeout) {
+			e <- tasks.NewGatherUpEvent(g, define.CodeScriptTimeout)
+		} else {
+			e <- tasks.NewGatherUpEvent(g, define.CodeScriptRunFailed)
+		}
 		return
 	}
-	logger.Infof("task-take: %v", time.Since(t0))
 
-	logger.Debugf("run command line %s success", fmtCommand)
-	milliTimestamp := time.Now().UnixMilli()
-	aggreRst, err := FormatOutput([]byte(out), milliTimestamp, taskConf.TimeOffset, taskConf.TimestampUnit)
-	if err != nil {
-		logger.Errorf("formatOutput failed:%s", err.Error())
-		event.ScriptFail(define.BeatErrScriptFormatOutputError, err.Error())
-		e <- event
+	since := time.Since(t0)
+	logger.Debugf("task command(%s) take %v, out=(%s)", command, since, out)
+	define.RecordLogf("[script] execute command(%s) take %v, len(out)=%d", command, since, len(out))
+
+	aggRst, formatErr := FormatOutput([]byte(out), milliTimestamp, taskConf.TimeOffset, timeHandler)
+	if errors.Is(formatErr, define.ErrNoScriptOutput) {
+		e <- tasks.NewGatherUpEvent(g, define.CodeScriptNoOutput)
+		logger.Error(formatErr)
 		return
 	}
-	logger.Debugf("format command line %s result success", fmtCommand)
 
 	gConfig, ok := g.GlobalConfig.(*configs.Config)
 	if ok && gConfig.KeepOneDimension {
-		// 清理aggreRst，对于相同的指标，只保留一个维度的数据
-		g.KeepOneDimension(aggreRst)
+		g.KeepOneDimension(aggRst)
 	}
 
-	for timestamp, subResult := range aggreRst {
+	var total int
+	for timestamp, subResult := range aggRst {
 		for _, pe := range subResult {
 			ev := NewEvent(g)
-			ev.StartAt = event.StartAt
+			ev.StartAt = originEvent.StartAt
 			ev.Timestamp = timestamp
-			ev.LocalTime = event.LocalTime
-			ev.UTCTime = event.UTCTime
+			ev.LocalTime = originEvent.LocalTime
+			ev.UTCTime = originEvent.UTCTime
 
 			ev.UserTime = time.Unix(ev.Timestamp, 0).UTC().Format(bkcommon.TimeFormat)
-			for aggKey, aggValue := range pe.AggreValue {
+			for aggKey, aggValue := range pe.AggValue {
 				ev.Metric[aggKey] = aggValue
 			}
 			if len(pe.Labels) > 0 {
@@ -120,24 +125,36 @@ func (g *Gather) Run(ctx context.Context, e chan<- define.Event) {
 					ev.Exemplar = tmp
 				}
 			}
+
 			ev.Success()
-			logger.Infof("event:%+v", ev)
 			e <- ev
+			total++
 		}
+	}
+
+	if formatErr != nil {
+		e <- tasks.NewGatherUpEvent(g, define.CodeInvalidPromFormat)
+		if len(aggRst) == 0 {
+			logger.Errorf("command(%s) format output failed totally: %s", command, formatErr)
+		} else {
+			logger.Errorf("command(%s) format output failed partly: %s", command, formatErr)
+		}
+	} else {
+		total++
+		e <- tasks.NewGatherUpEventWithValue(g, define.CodeOK, float64(total))
 	}
 }
 
 // KeepOneDimension 只在测试模式需要这么处理
-// 指标名+维度字段名 作为唯一的key
-// 不同维度值只保留一个，但是如果有多的维度名，那么需要保留，详细可以看test里的案例
+// 指标名+维度字段名 作为唯一的 key
+// 不同维度值只保留一个，但是如果有多的维度名，那么需要保留，详细可以看 test 里的案例
 func (g *Gather) KeepOneDimension(data map[int64]map[string]tasks.PromEvent) {
-	logger.Infof("[script collect] keep one dimension %v", data)
 	for timestamp, subResult := range data {
 		keySet := common.StringSet{}
 		newSubResult := make(map[string]tasks.PromEvent)
 		for dimensionKey, pe := range subResult {
 			// 清理部分指标，当前面的维度已经包含了某个指标后，那么接下来的维度里，则删除这个指标
-			lenOfdimensionNames := len(pe.Labels)
+			dimensionNamesLen := len(pe.Labels)
 			dimFieldNames := make([]string, 0)
 			for dimK := range pe.Labels {
 				dimFieldNames = append(dimFieldNames, dimK)
@@ -145,19 +162,19 @@ func (g *Gather) KeepOneDimension(data map[int64]map[string]tasks.PromEvent) {
 			sort.Strings(dimFieldNames)
 			dimFieldNames = append(dimFieldNames, "") // 先占个空位
 
-			newAggreValue := make(common.MapStr)
-			for aggKey, aggValue := range pe.AggreValue {
-				dimFieldNames[lenOfdimensionNames] = aggKey
+			newAggValue := make(common.MapStr)
+			for aggKey, aggValue := range pe.AggValue {
+				dimFieldNames[dimensionNamesLen] = aggKey
 				hashKey := utils.GeneratorHashKey(dimFieldNames)
 				if !keySet.Has(hashKey) {
 					keySet.Add(hashKey)
-					newAggreValue[aggKey] = aggValue
+					newAggValue[aggKey] = aggValue
 				}
 			}
-			pe.AggreValue = newAggreValue
+			pe.AggValue = newAggValue
 
 			// 如果该维度下的还有指标未被清理。则保留这个维度的数据
-			if len(newAggreValue) > 0 {
+			if len(newAggValue) > 0 {
 				newSubResult[dimensionKey] = pe
 			}
 		}
@@ -167,12 +184,10 @@ func (g *Gather) KeepOneDimension(data map[int64]map[string]tasks.PromEvent) {
 	}
 }
 
-// New :
 func New(globalConfig define.Config, taskConfig define.TaskConfig) define.Task {
 	gather := &Gather{}
 	gather.GlobalConfig = globalConfig
 	gather.TaskConfig = taskConfig
-
 	gather.Init()
 
 	return gather

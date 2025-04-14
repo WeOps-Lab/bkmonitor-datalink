@@ -14,6 +14,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/Knetic/govaluate"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/parser"
 )
@@ -30,12 +31,46 @@ type QueryPromQL struct {
 	Limit               int      `json:"limit,omitempty"`
 	Slimit              int      `json:"slimit,omitempty"`
 	Match               string   `json:"match,omitempty"`
+	IsVerifyDimensions  bool     `json:"is_verify_dimensions,omitempty"`
+
+	// DownSampleRange 降采样：大于Step才能生效，可以为空
+	DownSampleRange string `json:"down_sample_range,omitempty" example:"5m"`
 	// Timezone 时区
 	Timezone string `json:"timezone,omitempty" example:"Asia/Shanghai"`
 	// LookBackDelta 偏移量
 	LookBackDelta string `json:"look_back_delta"`
 	// 瞬时数据
 	Instant bool `json:"instant"`
+}
+
+// refMgr
+type refMgr struct {
+	count int
+	char  string
+}
+
+// Next
+func (rm *refMgr) Next() string {
+	// 讲道理不会出现这种情况 26 个不同指标求算术表达式 ???
+	if rm.count >= 26 {
+		s := fmt.Sprintf("z%d", rm.count-26)
+		rm.count++
+		return s
+	}
+
+	s := rm.char[rm.count]
+	rm.count++
+
+	return string(s)
+}
+
+// vecGroup
+type vecGroup struct {
+	ID       string
+	Name     string
+	Nodes    []parser.Node
+	StartPos int
+	EndPos   int
 }
 
 // queryPromQLExpr
@@ -246,6 +281,17 @@ func (sp *queryPromQLExpr) queryTs() (*QueryTs, error) {
 						vargsList = append(vargsList, at.Val)
 					case *parser.StringLiteral:
 						vargsList = append(vargsList, at.Val)
+					case *parser.BinaryExpr:
+						expr, err := govaluate.NewEvaluableExpression(at.String())
+						if err != nil {
+							return &QueryTs{}, err
+						}
+						result, err := expr.Evaluate(nil)
+						if err != nil {
+							return &QueryTs{}, err
+						}
+
+						vargsList = append(vargsList, result)
 					default:
 						continue
 					}
@@ -270,8 +316,18 @@ func (sp *queryPromQLExpr) queryTs() (*QueryTs, error) {
 						timeAggregation.VargsList = vargsList
 					}
 
-					// 如果是 matrix 类型，则需要写入到 timeAggregation 里
-					query.TimeAggregation = timeAggregation
+					// 只有第一层的时间聚合函数才放到 TimeAggregation 里面
+					if query.TimeAggregation.Function == "" {
+						query.TimeAggregation = timeAggregation
+					} else {
+						query.AggregateMethodList = append(query.AggregateMethodList, AggregateMethod{
+							Method:     timeAggregation.Function,
+							VArgsList:  timeAggregation.VargsList,
+							Window:     timeAggregation.Window,
+							IsSubQuery: timeAggregation.IsSubQuery,
+							Step:       timeAggregation.Step,
+						})
+					}
 				} else {
 					// 如果是 vector 类型，则需要写入到 aggregateMethodList 里
 					aggregateMethod := AggregateMethod{
@@ -283,6 +339,7 @@ func (sp *queryPromQLExpr) queryTs() (*QueryTs, error) {
 					}
 					query.AggregateMethodList = append(query.AggregateMethodList, aggregateMethod)
 				}
+
 			case *parser.AggregateExpr:
 				method := convertMethod(e.Op)
 				if method == "" {
@@ -350,19 +407,13 @@ func vectorQuery(
 		query = new(Query)
 	}
 	conds := make([]ConditionField, 0)
-	route, err := MakeRouteFromLBMatchOrMetricName(e.LabelMatchers)
+	route, matchers, err := MetricsToRouter(e.LabelMatchers...)
 	if err != nil {
 		return query, err
 	}
+	query.IsRegexp = route.IsRegexp()
 
-	for _, label := range e.LabelMatchers {
-		if label.Name == labels.MetricName {
-			if label.Type == labels.MatchRegexp {
-				query.IsRegexp = true
-			}
-			continue
-		}
-
+	for _, label := range matchers {
 		// bk_database, bk_measurement 2个系统 label 需要过滤
 		if label.Name == bkDatabaseLabelName || label.Name == bkMeasurementLabelName {
 			continue
@@ -414,4 +465,52 @@ func vectorQuery(
 	query.VectorOffset = e.Offset
 
 	return query, nil
+}
+
+// convertOp
+func convertOp(op labels.MatchType) string {
+	switch op {
+	case labels.MatchEqual:
+		return ConditionEqual
+	case labels.MatchNotEqual:
+		return ConditionNotEqual
+	case labels.MatchRegexp:
+		return ConditionRegEqual
+	case labels.MatchNotRegexp:
+		return ConditionNotRegEqual
+	default:
+		return ""
+	}
+}
+
+// convertMethod
+func convertMethod(t parser.ItemType) string {
+	switch t {
+	case parser.COUNT:
+		return CountAggName
+	case parser.MAX:
+		return MaxAggName
+	case parser.MIN:
+		return MinAggName
+	case parser.AVG:
+		return MeanAggName
+	case parser.SUM:
+		return SumAggName
+	case parser.BOTTOMK:
+		return BottomKAggName
+	case parser.TOPK:
+		return TopkAggName
+	case parser.QUANTILE:
+		return QuantileAggName
+	case parser.GROUP:
+		return GroupAggName
+	case parser.STDDEV:
+		return StddevAggName
+	case parser.STDVAR:
+		return StdvarAggName
+	case parser.COUNT_VALUES:
+		return CountValuesAggName
+	}
+
+	return ""
 }

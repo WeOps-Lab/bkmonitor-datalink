@@ -11,6 +11,7 @@ package influxdb
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -21,6 +22,30 @@ type FieldToResultTable map[string]ResultTableList
 type DataLabelToResultTable map[string]ResultTableList
 
 type ResultTableDetailInfo map[string]*ResultTableDetail
+
+//go:generate msgp -tests=false
+type BkAppSpace map[string]*SpaceUIDList
+
+type SpaceUIDList []string
+
+func (z *SpaceUIDList) Marshal(b []byte) (o []byte, err error) {
+	return z.MarshalMsg(b)
+}
+
+func (z *SpaceUIDList) Unmarshal(bts []byte) (o []byte, err error) {
+	return z.UnmarshalMsg(bts)
+}
+
+func (z *SpaceUIDList) Print() string {
+	return fmt.Sprintf("%+v", *z)
+}
+
+func (z *SpaceUIDList) Length() int {
+	return len(*z)
+}
+
+func (z *SpaceUIDList) Fill(key string) {
+}
 
 //go:generate msgp -tests=false
 type Space map[string]*SpaceResultTable
@@ -36,19 +61,41 @@ type SpaceResultTable struct {
 //go:generate msgp -tests=false
 type ResultTableList []string
 
+type TimeField struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+	Unit string `json:"unit"`
+}
+
+type Record struct {
+	StorageID  int64 `json:"storage_id,omitempty"`
+	EnableTime int64 `json:"enable_time,omitempty"`
+}
+
 //go:generate msgp -tests=false
 type ResultTableDetail struct {
-	StorageId       int64    `json:"storage_id"`
-	ClusterName     string   `json:"cluster_name"`
-	DB              string   `json:"db"`
-	TableId         string   `json:"table_id"`
-	Measurement     string   `json:"measurement"`
-	VmRt            string   `json:"vm_rt"`
-	Fields          []string `json:"fields"`
-	MeasurementType string   `json:"measurement_type"`
-	BcsClusterID    string   `json:"bcs_cluster_id"`
-	DataLabel       string   `json:"data_label"`
-	TagsKey         []string `json:"tags_key"`
+	StorageId             int64    `json:"storage_id"`
+	StorageName           string   `json:"storage_name"`
+	StorageType           string   `json:"storage_type"`
+	StorageClusterRecords []Record `json:"storage_cluster_records"`
+	ClusterName           string   `json:"cluster_name"`
+	DB                    string   `json:"db"`
+	TableId               string   `json:"table_id"`
+	Measurement           string   `json:"measurement"`
+	VmRt                  string   `json:"vm_rt"`
+	Fields                []string `json:"fields"`
+	MeasurementType       string   `json:"measurement_type"`
+	BcsClusterID          string   `json:"bcs_cluster_id"`
+	DataLabel             string   `json:"data_label"`
+	TagsKey               []string `json:"tags_key"`
+	DataId                int64    `json:"bk_data_id"`
+	SourceType            string   `json:"source_type"`
+	Options               struct {
+		// 自定义时间聚合字段
+		TimeField TimeField `json:"time_field"`
+		// db 是否拼接时间格式
+		NeedAddTime bool `json:"need_add_time"`
+	} `json:"options"`
 }
 
 func (ss StableSpace) Len() int {
@@ -78,12 +125,26 @@ func (s *Space) Length() int {
 
 // Marshal 由于 Space 是无序字典，无法保证每一次的序列化的内容是稳定的，需要在序列化过程中，将其转换为有序的切片对象
 func (s *Space) Marshal(b []byte) (o []byte, err error) {
-	return s.MarshalMsg(b)
+	ss := StableSpace{}
+	for _, table := range *s {
+		ss = append(ss, table)
+	}
+	// 排序保证结构稳定
+	sort.Sort(ss)
+	return (&ss).MarshalMsg(b)
 }
 
 // Unmarshal 由于 Space 是无序字典，内部存的是切片对象 StableSpace，反序列化过程需要做对象转换
 func (s *Space) Unmarshal(bts []byte) (o []byte, err error) {
-	return s.UnmarshalMsg(bts)
+	ss := StableSpace{}
+	o, err = (&ss).UnmarshalMsg(bts)
+	if err != nil {
+		return
+	}
+	for _, table := range ss {
+		(*s)[table.TableId] = table
+	}
+	return
 }
 
 func (s *Space) Fill(key string) {

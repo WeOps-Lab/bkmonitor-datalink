@@ -17,54 +17,50 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/common/define"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/common/filewatcher"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/config"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/configs"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/operator"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/logger"
 )
 
-// runCmd represents the run command
 var runCmd = &cobra.Command{
 	Use:   "run",
-	Short: "start program as operator mode",
-	Long:  `bkmonitor-operator watches serviceMonitor, podMonitor and probe resource from kubernetes and dispatches tasks to workers`,
+	Short: "Start app as operator mode",
+	Long:  `Operator lists/watches resources from kubernetes then dispatches tasks to workers`,
 	Run: func(cmd *cobra.Command, args []string) {
-		waitUntil, err := filewatcher.AddPath(config.CustomConfigFilePath)
+		waitUntil, err := filewatcher.AddPath(define.ConfigFilePath)
 		if err != nil {
-			logger.Errorf("watch config file [%s] failed, error: %s", config.CustomConfigFilePath, err)
-			os.Exit(1)
+			logger.Fatalf("watch config file %s failed: %s", define.ConfigFilePath, err)
 		}
 		defer filewatcher.Stop()
 
 		sigChan := make(chan os.Signal, 1)
 		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-		logger.Infof("waiting file [%s] to be updated", config.CustomConfigFilePath)
+		logger.Infof("loading config %s", define.ConfigFilePath)
 		<-waitUntil
-		logger.Info("operator is ready to work")
+		logger.Infof("loaded config %s finished", define.ConfigFilePath)
 
-		if err := config.InitConfig(); err != nil {
-			logger.Errorf("failed to load config: %v", err)
-			os.Exit(1)
+		if err := configs.Load(define.ConfigFilePath); err != nil {
+			logger.Fatalf("failed to load config %s: %s", define.ConfigFilePath, err)
 		}
 
 		var reloadTotal int
 	Outer:
 		for {
 			ctx, cancel := context.WithCancel(context.Background())
-			opr, err := operator.NewOperator(ctx, operator.BuildInfo{
+			mgr, err := operator.New(ctx, operator.BuildInfo{
 				Version: Version,
 				GitHash: GitHash,
 				Time:    BuildTime,
 			})
 			if err != nil {
-				logger.Errorf("crate operator failed, error: %s", err)
-				os.Exit(1)
+				logger.Fatalf("crate operator failed: %s", err)
 			}
 
-			if err = opr.Run(); err != nil {
-				logger.Errorf("run operator failed, error: %s", err)
-				os.Exit(1)
+			if err = mgr.Run(); err != nil {
+				logger.Fatalf("run operator failed: %s", err)
 			}
 
 			for {
@@ -73,19 +69,18 @@ var runCmd = &cobra.Command{
 					reloadTotal++
 					// 运行过程中重载配置出现错误 则忽略
 					logger.Infof("reload operator count: %d", reloadTotal)
-					if err := config.InitConfig(); err != nil {
-						logger.Errorf("[ignore] failed to load config: %v", err)
+					if err := configs.Load(define.ConfigFilePath); err != nil {
+						logger.Warnf("[ignore] failed to load config: %v", err)
 						continue
 					}
 
 					cancel()
-					opr.Stop()
+					mgr.Stop()
 					goto Outer
 
 				case <-sigChan:
-					logger.Info("receive terminal signal")
 					cancel()
-					opr.Stop()
+					mgr.Stop()
 					return
 				}
 			}

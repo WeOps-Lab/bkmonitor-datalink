@@ -10,15 +10,26 @@
 package operator
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/common/define"
 )
 
 var (
-	appUptime = prometheus.NewCounter(
+	clusterVersion = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: define.MonitorNamespace,
+			Name:      "cluster_version",
+			Help:      "kubernetes server version",
+		},
+		[]string{"version"},
+	)
+
+	appUptime = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: define.MonitorNamespace,
 			Name:      "uptime",
@@ -26,7 +37,7 @@ var (
 		},
 	)
 
-	appBuildInfo = prometheus.NewGaugeVec(
+	appBuildInfo = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: define.MonitorNamespace,
 			Name:      "build_info",
@@ -35,164 +46,96 @@ var (
 		[]string{"version", "git_hash", "build_time"},
 	)
 
-	activeChildConfigCount = prometheus.NewGaugeVec(
+	nodeConfigCount = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: define.MonitorNamespace,
-			Name:      "active_config_count",
-			Help:      "active child config count",
+			Name:      "node_config_count",
+			Help:      "node configs count",
 		},
 		[]string{"node"},
 	)
 
-	activeSharedDiscoveryCount = prometheus.NewGauge(
+	monitorEndpointCount = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: define.MonitorNamespace,
-			Name:      "active_shared_discovery_count",
-			Help:      "active shared discovery count",
+			Name:      "monitor_endpoint_count",
+			Help:      "monitor endpoint count",
 		},
+		[]string{"name"},
 	)
 
-	activeMonitorResourceCount = prometheus.NewGaugeVec(
+	resourceCount = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: define.MonitorNamespace,
-			Name:      "active_monitor_resource_count",
-			Help:      "active monitor resource count",
+			Name:      "resource_count",
+			Help:      "resource count",
 		},
-		[]string{"kind"},
+		[]string{"resource"},
 	)
 
-	receivedEventTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
+	sharedDiscoveryCount = promauto.NewGauge(
+		prometheus.GaugeOpts{
 			Namespace: define.MonitorNamespace,
-			Name:      "received_event_total",
-			Help:      "received kubernetes event total",
+			Name:      "shared_discovery_count",
+			Help:      "shared discovery count",
 		},
-		[]string{"monitor_kind", "action"},
 	)
 
-	handledEventTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
+	discoverCount = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
 			Namespace: define.MonitorNamespace,
-			Name:      "handled_event_total",
-			Help:      "handled kubernetes event total",
+			Name:      "discover_count",
+			Help:      "discover count",
 		},
-		[]string{"monitor_kind", "action"},
+		[]string{"type"},
 	)
 
-	handledEventDuration = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Namespace: define.MonitorNamespace,
-			Name:      "handled_event_duration_seconds",
-			Help:      "handled kubernetes event duration seconds",
-			Buckets:   define.DefObserveDuration,
-		},
-		[]string{"monitor_kind", "action"},
-	)
-
-	handledSecretSuccessTotal = prometheus.NewCounterVec(
+	handledSecretSuccessTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: define.MonitorNamespace,
 			Name:      "handled_secret_success_total",
 			Help:      "handled secret success total",
 		},
-		[]string{"secret_name", "action"},
+		[]string{"secret", "action"},
 	)
 
-	handledSecretFailedTotal = prometheus.NewCounterVec(
+	handledSecretFailedTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: define.MonitorNamespace,
 			Name:      "handled_secret_failed_total",
 			Help:      "handled secret failed total",
 		},
-		[]string{"secret_name", "action"},
-	)
-	skippedSecretTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: define.MonitorNamespace,
-			Name:      "skipped_secret_total",
-			Help:      "skipped_secret_total",
-		},
-		[]string{"task_type", "secret_name"},
+		[]string{"secret", "action"},
 	)
 
-	dispatchedTaskTotal = prometheus.NewCounter(
+	dispatchedTaskTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: define.MonitorNamespace,
 			Name:      "dispatched_task_total",
 			Help:      "dispatched task total",
 		},
+		[]string{"trigger"},
 	)
 
-	dispatchedTaskDuration = prometheus.NewHistogram(
+	dispatchedTaskDuration = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: define.MonitorNamespace,
 			Name:      "dispatched_task_duration_seconds",
 			Help:      "dispatched task duration seconds",
 			Buckets:   define.DefObserveDuration,
 		},
+		[]string{"trigger"},
 	)
 
-	compressedConfigFailedTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: define.MonitorNamespace,
-			Name:      "compressed_config_failed_total",
-			Help:      "compressed config failed total",
-		},
-		[]string{"task_type", "secret_name"},
-	)
-
-	handledDiscoverNotifyTotal = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Namespace: define.MonitorNamespace,
-			Name:      "handled_discover_notify_total",
-			Help:      "handled discover notify total",
-		},
-	)
-
-	handledDataIDWatcherNotifyTotal = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Namespace: define.MonitorNamespace,
-			Name:      "handled_dataid_watcher_notify_total",
-			Help:      "handled dataid watcher notify total",
-		},
-	)
-
-	reloadedDiscoverDuration = prometheus.NewHistogram(
-		prometheus.HistogramOpts{
-			Namespace: define.MonitorNamespace,
-			Name:      "reloaded_discover_duration_seconds",
-			Help:      "reloaded discover duration seconds",
-			Buckets:   define.DefObserveDuration,
-		},
-	)
-
-	activeSecretFileCount = prometheus.NewGaugeVec(
+	statefulSetWorkerCount = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: define.MonitorNamespace,
-			Name:      "active_secret_file_count",
-			Help:      "active secret file count",
-		},
-		[]string{"task_type", "secret_name"},
-	)
-
-	activeSecretBytes = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: define.MonitorNamespace,
-			Name:      "active_secret_bytes",
-			Help:      "active secret bytes",
-		},
-		[]string{"task_type", "secret_name"},
-	)
-
-	secretsExceeded = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Namespace: define.MonitorNamespace,
-			Name:      "secrets_exceeded",
-			Help:      "secrets exceeded",
+			Name:      "statefulset_workers",
+			Help:      "statefulset workers count",
 		},
 	)
 
-	scaledStatefulSetFailedTotal = prometheus.NewCounter(
+	scaledStatefulSetFailedTotal = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: define.MonitorNamespace,
 			Name:      "scaled_statefulset_failed_total",
@@ -200,7 +143,7 @@ var (
 		},
 	)
 
-	scaledStatefulSetSuccessTotal = prometheus.NewCounter(
+	scaledStatefulSetSuccessTotal = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: define.MonitorNamespace,
 			Name:      "scaled_statefulset_success_total",
@@ -208,33 +151,6 @@ var (
 		},
 	)
 )
-
-func init() {
-	prometheus.MustRegister(
-		appUptime,
-		appBuildInfo,
-		activeChildConfigCount,
-		activeSharedDiscoveryCount,
-		activeMonitorResourceCount,
-		activeSecretFileCount,
-		activeSecretBytes,
-		receivedEventTotal,
-		handledEventTotal,
-		handledEventDuration,
-		handledSecretSuccessTotal,
-		handledSecretFailedTotal,
-		handledDiscoverNotifyTotal,
-		handledDataIDWatcherNotifyTotal,
-		reloadedDiscoverDuration,
-		skippedSecretTotal,
-		dispatchedTaskTotal,
-		dispatchedTaskDuration,
-		compressedConfigFailedTotal,
-		secretsExceeded,
-		scaledStatefulSetFailedTotal,
-		scaledStatefulSetSuccessTotal,
-	)
-}
 
 // BuildInfo 代表程序构建信息
 type BuildInfo struct {
@@ -248,107 +164,54 @@ func newMetricMonitor() *metricMonitor {
 }
 
 type metricMonitor struct {
-	receivedK8sEvent int
-	handledK8sEvent  int
-
-	handledSecretFailed      int       // 记录 secrets 处理失败次数
-	handledSecretFailedTime  time.Time // 记录 secrets 处理失败时间
-	handledSecretSuccessTime time.Time // 记录 secrets 处理成功时间
+	secretFailedCounter int    // 记录 secrets 处理失败次数
+	secretLastError     string // 记录 secrets 处理 error
 }
 
-// UpdateUptime 更新进程活跃时间
 func (m *metricMonitor) UpdateUptime(n int) {
 	appUptime.Add(float64(n))
 }
 
-// SetAppBuildInfo 更新进程构建信息
 func (m *metricMonitor) SetAppBuildInfo(info BuildInfo) {
 	appBuildInfo.WithLabelValues(info.Version, info.GitHash, info.Time).Set(1)
 }
 
-// SetActiveChildConfigCount 记录活跃子配置数量
-func (m *metricMonitor) SetActiveChildConfigCount(node string, n int) {
-	activeChildConfigCount.WithLabelValues(node).Set(float64(n))
+func (m *metricMonitor) SetNodeConfigCount(node string, n int) {
+	nodeConfigCount.WithLabelValues(node).Set(float64(n))
 }
 
-// SetActiveSharedDiscoveryCount 记录活跃 sharedDiscovery 数量
-func (m *metricMonitor) SetActiveSharedDiscoveryCount(n int) {
-	activeSharedDiscoveryCount.Set(float64(n))
+func (m *metricMonitor) SetMonitorEndpointCount(name string, n int) {
+	monitorEndpointCount.WithLabelValues(name).Set(float64(n))
 }
 
-// SetActiveMonitorResourceCount 记录活跃监控资源数量
-func (m *metricMonitor) SetActiveMonitorResourceCount(kind string, n int) {
-	activeMonitorResourceCount.WithLabelValues(kind).Set(float64(n))
+func (m *metricMonitor) SetResourceCount(resource string, n int) {
+	resourceCount.WithLabelValues(resource).Set(float64(n))
 }
 
-// IncReceivedEventCounter 增加接收 k8s 事件计数器
-func (m *metricMonitor) IncReceivedEventCounter(monitorKing, action string) {
-	m.receivedK8sEvent++
-	receivedEventTotal.WithLabelValues(monitorKing, action).Inc()
+func (m *metricMonitor) SetSharedDiscoveryCount(n int) {
+	sharedDiscoveryCount.Set(float64(n))
 }
 
-// IncHandledEventCounter 递增处理 k8s 事件计数器
-func (m *metricMonitor) IncHandledEventCounter(monitorKing, action string) {
-	m.handledK8sEvent++
-	handledEventTotal.WithLabelValues(monitorKing, action).Inc()
+func (m *metricMonitor) SetDiscoverCount(typ string, n int) {
+	discoverCount.WithLabelValues(typ).Set(float64(n))
 }
 
-// ObserveHandledEventDuration 观测 k8s 事件处理耗时
-func (m *metricMonitor) ObserveHandledEventDuration(t time.Time, monitorKing, action string) {
-	handledEventDuration.WithLabelValues(monitorKing, action).Observe(time.Since(t).Seconds())
-}
-
-// IncHandledSecretSuccessCounter 递增 secrets 处理成功计数器
 func (m *metricMonitor) IncHandledSecretSuccessCounter(name, action string) {
-	m.handledSecretSuccessTime = time.Now()
 	handledSecretSuccessTotal.WithLabelValues(name, action).Inc()
 }
 
-// IncHandledSecretFailedCounter 递增 secrets 处理失败计数器
-func (m *metricMonitor) IncHandledSecretFailedCounter(name, action string) {
-	m.handledSecretFailed++
-	m.handledSecretFailedTime = time.Now()
+func (m *metricMonitor) IncHandledSecretFailedCounter(name, action string, err error) {
+	m.secretFailedCounter++
+	m.secretLastError = fmt.Sprintf("%s\t%s", time.Now().Format(time.RFC3339), err)
 	handledSecretFailedTotal.WithLabelValues(name, action).Inc()
 }
 
-func (m *metricMonitor) IncHandledDiscoverNotifyCounter() {
-	handledDiscoverNotifyTotal.Inc()
+func (m *metricMonitor) IncDispatchedTaskCounter(trigger string) {
+	dispatchedTaskTotal.WithLabelValues(trigger).Inc()
 }
 
-func (m *metricMonitor) IncHandledDataIDWatcherNotifyCounter() {
-	handledDataIDWatcherNotifyTotal.Inc()
-}
-
-func (m *metricMonitor) ObserveReloadedDiscoverDuration(t time.Time) {
-	reloadedDiscoverDuration.Observe(time.Since(t).Seconds())
-}
-
-func (m *metricMonitor) SetActiveSecretFileCount(taskType, secretName string, count int) {
-	activeSecretFileCount.WithLabelValues(taskType, secretName).Set(float64(count))
-}
-
-func (m *metricMonitor) SetActiveSecretBytes(taskType, secretName string, n int) {
-	activeSecretBytes.WithLabelValues(taskType, secretName).Set(float64(n))
-}
-
-func (m *metricMonitor) IncSecretsExceededCounter() {
-	secretsExceeded.Inc()
-}
-
-func (m *metricMonitor) IncSkippedSecretCounter(taskType, secretName string) {
-	skippedSecretTotal.WithLabelValues(taskType, secretName).Inc()
-}
-
-func (m *metricMonitor) IncDispatchedTaskCounter() {
-	dispatchedTaskTotal.Inc()
-}
-
-func (m *metricMonitor) ObserveDispatchedTaskDuration(t time.Time) {
-	dispatchedTaskDuration.Observe(time.Since(t).Seconds())
-}
-
-func (m *metricMonitor) IncCompressedConfigFailedCounter(taskType, secretName string) {
-	compressedConfigFailedTotal.WithLabelValues(taskType, secretName).Inc()
+func (m *metricMonitor) ObserveDispatchedTaskDuration(trigger string, t time.Time) {
+	dispatchedTaskDuration.WithLabelValues(trigger).Observe(time.Since(t).Seconds())
 }
 
 func (m *metricMonitor) IncScaledStatefulSetFailedCounter() {
@@ -357,4 +220,12 @@ func (m *metricMonitor) IncScaledStatefulSetFailedCounter() {
 
 func (m *metricMonitor) IncScaledStatefulSetSuccessCounter() {
 	scaledStatefulSetSuccessTotal.Inc()
+}
+
+func (m *metricMonitor) SetStatefulSetWorkerCount(count int) {
+	statefulSetWorkerCount.Set(float64(count))
+}
+
+func (m *metricMonitor) SetKubernetesVersion(v string) {
+	clusterVersion.WithLabelValues(v).Set(1)
 }

@@ -10,10 +10,17 @@
 package objectsref
 
 import (
-	"bytes"
-)
+	"fmt"
+	"io"
+	"regexp"
+	"strconv"
+	"strings"
 
-// NOTE: 实验性功能（Experimental）后续可能会持续迭代 或者删除
+	corev1 "k8s.io/api/core/v1"
+
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/common/promfmt"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/common/utils"
+)
 
 const (
 	relationNodeSystem           = "node_with_system_relation"
@@ -23,133 +30,339 @@ const (
 	relationPodStatefulset       = "pod_with_statefulset_relation"
 	relationDaemonsetPod         = "daemonset_with_pod_relation"
 	relationDeploymentReplicaset = "deployment_with_replicaset_relation"
+	relationContainerPod         = "container_with_pod_relation"
+	relationPodService           = "pod_with_service_relation"
+	relationK8sAddressService    = "k8s_address_with_service_relation"
+	relationDomainService        = "domain_with_service_relation"
+	relationIngressService       = "ingress_with_service_relation"
 
-	// TODO(mando): 待实现
-	relationEndpointPod            = "endpoint_with_pod_relation"
-	relationEndpointService        = "endpoint_with_service_relation"
-	relationIngressServiceRelation = "ingress_with_service_relation"
+	relationContainerWithDataSource   = "container_with_datasource_relation"
+	relationDataSourceWithPod         = "datasource_with_pod_relation"
+	relationDataSourceWithNode        = "datasource_with_node_relation"
+	relationBkLogConfigWithDataSource = "bklogconfig_with_datasource_relation"
 )
 
-type RelationMetric struct {
-	Name      string
-	Dimension map[string]string
-}
-
-func (oc *ObjectsController) GetNodeRelation() []RelationMetric {
-	var metrics []RelationMetric
+func (oc *ObjectsController) WriteNodeRelations(w io.Writer) {
 	for node, ip := range oc.nodeObjs.Addrs() {
-		metrics = append(metrics, RelationMetric{
+		promfmt.FmtBytes(w, promfmt.Metric{
 			Name: relationNodeSystem,
-			Dimension: map[string]string{
-				"node":         node,
-				"bk_target_ip": ip,
+			Labels: []promfmt.Label{
+				{Name: "node", Value: node},
+				{Name: "bk_target_ip", Value: ip},
 			},
 		})
 	}
-	return metrics
 }
 
-func (oc *ObjectsController) GetReplicasetRelation() []RelationMetric {
-	var metrics []RelationMetric
+func (oc *ObjectsController) WriteServiceRelations(w io.Writer) {
+	oc.serviceObjs.Range(func(namespace string, services serviceEntities) {
+		pods := oc.podObjs.GetByNamespace(namespace)
+		for _, svc := range services {
+			if len(svc.selector) > 0 {
+				for _, pod := range pods {
+					if !utils.MatchSubLabels(svc.selector, pod.Labels) {
+						continue
+					}
+					promfmt.FmtBytes(w, promfmt.Metric{
+						Name: relationPodService,
+						Labels: []promfmt.Label{
+							{Name: "namespace", Value: namespace},
+							{Name: "service", Value: svc.name},
+							{Name: "pod", Value: pod.ID.Name},
+						},
+					})
+				}
+			}
+
+			for _, addr := range svc.externalIPs {
+				promfmt.FmtBytes(w, promfmt.Metric{
+					Name: relationK8sAddressService,
+					Labels: []promfmt.Label{
+						{Name: "namespace", Value: svc.namespace},
+						{Name: "service", Value: svc.name},
+						{Name: "address", Value: addr},
+					},
+				})
+			}
+
+			oc.ingressObjs.Range(namespace, func(name string, ingress ingressEntity) {
+				for _, s := range ingress.services {
+					if s != svc.name {
+						continue
+					}
+					promfmt.FmtBytes(w, promfmt.Metric{
+						Name: relationIngressService,
+						Labels: []promfmt.Label{
+							{Name: "namespace", Value: svc.namespace},
+							{Name: "service", Value: svc.name},
+							{Name: "ingress", Value: name},
+						},
+					})
+				}
+			})
+
+			switch svc.kind {
+			case string(corev1.ServiceTypeExternalName):
+				eps, ok := oc.endpointsObjs.getEndpoints(svc.namespace, svc.name)
+				if !ok {
+					promfmt.FmtBytes(w, promfmt.Metric{
+						Name: relationDomainService,
+						Labels: []promfmt.Label{
+							{Name: "namespace", Value: svc.namespace},
+							{Name: "service", Value: svc.name},
+							{Name: "domain", Value: svc.externalName},
+						},
+					})
+				} else {
+					for _, addr := range eps.addresses {
+						promfmt.FmtBytes(w, promfmt.Metric{
+							Name: relationK8sAddressService,
+							Labels: []promfmt.Label{
+								{Name: "namespace", Value: svc.namespace},
+								{Name: "service", Value: svc.name},
+								{Name: "address", Value: addr},
+							},
+						})
+					}
+				}
+
+			case string(corev1.ServiceTypeLoadBalancer):
+				for _, addr := range svc.loadBalancerIPs {
+					promfmt.FmtBytes(w, promfmt.Metric{
+						Name: relationK8sAddressService,
+						Labels: []promfmt.Label{
+							{Name: "namespace", Value: svc.namespace},
+							{Name: "service", Value: svc.name},
+							{Name: "address", Value: addr},
+						},
+					})
+				}
+			}
+		}
+	})
+}
+
+func (oc *ObjectsController) WriteReplicasetRelations(w io.Writer) {
 	for _, rs := range oc.replicaSetObjs.GetAll() {
 		ownerRef := LookupOnce(rs.ID, oc.replicaSetObjs, oc.objsMap())
 		if ownerRef == nil {
 			continue
 		}
 
-		dims := map[string]string{
-			"replicaset": rs.ID.Name,
-			"namespace":  rs.ID.Namespace,
+		labels := []promfmt.Label{
+			{Name: "namespace", Value: rs.ID.Namespace},
+			{Name: "replicaset", Value: rs.ID.Name},
 		}
 
 		switch ownerRef.Kind {
 		case kindDeployment:
-			dims["deployment"] = ownerRef.Name
-			metrics = append(metrics, RelationMetric{
-				Name:      relationDeploymentReplicaset,
-				Dimension: dims,
+			labels = append(labels, promfmt.Label{
+				Name:  "deployment",
+				Value: ownerRef.Name,
+			})
+			promfmt.FmtBytes(w, promfmt.Metric{
+				Name:   relationDeploymentReplicaset,
+				Labels: labels,
 			})
 		}
 	}
-	return metrics
 }
 
-func (oc *ObjectsController) GetPodRelation() []RelationMetric {
-	var metrics []RelationMetric
+func (oc *ObjectsController) WriteDataSourceRelations(w io.Writer) {
+	pods := oc.podObjs.GetAll()
+	nodes := oc.nodeObjs.GetAll()
+
+	oc.bkLogConfigObjs.Range(func(e *bkLogConfigEntity) {
+		promfmt.FmtBytes(w, promfmt.Metric{
+			Name: relationBkLogConfigWithDataSource,
+			Labels: []promfmt.Label{
+				{Name: "bk_data_id", Value: fmt.Sprintf("%d", e.Obj.Spec.DataId)},
+				{Name: "bklogconfig_namespace", Value: e.Obj.Namespace},
+				{Name: "bklogconfig_name", Value: e.Obj.Name},
+			},
+		})
+
+		switch e.Obj.Spec.LogConfigType {
+		case logConfigTypeStd, logConfigTypeContainer:
+			for _, pod := range pods {
+				if !e.MatchNamespace(pod.ID.Namespace) {
+					continue
+				}
+
+				if !e.Obj.Spec.AllContainer {
+					if !e.MatchLabel(pod.Labels) {
+						continue
+					}
+
+					if !e.MatchAnnotation(pod.Annotations) {
+						continue
+					}
+
+					if !e.MatchWorkload(pod.Labels, pod.Annotations, pod.OwnerRefs) {
+						continue
+					}
+				}
+
+				podRelationStatus := false
+				for _, container := range pod.Containers {
+					if !e.Obj.Spec.AllContainer {
+						if !e.MatchContainerName(container.Name) {
+							continue
+						}
+					}
+					podRelationStatus = true
+				}
+
+				// 只需要上报到 pod 层级就够了
+				if podRelationStatus {
+					promfmt.FmtBytes(w, promfmt.Metric{
+						Name: relationDataSourceWithPod,
+						Labels: []promfmt.Label{
+							{Name: "bk_data_id", Value: fmt.Sprintf("%d", e.Obj.Spec.DataId)},
+							{Name: "namespace", Value: pod.ID.Namespace},
+							{Name: "pod", Value: pod.ID.Name},
+						},
+					})
+				}
+			}
+
+		case logConfigTypeNode:
+			for _, node := range nodes {
+				if !e.MatchLabel(node.GetLabels()) {
+					continue
+				}
+
+				if !e.MatchAnnotation(node.GetAnnotations()) {
+					continue
+				}
+
+				promfmt.FmtBytes(w, promfmt.Metric{
+					Name: relationDataSourceWithNode,
+					Labels: []promfmt.Label{
+						{Name: "bk_data_id", Value: fmt.Sprintf("%d", e.Obj.Spec.DataId)},
+						{Name: "node", Value: node.Name},
+					},
+				})
+			}
+		}
+	})
+}
+
+type StatefulSetWorker struct {
+	PodIP string
+	Index int
+}
+
+func (oc *ObjectsController) FetchPodEvents(rv int) ([]PodEvent, int) {
+	return oc.podObjs.FetchEvents(rv)
+}
+
+func (oc *ObjectsController) GetPods(s string) map[string]StatefulSetWorker {
+	regex, err := regexp.Compile(s)
+	if err != nil {
+		return nil
+	}
+
+	// bkm-statefulset-worker-0 => [0]
+	parseIndex := func(s string) int {
+		parts := strings.Split(s, "-")
+		if len(parts) <= 0 {
+			return 0
+		}
+		last := parts[len(parts)-1]
+		index, _ := strconv.ParseInt(last, 10, 64)
+		return int(index)
+	}
+
+	items := make(map[string]StatefulSetWorker)
+	for _, pod := range oc.podObjs.GetAll() {
+		if regex.MatchString(pod.ID.String()) {
+			// 确保 podip 已经获取到
+			if pod.PodIP == "" {
+				continue
+			}
+			items[pod.PodIP] = StatefulSetWorker{
+				PodIP: pod.PodIP,
+				Index: parseIndex(pod.ID.Name),
+			}
+		}
+	}
+	return items
+}
+
+func (oc *ObjectsController) WritePodRelations(w io.Writer) {
 	for _, pod := range oc.podObjs.GetAll() {
 		ownerRef := LookupOnce(pod.ID, oc.podObjs, oc.objsMap())
 		if ownerRef == nil {
 			continue
 		}
 
-		metrics = append(metrics, RelationMetric{
+		promfmt.FmtBytes(w, promfmt.Metric{
 			Name: relationNodePod,
-			Dimension: map[string]string{
-				"node":      pod.NodeName,
-				"pod":       pod.ID.Name,
-				"namespace": pod.ID.Namespace,
+			Labels: []promfmt.Label{
+				{Name: "namespace", Value: pod.ID.Namespace},
+				{Name: "pod", Value: pod.ID.Name},
+				{Name: "node", Value: pod.NodeName},
 			},
 		})
 
-		dims := map[string]string{
-			"pod":       pod.ID.Name,
-			"namespace": pod.ID.Namespace,
+		// 遍历 containers
+		for _, container := range pod.Containers {
+			promfmt.FmtBytes(w, promfmt.Metric{
+				Name: relationContainerPod,
+				Labels: []promfmt.Label{
+					{Name: "namespace", Value: pod.ID.Namespace},
+					{Name: "pod", Value: pod.ID.Name},
+					{Name: "node", Value: pod.NodeName},
+					{Name: "container", Value: container.Name},
+				},
+			})
+		}
+
+		labels := []promfmt.Label{
+			{Name: "namespace", Value: pod.ID.Namespace},
+			{Name: "pod", Value: pod.ID.Name},
 		}
 		switch ownerRef.Kind {
 		case kindJob:
-			dims["job"] = ownerRef.Name
-			metrics = append(metrics, RelationMetric{
-				Name:      relationJobPod,
-				Dimension: dims,
+			labels = append(labels, promfmt.Label{
+				Name:  "job",
+				Value: ownerRef.Name,
+			})
+			promfmt.FmtBytes(w, promfmt.Metric{
+				Name:   relationJobPod,
+				Labels: labels,
 			})
 
 		case kindReplicaSet:
-			dims["replicaset"] = ownerRef.Name
-			metrics = append(metrics, RelationMetric{
-				Name:      relationPodReplicaset,
-				Dimension: dims,
+			labels = append(labels, promfmt.Label{
+				Name:  "replicaset",
+				Value: ownerRef.Name,
+			})
+			promfmt.FmtBytes(w, promfmt.Metric{
+				Name:   relationPodReplicaset,
+				Labels: labels,
 			})
 
 		case kindGameStatefulSet:
-			dims["statefulset"] = ownerRef.Name
-			metrics = append(metrics, RelationMetric{
-				Name:      relationPodStatefulset,
-				Dimension: dims,
+			labels = append(labels, promfmt.Label{
+				Name:  "statefulset",
+				Value: ownerRef.Name,
+			})
+			promfmt.FmtBytes(w, promfmt.Metric{
+				Name:   relationPodStatefulset,
+				Labels: labels,
 			})
 
 		case kindDaemonSet:
-			dims["daemonset"] = ownerRef.Name
-			metrics = append(metrics, RelationMetric{
-				Name:      relationDaemonsetPod,
-				Dimension: dims,
+			labels = append(labels, promfmt.Label{
+				Name:  "daemonset",
+				Value: ownerRef.Name,
+			})
+			promfmt.FmtBytes(w, promfmt.Metric{
+				Name:   relationDaemonsetPod,
+				Labels: labels,
 			})
 		}
 	}
-	return metrics
-}
-
-func RelationToPromFormat(metrics []RelationMetric) []byte {
-	var lines []byte
-	for _, metric := range metrics {
-		var buf bytes.Buffer
-		buf.WriteString(metric.Name)
-		buf.WriteString(`{`)
-
-		var n int
-		for k, v := range metric.Dimension {
-			if n > 0 {
-				buf.WriteString(`,`)
-			}
-			n++
-			buf.WriteString(k)
-			buf.WriteString(`="`)
-			buf.WriteString(v)
-			buf.WriteString(`"`)
-		}
-
-		buf.WriteString("} 1")
-		buf.WriteString("\n")
-		lines = append(lines, buf.Bytes()...)
-	}
-	return lines
 }

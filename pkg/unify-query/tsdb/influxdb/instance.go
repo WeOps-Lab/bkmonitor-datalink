@@ -11,7 +11,6 @@ package influxdb
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/url"
@@ -28,7 +27,6 @@ import (
 	promPromql "github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
 	promRemote "github.com/prometheus/prometheus/storage/remote"
-	oleltrace "go.opentelemetry.io/otel/trace"
 	"golang.org/x/time/rate"
 	"google.golang.org/grpc"
 
@@ -36,9 +34,11 @@ import (
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/curl"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/influxdb"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/influxdb/decoder"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/internal/json"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/log"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metric"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/query/structured"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/trace"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/tsdb"
 )
@@ -52,8 +52,6 @@ const (
 	ContentTypeMsgpack  = "application/x-msgpack"
 
 	ContentEncodingSnappy = "snappy"
-
-	BKTaskIndex = "bk_task_index"
 )
 
 var (
@@ -64,16 +62,12 @@ var (
 )
 
 // NewInstance 初始化引擎
-func NewInstance(ctx context.Context, opt Options) *Instance {
-	headers := map[string]string{}
-	if opt.Accept != "" {
-		headers[ContentType] = opt.Accept
-	}
-	if opt.AcceptEncoding != "" {
-		headers[ContentEncoding] = opt.AcceptEncoding
+func NewInstance(ctx context.Context, opt *Options) (*Instance, error) {
+	if opt.Host == "" {
+		return nil, fmt.Errorf("host is empty %+v", opt)
 	}
 
-	return &Instance{
+	inst := &Instance{
 		ctx:      ctx,
 		host:     opt.Host,
 		port:     opt.Port,
@@ -98,28 +92,34 @@ func NewInstance(ctx context.Context, opt Options) *Instance {
 		timeout: opt.Timeout,
 		curl:    opt.Curl,
 	}
+	return inst, nil
 }
 
 var _ tsdb.Instance = (*Instance)(nil)
 
+func (i *Instance) Check(ctx context.Context, promql string, start, end time.Time, step time.Duration) string {
+	return ""
+}
+
 // GetInstanceType 获取引擎类型
-func (i *Instance) GetInstanceType() string {
+func (i *Instance) InstanceType() string {
 	return consul.InfluxDBStorageType
 }
 
 func (i *Instance) QueryExemplar(ctx context.Context, fields []string, query *metadata.Query, start, end time.Time, matchers ...*labels.Matcher) (*decoder.Response, error) {
 	var (
-		cancel        context.CancelFunc
-		span          oleltrace.Span
+		cancel context.CancelFunc
+
 		startAnaylize time.Time
 
 		sLimitStr string
 		limitStr  string
+		err       error
+
+		res = new(decoder.Response)
 	)
-	ctx, span = trace.IntoContext(ctx, trace.TracerName, "influxdb-influxql-query-exemplar")
-	if span != nil {
-		defer span.End()
-	}
+	ctx, span := trace.NewSpan(ctx, "influxdb-influxql-query-exemplar")
+	defer span.End(&err)
 	startAnaylize = time.Now()
 
 	where := fmt.Sprintf("time > %d and time < %d", start.UnixNano(), end.UnixNano())
@@ -155,62 +155,55 @@ func (i *Instance) QueryExemplar(ctx context.Context, fields []string, query *me
 		"http", i.host, i.port, "query", values.Encode(),
 	)
 
-	trace.InsertStringIntoSpan("query-params", values.Encode(), span)
-	trace.InsertStringIntoSpan("http-url", urlPath, span)
+	span.Set("query-params", values.Encode())
+	span.Set("http-url", urlPath)
 
 	ctx, cancel = context.WithTimeout(ctx, i.timeout)
 	defer cancel()
 
 	user := metadata.GetUser(ctx)
-	trace.InsertStringIntoSpan("query-space-uid", user.SpaceUid, span)
-	trace.InsertStringIntoSpan("query-source", user.Source, span)
-	trace.InsertStringIntoSpan("query-username", user.Name, span)
-	trace.InsertStringIntoSpan("query-url-path", urlPath, span)
-	trace.InsertStringIntoSpan("query-q", influxql, span)
-	trace.InsertStringIntoSpan("query-db", query.DB, span)
-	trace.InsertStringIntoSpan("query-measurement", query.Measurement, span)
-	trace.InsertStringIntoSpan("query-field", query.Field, span)
-	trace.InsertStringIntoSpan("query-url-path", urlPath, span)
-	trace.InsertStringIntoSpan("query-where", where, span)
-	trace.InsertStringIntoSpan("query-cost", time.Since(startAnaylize).String(), span)
+	span.Set("query-space-uid", user.SpaceUid)
+	span.Set("query-source", user.Source)
+	span.Set("query-username", user.Name)
+	span.Set("query-url-path", urlPath)
+	span.Set("query-q", influxql)
+	span.Set("query-db", query.DB)
+	span.Set("query-measurement", query.Measurement)
+	span.Set("query-field", query.Field)
+	span.Set("query-url-path", urlPath)
+	span.Set("query-where", where)
+	span.Set("query-cost", time.Since(startAnaylize).String())
 
 	log.Debugf(ctx,
 		"influxdb query: %s, where: %s",
 		urlPath, where,
 	)
 
-	resp, err := i.curl.Request(
+	dec, err := decoder.GetDecoder(i.contentType)
+	if err != nil {
+		log.Errorf(ctx, "get decoder:%s error:%s", i.contentType, err)
+		return nil, err
+	}
+
+	i.curl.WithDecoder(func(ctx context.Context, reader io.Reader, resp interface{}) (int, error) {
+		dr := resp.(*decoder.Response)
+		return dec.Decode(ctx, reader, dr)
+	})
+
+	size, err := i.curl.Request(
 		ctx, curl.Get,
 		curl.Options{
 			UrlPath: urlPath,
-			Headers: map[string]string{
+			Headers: metadata.Headers(ctx, map[string]string{
 				ContentType: i.contentType,
-			},
+			}),
 			UserName: i.username,
 			Password: i.password,
 		},
+		res,
 	)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+	metric.TsDBRequestBytes(ctx, size, i.InstanceType())
 
-	respContentType := resp.Header.Get("Content-type")
-	dec, err := decoder.GetDecoder(respContentType)
-	if err != nil {
-		data, readErr := io.ReadAll(resp.Body)
-		if readErr != nil {
-			log.Errorf(ctx, "get decoder:%s error:%s and read error:%s", respContentType, err, readErr)
-			return nil, err
-		}
-		log.Errorf(ctx, "get decoder:%s error:%s,data in body:%s", respContentType, err, data)
-		return nil, err
-	}
-	res, err := dec.Decode(ctx, resp.Body)
-	if err != nil {
-		log.Errorf(ctx, "decoder:%s decode error:%s", respContentType, err)
-		return nil, err
-	}
 	return res, nil
 }
 
@@ -327,7 +320,7 @@ func (i *Instance) getLimitAndSlimit(limit, slimit int) (int64, int64) {
 		resultLimit = limit
 	}
 	if limit == 0 || limit > i.maxLimit {
-		if i.maxSLimit > 0 {
+		if i.maxLimit > 0 {
 			resultLimit = i.maxLimit + i.tolerance
 		}
 	}
@@ -344,60 +337,32 @@ func (i *Instance) getLimitAndSlimit(limit, slimit int) (int64, int64) {
 	return int64(resultLimit), int64(resultSLimit)
 }
 
-func (i *Instance) downSampleCheck(
-	ctx context.Context,
-	query *metadata.Query,
-	hints *storage.SelectHints,
-	matchers ...*labels.Matcher,
-) bool {
-	newFuncName, _, _ := query.GetDownSampleFunc(hints)
-	return newFuncName != ""
-}
-
-func (i *Instance) query(
-	ctx context.Context,
-	query *metadata.Query,
-	hints *storage.SelectHints,
-	withFieldTag bool,
-	matchers ...*labels.Matcher,
-) (*prompb.QueryResult, error) {
+func (i *Instance) makeSQL(
+	ctx context.Context, query *metadata.Query, start, end time.Time,
+) (string, error) {
 	var (
-		cancel        context.CancelFunc
-		span          oleltrace.Span
-		startAnaylize time.Time
+		selectList = make([]string, 0)
+		groupList  = make([]string, 0)
 
-		seriesNum = 0
-		pointNum  = 0
-
-		isCount   bool
-		sLimitStr string
-		limitStr  string
-		timezone  string
-
-		withTag     = ",*::tag"
-		aggField    string
-		groupingStr string
-
-		expandTag []prompb.Label
+		sqlBuilder strings.Builder
+		err        error
 	)
-	ctx, span = trace.IntoContext(ctx, trace.TracerName, "influxdb-influxql-query-raw")
-	if span != nil {
-		defer span.End()
+	ctx, span := trace.NewSpan(ctx, "influxdb-make-sqlBuilder")
+	defer span.End(&err)
+
+	if len(query.Aggregates) > 1 {
+		return "", fmt.Errorf("influxdb 不支持多函数聚合查询, %+v", query.Aggregates)
 	}
 
-	bkTaskIndex := query.TableID
-	if bkTaskIndex == "" {
-		bkTaskIndex = fmt.Sprintf("%s_%s", query.DB, query.Measurement)
-	}
-	if withFieldTag {
-		bkTaskIndex = bkTaskIndex + "_" + query.Field
-	}
-	newFuncName, window, dims := query.GetDownSampleFunc(hints)
-	if newFuncName != "" {
-		groupList := make([]string, 0, len(dims)+1)
-		if len(dims) > 0 {
-			for _, dim := range dims {
+	if len(query.Aggregates) == 1 {
+		agg := query.Aggregates[0]
+		if len(agg.Dimensions) > 0 {
+			for _, dim := range agg.Dimensions {
 				group := dim
+				if group == labels.MetricName {
+					continue
+				}
+
 				if group != "*" {
 					group = fmt.Sprintf(`"%s"`, group)
 				}
@@ -405,57 +370,77 @@ func (i *Instance) query(
 			}
 		}
 
-		if window > 0 {
-			groupList = append(groupList, "time("+window.String()+")")
-		}
-		if len(groupList) > 0 {
-			groupingStr = " group by " + strings.Join(groupList, ", ")
+		if agg.Window > 0 && !agg.Without {
+			groupList = append(groupList, "time("+agg.Window.String()+")")
 		}
 
-		isCount = newFuncName == metadata.COUNT
-		withTag = ""
-		aggField = fmt.Sprintf(`%s("%s")`, newFuncName, query.Field)
-
-		expandTag = []prompb.Label{
-			{
-				Name:  BKTaskIndex,
-				Value: bkTaskIndex,
-			},
+		// avg => mean
+		if agg.Name == structured.AVG {
+			agg.Name = structured.MEAN
 		}
+
+		selectList = append(selectList, fmt.Sprintf(`%s("%s") AS %s`, agg.Name, query.Field, influxdb.ResultColumnName))
 	} else {
-		aggField = fmt.Sprintf(`"%s"`, query.Field)
-		if withFieldTag {
-			expandTag = []prompb.Label{
-				{
-					Name:  BKTaskIndex,
-					Value: bkTaskIndex,
-				},
-			}
-		}
+		selectList = append(selectList, fmt.Sprintf(`"%s" AS %s`, query.Field, influxdb.ResultColumnName))
+		selectList = append(selectList, "*::tag")
 	}
+	selectList = append(selectList, fmt.Sprintf(`"time" AS %s`, influxdb.TimeColumnName))
 
-	where := fmt.Sprintf("time > %d and time < %d", hints.Start*1e6, hints.End*1e6)
+	sqlBuilder.WriteString("SELECT ")
+	sqlBuilder.WriteString(strings.Join(selectList, ", ") + " ")
+	sqlBuilder.WriteString("FROM " + influxql.QuoteIdent(query.Measurement) + " ")
+	sqlBuilder.WriteString("WHERE " + fmt.Sprintf("time > %d and time < %d", start.UnixNano(), end.UnixNano()))
 	if query.Condition != "" {
-		where = fmt.Sprintf("%s and %s", where, query.Condition)
+		sqlBuilder.WriteString(" AND (" + query.Condition + ")")
+	}
+	if len(groupList) > 0 {
+		sqlBuilder.WriteString(" GROUP BY " + strings.Join(groupList, ", "))
 	}
 
 	limit, slimit := i.getLimitAndSlimit(query.OffsetInfo.Limit, query.OffsetInfo.SLimit)
-
 	if limit > 0 {
-		sLimitStr = fmt.Sprintf(` slimit %d`, slimit)
+		sqlBuilder.WriteString(fmt.Sprintf(` LIMIT %d`, limit))
 	}
 	if slimit > 0 {
-		limitStr = fmt.Sprintf(` limit %d`, limit)
+		sqlBuilder.WriteString(fmt.Sprintf(` SLIMIT %d`, slimit))
 	}
 	if query.Timezone != "" {
-		timezone = fmt.Sprintf(` tz('%s')`, query.Timezone)
+		sqlBuilder.WriteString(fmt.Sprintf(` TZ('%s')`, query.Timezone))
 	}
 
-	sql := fmt.Sprintf(
-		"select %s as %s, time as %s%s from %s where %s %s%s%s%s",
-		aggField, influxdb.ResultColumnName, influxdb.TimeColumnName, withTag, influxql.QuoteIdent(query.Measurement),
-		where, groupingStr, limitStr, sLimitStr, timezone,
+	return sqlBuilder.String(), nil
+}
+
+func (i *Instance) query(
+	ctx context.Context,
+	query *metadata.Query,
+	start time.Time,
+	end time.Time,
+	withFieldTag bool,
+) (*prompb.QueryResult, error) {
+	var (
+		cancel context.CancelFunc
+
+		startAnaylize time.Time
+
+		seriesNum = 0
+		pointNum  = 0
+
+		err error
+
+		res = new(decoder.Response)
 	)
+	ctx, span := trace.NewSpan(ctx, "influxdb-influxql-query-raw")
+	defer span.End(&err)
+
+	if len(query.Aggregates) > 1 {
+		return nil, fmt.Errorf("influxdb 不支持多函数聚合查询, %+v", query.Aggregates)
+	}
+
+	sql, err := i.makeSQL(ctx, query, start, end)
+	if err != nil {
+		return nil, err
+	}
 
 	values := &url.Values{}
 	values.Set("db", query.DB)
@@ -471,31 +456,36 @@ func (i *Instance) query(
 		"http", i.host, i.port, "query", values.Encode(),
 	)
 
-	trace.InsertStringIntoSpan("query-params", values.Encode(), span)
-	trace.InsertStringIntoSpan("http-url", urlPath, span)
+	span.Set("query-params", values.Encode())
+	span.Set("http-url", urlPath)
 
 	ctx, cancel = context.WithTimeout(ctx, i.timeout)
 	defer cancel()
 	startAnaylize = time.Now()
 
 	user := metadata.GetUser(ctx)
-	trace.InsertStringIntoSpan("query-space-uid", user.SpaceUid, span)
-	trace.InsertStringIntoSpan("query-source", user.Source, span)
-	trace.InsertStringIntoSpan("query-username", user.Name, span)
-	trace.InsertStringIntoSpan("query-url-path", urlPath, span)
-	trace.InsertStringIntoSpan("query-q", sql, span)
-	trace.InsertStringIntoSpan("query-db", query.DB, span)
-	trace.InsertStringIntoSpan("query-measurement", query.Measurement, span)
-	trace.InsertStringIntoSpan("query-field", query.Field, span)
-	trace.InsertStringIntoSpan("query-url-path", urlPath, span)
-	trace.InsertStringIntoSpan("query-where", where, span)
+	span.Set("query-space-uid", user.SpaceUid)
+	span.Set("query-source", user.Source)
+	span.Set("query-username", user.Name)
+	span.Set("query-url-path", urlPath)
+	span.Set("query-q", sql)
+	span.Set("query-db", query.DB)
+	span.Set("query-measurement", query.Measurement)
+	span.Set("query-field", query.Field)
+	span.Set("query-url-path", urlPath)
 
-	log.Debugf(ctx,
-		"influxdb query: %s, where: %s",
-		urlPath, where,
-	)
+	dec, err := decoder.GetDecoder(i.contentType)
+	if err != nil {
+		log.Errorf(ctx, "get decoder:%s error:%s", i.contentType, err)
+		return nil, err
+	}
 
-	resp, err := i.curl.Request(
+	i.curl.WithDecoder(func(ctx context.Context, reader io.Reader, resp interface{}) (int, error) {
+		dr := resp.(*decoder.Response)
+		return dec.Decode(ctx, reader, dr)
+	})
+
+	size, err := i.curl.Request(
 		ctx, curl.Get,
 		curl.Options{
 			UrlPath: urlPath,
@@ -505,36 +495,21 @@ func (i *Instance) query(
 			UserName: i.username,
 			Password: i.password,
 		},
+		res,
 	)
 	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	respContentType := resp.Header.Get("Content-type")
-	dec, err := decoder.GetDecoder(respContentType)
-	if err != nil {
-		data, readErr := io.ReadAll(resp.Body)
-		if readErr != nil {
-			log.Errorf(ctx, "get decoder:%s error:%s and read error:%s", respContentType, err, readErr)
-			return nil, err
-		}
-		log.Errorf(ctx, "get decoder:%s error:%s,data in body:%s", respContentType, err, data)
-		return nil, err
-	}
-
-	res, err := dec.Decode(ctx, resp.Body)
-	if err != nil {
-		log.Errorf(ctx, "decoder:%s decode error:%s", respContentType, err)
 		return nil, err
 	}
 
 	queryCost := time.Since(startAnaylize)
-	trace.InsertStringIntoSpan("query-cost", queryCost.String(), span)
+	span.Set("query-cost", queryCost.String())
 
+	rangeLeftTime := end.Sub(start)
+	metric.TsDBRequestRangeMinute(ctx, rangeLeftTime, i.InstanceType())
 	metric.TsDBRequestSecond(
-		ctx, queryCost, user.SpaceUid, fmt.Sprintf("%s_http", consul.InfluxDBStorageType),
+		ctx, queryCost, fmt.Sprintf("%s_http", i.InstanceType()), i.host,
 	)
+	metric.TsDBRequestBytes(ctx, size, i.InstanceType())
 
 	series := make([]*decoder.Row, 0)
 	for _, r := range res.Results {
@@ -552,12 +527,12 @@ func (i *Instance) query(
 		Timeseries: make([]*prompb.TimeSeries, 0, len(series)),
 	}
 
-	trace.InsertStringIntoSpan("expand-tag", fmt.Sprintf("%+v", expandTag), span)
+	metricLabel := query.MetricLabels(ctx)
 
 	for _, s := range series {
 		pointNum += len(s.Values)
 
-		lbs := make([]prompb.Label, 0, len(s.Tags)+len(expandTag))
+		lbs := make([]prompb.Label, 0, len(s.Tags)+1)
 		for k, v := range s.Tags {
 			lbs = append(lbs, prompb.Label{
 				Name:  k,
@@ -565,26 +540,21 @@ func (i *Instance) query(
 			})
 		}
 
-		if len(expandTag) > 0 {
-			lbs = append(lbs, expandTag...)
+		// 拼接指标名
+		if metricLabel != nil {
+			lbs = append(lbs, *metricLabel)
 		}
 
 		samples := make([]prompb.Sample, 0, len(s.Values))
 		for _, sv := range s.Values {
-			t, v, err := i.getRawData(s.Columns, sv)
-			if err != nil {
+			t, v, rawErr := i.getRawData(s.Columns, sv)
+			if rawErr != nil {
 				continue
 			}
-			repNum := 1
-			if isCount {
-				repNum = int(v)
-			}
-			for j := 0; j < repNum; j++ {
-				samples = append(samples, prompb.Sample{
-					Value:     v,
-					Timestamp: t.UnixMilli(),
-				})
-			}
+			samples = append(samples, prompb.Sample{
+				Value:     v,
+				Timestamp: t.UnixMilli(),
+			})
 		}
 
 		result.Timeseries = append(result.Timeseries, &prompb.TimeSeries{
@@ -600,8 +570,8 @@ func (i *Instance) query(
 		metadata.SetStatus(ctx, metadata.ExceedsMaximumSlimit, fmt.Sprintf("query series > max: %d", i.maxSLimit))
 	}
 
-	trace.InsertIntIntoSpan("resp-series-num", seriesNum, span)
-	trace.InsertIntIntoSpan("resp-point-num", pointNum, span)
+	span.Set("resp-series-num", seriesNum)
+	span.Set("resp-point-num", pointNum)
 	return result, nil
 }
 
@@ -611,30 +581,31 @@ func (i *Instance) grpcStream(
 	slimit, limit int64,
 ) storage.SeriesSet {
 	var (
-		span   oleltrace.Span
 		client remote.QueryTimeSeriesServiceClient
+		err    error
 	)
 
-	ctx, span = trace.IntoContext(ctx, trace.TracerName, "influxdb-query-raw-grpc-stream")
+	ctx, span := trace.NewSpan(ctx, "influxdb-query-grpc-stream")
+	defer span.End(&err)
 
 	urlPath := fmt.Sprintf("%s:%d", i.host, i.grpcPort)
 
 	user := metadata.GetUser(ctx)
-	trace.InsertStringIntoSpan("query-space-uid", user.SpaceUid, span)
-	trace.InsertStringIntoSpan("query-source", user.Source, span)
-	trace.InsertStringIntoSpan("query-username", user.Name, span)
-	trace.InsertStringIntoSpan("query-url-path", urlPath, span)
-	trace.InsertStringIntoSpan("query-db", db, span)
-	trace.InsertStringIntoSpan("query-rp", rp, span)
-	trace.InsertStringIntoSpan("query-measurement", measurement, span)
-	trace.InsertStringIntoSpan("query-field", field, span)
-	trace.InsertStringIntoSpan("query-where", where, span)
-	trace.InsertIntIntoSpan("query-slimit", int(slimit), span)
-	trace.InsertIntIntoSpan("query-limit", int(limit), span)
+	span.Set("grpc-query-space-uid", user.SpaceUid)
+	span.Set("grpc-query-source", user.Source)
+	span.Set("grpc-query-username", user.Name)
+	span.Set("grpc-query-url-path", urlPath)
+	span.Set("grpc-query-db", db)
+	span.Set("grpc-query-rp", rp)
+	span.Set("grpc-query-measurement", measurement)
+	span.Set("grpc-query-field", field)
+	span.Set("grpc-query-where", where)
+	span.Set("grpc-query-slimit", int(slimit))
+	span.Set("grpc-query-limit", int(limit))
 
 	client = influxdb.GetInfluxDBRouter().TimeSeriesClient(ctx, i.protocol, urlPath)
 	if client == nil {
-		log.Errorf(ctx, ErrorsHttpNotFound.Error())
+		err = ErrorsHttpNotFound
 		return storage.ErrSeriesSet(ErrorsHttpNotFound)
 	}
 
@@ -649,7 +620,7 @@ func (i *Instance) grpcStream(
 	}
 
 	filterRequest, _ := json.Marshal(req)
-	trace.InsertStringIntoSpan("query-filter-request", string(filterRequest), span)
+	span.Set("grpc-query-filter-request", string(filterRequest))
 
 	stream, err := client.Raw(ctx, req)
 	if err != nil {
@@ -660,36 +631,43 @@ func (i *Instance) grpcStream(
 
 	name := fmt.Sprintf("%s://%s", i.protocol, i.host)
 
-	trace.InsertStringIntoSpan("start-stream-series-set", name, span)
+	span.Set("grpc-start-stream-series-set", name)
+
+	qry := &metadata.Query{TableID: fmt.Sprintf("%s.%s", db, measurement), MetricName: field}
+
 	seriesSet := StartStreamSeriesSet(
 		ctx, name, &StreamSeriesSetOption{
-			Span:    span,
-			Stream:  stream,
-			Limiter: limiter,
-			Timeout: i.timeout,
+			Span:        span,
+			Stream:      stream,
+			Limiter:     limiter,
+			Timeout:     i.timeout,
+			MetricLabel: qry.MetricLabels(ctx),
 		},
 	)
 
 	return seriesSet
 }
 
-// QueryRaw 查询原始数据
-func (i *Instance) QueryRaw(
+// QueryRawData 直接查询原始返回
+func (i *Instance) QueryRawData(ctx context.Context, query *metadata.Query, start, end time.Time, dataCh chan<- map[string]any) (int64, metadata.ResultTableOptions, error) {
+	return 0, nil, nil
+}
+
+// QuerySeriesSet 给 PromEngine 提供查询接口
+func (i *Instance) QuerySeriesSet(
 	ctx context.Context,
 	query *metadata.Query,
-	hints *storage.SelectHints,
-	matchers ...*labels.Matcher,
+	start time.Time,
+	end time.Time,
 ) storage.SeriesSet {
 	var (
-		span oleltrace.Span
+		err error
 	)
 
-	ctx, span = trace.IntoContext(ctx, trace.TracerName, "influxdb-query-raw")
-	if span != nil {
-		defer span.End()
-	}
+	ctx, span := trace.NewSpan(ctx, "influxdb-query-raw")
+	defer span.End(&err)
 
-	where := fmt.Sprintf("time > %d and time < %d", hints.Start*1e6, hints.End*1e6)
+	where := fmt.Sprintf("time > %d and time < %d", start.UnixNano(), end.UnixNano())
 	if query.Condition != "" {
 		where = fmt.Sprintf("%s and %s", where, query.Condition)
 	}
@@ -697,27 +675,27 @@ func (i *Instance) QueryRaw(
 	limit, slimit := i.getLimitAndSlimit(query.OffsetInfo.Limit, query.OffsetInfo.SLimit)
 
 	user := metadata.GetUser(ctx)
-	trace.InsertStringIntoSpan("query-space-uid", user.SpaceUid, span)
-	trace.InsertStringIntoSpan("query-source", user.Source, span)
-	trace.InsertStringIntoSpan("query-username", user.Name, span)
+	span.Set("query-space-uid", user.SpaceUid)
+	span.Set("query-source", user.Source)
+	span.Set("query-username", user.Name)
 
-	trace.InsertStringIntoSpan("query-storage-id", query.StorageID, span)
-	trace.InsertStringIntoSpan("query-cluster-name", query.ClusterName, span)
-	trace.InsertStringIntoSpan("query-tag-keys", fmt.Sprintf("%+v", query.TagsKey), span)
+	span.Set("query-storage-id", query.StorageID)
+	span.Set("query-cluster-name", query.ClusterName)
+	span.Set("query-tag-keys", query.TagsKey)
 
-	trace.InsertStringIntoSpan("query-protocol", i.protocol, span)
-	trace.InsertIntIntoSpan("query-rate-limit", int(i.readRateLimit), span)
+	span.Set("query-protocol", i.protocol)
+	span.Set("query-rate-limit", int(i.readRateLimit))
 
-	trace.InsertIntIntoSpan("query-max-limit", i.maxLimit, span)
-	trace.InsertIntIntoSpan("query-max-slimit", i.maxSLimit, span)
+	span.Set("query-max-limit", i.maxLimit)
+	span.Set("query-max-slimit", i.maxSLimit)
 
-	trace.InsertStringIntoSpan("query-host", i.host, span)
-	trace.InsertStringIntoSpan("query-db", query.DB, span)
-	trace.InsertStringIntoSpan("query-measurement", query.Measurement, span)
-	trace.InsertStringIntoSpan("query-measurements", strings.Join(query.Measurements, ","), span)
-	trace.InsertStringIntoSpan("query-field", query.Field, span)
-	trace.InsertStringIntoSpan("query-fields", strings.Join(query.Fields, ","), span)
-	trace.InsertStringIntoSpan("query-where", where, span)
+	span.Set("query-host", i.host)
+	span.Set("query-db", query.DB)
+	span.Set("query-measurement", query.Measurement)
+	span.Set("query-measurements", strings.Join(query.Measurements, ","))
+	span.Set("query-field", query.Field)
+	span.Set("query-fields", strings.Join(query.Fields, ","))
+	span.Set("query-where", where)
 
 	var sets []storage.SeriesSet
 	// 在指标模糊匹配的情况下，需要检索符合条件的 Measures + Fields，这时候会有多个，最后合并结果输出
@@ -726,26 +704,27 @@ func (i *Instance) QueryRaw(
 		for _, field := range query.Fields {
 			var set storage.SeriesSet
 			// 判断是否进入降采样逻辑：sum(sum_over_time), count(count_over_time) 等等
-			if !i.downSampleCheck(ctx, query, hints) && i.protocol == influxdb.GRPC {
+			if len(query.Aggregates) == 0 && i.protocol == influxdb.GRPC {
 				set = i.grpcStream(ctx, query.DB, query.RetentionPolicy, measurement, field, where, slimit, limit)
 			} else {
-				// 复制 Query 对象，简化 field、measure 取值，传入查询方法
-				query := &metadata.Query{
-					TableID:             query.TableID,
-					RetentionPolicy:     query.RetentionPolicy,
-					DB:                  query.DB,
-					Measurement:         measurement,
-					Field:               field,
-					Timezone:            query.Timezone,
-					LabelsMatcher:       query.LabelsMatcher,
-					IsHasOr:             query.IsHasOr,
-					AggregateMethodList: query.AggregateMethodList,
-					Condition:           query.Condition,
-					Filters:             query.Filters,
-					OffsetInfo:          query.OffsetInfo,
-					SegmentedEnable:     query.SegmentedEnable,
+				// 复制 ToVmExpand 对象，简化 field、measure 取值，传入查询方法
+				mq := &metadata.Query{
+					DataSource:      query.DataSource,
+					TableID:         query.TableID,
+					MetricName:      query.MetricName,
+					RetentionPolicy: query.RetentionPolicy,
+					DB:              query.DB,
+					Measurement:     measurement,
+					Field:           field,
+					Timezone:        query.Timezone,
+					IsHasOr:         query.IsHasOr,
+					Aggregates:      query.Aggregates,
+					Condition:       query.Condition,
+					Filters:         query.Filters,
+					OffsetInfo:      query.OffsetInfo,
+					SegmentedEnable: query.SegmentedEnable,
 				}
-				res, err := i.query(ctx, query, hints, multiFieldsFlag, matchers...)
+				res, err := i.query(ctx, mq, start, end, multiFieldsFlag)
 				if err != nil {
 					log.Errorf(ctx, err.Error())
 					continue
@@ -763,7 +742,7 @@ func (i *Instance) QueryRaw(
 }
 
 // QueryRange 查询范围数据
-func (i *Instance) QueryRange(
+func (i *Instance) DirectQueryRange(
 	ctx context.Context, promql string,
 	start, end time.Time, step time.Duration,
 ) (promPromql.Matrix, error) {
@@ -771,26 +750,23 @@ func (i *Instance) QueryRange(
 }
 
 // Query instant 查询
-func (i *Instance) Query(
+func (i *Instance) DirectQuery(
 	ctx context.Context, promql string,
 	end time.Time,
 ) (promql.Vector, error) {
 	return nil, nil
 }
 
-func (i *Instance) LabelNames(ctx context.Context, query *metadata.Query, start, end time.Time, matchers ...*labels.Matcher) ([]string, error) {
+func (i *Instance) QueryLabelNames(ctx context.Context, query *metadata.Query, start, end time.Time) ([]string, error) {
 	var (
-		span   oleltrace.Span
 		err    error
 		cancel context.CancelFunc
 
 		lbMap = make(map[string]struct{})
 	)
 
-	ctx, span = trace.IntoContext(ctx, trace.TracerName, "influxdb-label-names")
-	if span != nil {
-		defer span.End()
-	}
+	ctx, span := trace.NewSpan(ctx, "influxdb-label-names")
+	defer span.End(&err)
 
 	if query != nil {
 		var (
@@ -798,6 +774,8 @@ func (i *Instance) LabelNames(ctx context.Context, query *metadata.Query, start,
 			measurement = query.Measurement
 			field       = query.Field
 			condition   = query.Condition
+
+			res = new(decoder.Response)
 		)
 		where := fmt.Sprintf("time > %d and time < %d", start.UnixNano(), end.UnixNano())
 		if condition != "" {
@@ -819,30 +797,40 @@ func (i *Instance) LabelNames(ctx context.Context, query *metadata.Query, start,
 			"http", i.host, i.port, "query", values.Encode(),
 		)
 
-		trace.InsertStringIntoSpan("query-params", values.Encode(), span)
-		trace.InsertStringIntoSpan("http-url", urlPath, span)
+		span.Set("query-params", values.Encode())
+		span.Set("http-url", urlPath)
 
 		ctx, cancel = context.WithTimeout(ctx, i.timeout)
 		defer cancel()
 		startAnaylize := time.Now()
 
 		user := metadata.GetUser(ctx)
-		trace.InsertStringIntoSpan("query-space-uid", user.SpaceUid, span)
-		trace.InsertStringIntoSpan("query-source", user.Source, span)
-		trace.InsertStringIntoSpan("query-username", user.Name, span)
-		trace.InsertStringIntoSpan("query-url-path", urlPath, span)
-		trace.InsertStringIntoSpan("query-db", db, span)
-		trace.InsertStringIntoSpan("query-measurement", measurement, span)
-		trace.InsertStringIntoSpan("query-field", field, span)
-		trace.InsertStringIntoSpan("query-url-path", urlPath, span)
-		trace.InsertStringIntoSpan("query-where", where, span)
+		span.Set("query-space-uid", user.SpaceUid)
+		span.Set("query-source", user.Source)
+		span.Set("query-username", user.Name)
+		span.Set("query-url-path", urlPath)
+		span.Set("query-db", db)
+		span.Set("query-measurement", measurement)
+		span.Set("query-field", field)
+		span.Set("query-url-path", urlPath)
+		span.Set("query-where", where)
 
 		log.Debugf(ctx,
 			"influxdb query: %s, where: %s",
 			urlPath, where,
 		)
+		dec, err := decoder.GetDecoder(i.contentType)
+		if err != nil {
+			log.Errorf(ctx, "get decoder:%s error:%s", i.contentType, err)
+			return nil, err
+		}
 
-		resp, err := i.curl.Request(
+		i.curl.WithDecoder(func(ctx context.Context, reader io.Reader, resp interface{}) (int, error) {
+			dr := resp.(*decoder.Response)
+			return dec.Decode(ctx, reader, dr)
+		})
+
+		size, err := i.curl.Request(
 			ctx, curl.Get,
 			curl.Options{
 				UrlPath: urlPath,
@@ -852,29 +840,11 @@ func (i *Instance) LabelNames(ctx context.Context, query *metadata.Query, start,
 				UserName: i.username,
 				Password: i.password,
 			},
+			res,
 		)
-		if err != nil {
-			return nil, err
-		}
-		defer resp.Body.Close()
-		respContentType := resp.Header.Get("Content-type")
-		dec, err := decoder.GetDecoder(respContentType)
-		if err != nil {
-			data, readErr := io.ReadAll(resp.Body)
-			if readErr != nil {
-				log.Errorf(ctx, "get decoder:%s error:%s and read error:%s", respContentType, err, readErr)
-				return nil, err
-			}
-			log.Errorf(ctx, "get decoder:%s error:%s,data in body:%s", respContentType, err, data)
-			return nil, err
-		}
-		res, err := dec.Decode(ctx, resp.Body)
-		if err != nil {
-			log.Errorf(ctx, "decoder:%s decode error:%s", respContentType, err)
-			return nil, err
-		}
+		metric.TsDBRequestBytes(ctx, size, i.InstanceType())
 
-		trace.InsertStringIntoSpan("query-cost", time.Since(startAnaylize).String(), span)
+		span.Set("query-cost", time.Since(startAnaylize).String())
 
 		if res.Err != "" {
 			return nil, fmt.Errorf(res.Err)
@@ -895,7 +865,7 @@ func (i *Instance) LabelNames(ctx context.Context, query *metadata.Query, start,
 			}
 		}
 
-		trace.InsertIntIntoSpan("resp-num", respNum, span)
+		span.Set("resp-num", respNum)
 	}
 
 	lbs := make([]string, 0, len(lbMap))
@@ -908,7 +878,6 @@ func (i *Instance) LabelNames(ctx context.Context, query *metadata.Query, start,
 
 func (i *Instance) metrics(ctx context.Context, query *metadata.Query) ([]string, error) {
 	var (
-		span   oleltrace.Span
 		err    error
 		cancel context.CancelFunc
 
@@ -918,11 +887,10 @@ func (i *Instance) metrics(ctx context.Context, query *metadata.Query) ([]string
 		field       = query.Field
 
 		sql string
+		res = new(decoder.Response)
 	)
-	ctx, span = trace.IntoContext(ctx, trace.TracerName, "influxdb-metrics")
-	if span != nil {
-		defer span.End()
-	}
+	ctx, span := trace.NewSpan(ctx, "influxdb-metrics")
+	defer span.End(&err)
 
 	if field == "value" {
 		sql = "show measurements"
@@ -941,29 +909,39 @@ func (i *Instance) metrics(ctx context.Context, query *metadata.Query) ([]string
 		"http", i.host, i.port, "query", values.Encode(),
 	)
 
-	trace.InsertStringIntoSpan("query-params", values.Encode(), span)
-	trace.InsertStringIntoSpan("http-url", urlPath, span)
+	span.Set("query-params", values.Encode())
+	span.Set("http-url", urlPath)
 
 	ctx, cancel = context.WithTimeout(ctx, i.timeout)
 	defer cancel()
 	startAnaylize := time.Now()
 
 	user := metadata.GetUser(ctx)
-	trace.InsertStringIntoSpan("query-space-uid", user.SpaceUid, span)
-	trace.InsertStringIntoSpan("query-source", user.Source, span)
-	trace.InsertStringIntoSpan("query-username", user.Name, span)
-	trace.InsertStringIntoSpan("query-url-path", urlPath, span)
-	trace.InsertStringIntoSpan("query-q", sql, span)
-	trace.InsertStringIntoSpan("query-db", db, span)
-	trace.InsertStringIntoSpan("query-measurement", measurement, span)
-	trace.InsertStringIntoSpan("query-field", field, span)
-	trace.InsertStringIntoSpan("query-url-path", urlPath, span)
+	span.Set("query-space-uid", user.SpaceUid)
+	span.Set("query-source", user.Source)
+	span.Set("query-username", user.Name)
+	span.Set("query-url-path", urlPath)
+	span.Set("query-q", sql)
+	span.Set("query-db", db)
+	span.Set("query-measurement", measurement)
+	span.Set("query-field", field)
+	span.Set("query-url-path", urlPath)
 
 	log.Debugf(ctx,
 		"influxdb query: %s", urlPath,
 	)
+	dec, err := decoder.GetDecoder(i.contentType)
+	if err != nil {
+		log.Errorf(ctx, "get decoder:%s error:%s", i.contentType, err)
+		return nil, err
+	}
 
-	resp, err := i.curl.Request(
+	i.curl.WithDecoder(func(ctx context.Context, reader io.Reader, resp interface{}) (int, error) {
+		dr := resp.(*decoder.Response)
+		return dec.Decode(ctx, reader, dr)
+	})
+
+	size, err := i.curl.Request(
 		ctx, curl.Get,
 		curl.Options{
 			UrlPath: urlPath,
@@ -973,29 +951,11 @@ func (i *Instance) metrics(ctx context.Context, query *metadata.Query) ([]string
 			UserName: i.username,
 			Password: i.password,
 		},
+		res,
 	)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	respContentType := resp.Header.Get("Content-type")
-	dec, err := decoder.GetDecoder(respContentType)
-	if err != nil {
-		data, readErr := io.ReadAll(resp.Body)
-		if readErr != nil {
-			log.Errorf(ctx, "get decoder:%s error:%s and read error:%s", respContentType, err, readErr)
-			return nil, err
-		}
-		log.Errorf(ctx, "get decoder:%s error:%s,data in body:%s", respContentType, err, data)
-		return nil, err
-	}
-	res, err := dec.Decode(ctx, resp.Body)
-	if err != nil {
-		log.Errorf(ctx, "decoder:%s decode error:%s", respContentType, err)
-		return nil, err
-	}
+	metric.TsDBRequestBytes(ctx, size, i.InstanceType())
 
-	trace.InsertStringIntoSpan("query-cost", time.Since(startAnaylize).String(), span)
+	span.Set("query-cost", time.Since(startAnaylize).String())
 
 	if res.Err != "" {
 		return nil, fmt.Errorf(res.Err)
@@ -1028,30 +988,29 @@ func (i *Instance) metrics(ctx context.Context, query *metadata.Query) ([]string
 		}
 	}
 
-	trace.InsertIntIntoSpan("resp-num", len(lbs), span)
+	span.Set("resp-num", len(lbs))
 
 	return lbs, err
 }
 
-func (i *Instance) LabelValues(ctx context.Context, query *metadata.Query, name string, start, end time.Time, matchers ...*labels.Matcher) ([]string, error) {
+func (i *Instance) QueryLabelValues(ctx context.Context, query *metadata.Query, name string, start, end time.Time) ([]string, error) {
 	var (
-		span   oleltrace.Span
 		err    error
 		cancel context.CancelFunc
 
 		lbMap = make(map[string]struct{})
 	)
 
-	ctx, span = trace.IntoContext(ctx, trace.TracerName, "influxdb-label-values")
-	if span != nil {
-		defer span.End()
-	}
+	ctx, span := trace.NewSpan(ctx, "influxdb-label-values")
+	defer span.End(&err)
 
 	var (
 		db          = query.DB
 		measurement = query.Measurement
 		field       = query.Field
 		condition   = query.Condition
+
+		res = new(decoder.Response)
 	)
 
 	if name == labels.MetricName {
@@ -1089,8 +1048,8 @@ func (i *Instance) LabelValues(ctx context.Context, query *metadata.Query, name 
 			"http", i.host, i.port, "query", values.Encode(),
 		)
 
-		trace.InsertStringIntoSpan("query-params", values.Encode(), span)
-		trace.InsertStringIntoSpan("http-url", urlPath, span)
+		span.Set("query-params", values.Encode())
+		span.Set("http-url", urlPath)
 
 		ctx, cancel = context.WithTimeout(ctx, i.timeout)
 		defer cancel()
@@ -1098,23 +1057,33 @@ func (i *Instance) LabelValues(ctx context.Context, query *metadata.Query, name 
 
 		user := metadata.GetUser(ctx)
 
-		trace.InsertStringIntoSpan("query-space-uid", user.SpaceUid, span)
-		trace.InsertStringIntoSpan("query-source", user.Source, span)
-		trace.InsertStringIntoSpan("query-username", user.Name, span)
-		trace.InsertStringIntoSpan("query-url-path", urlPath, span)
-		trace.InsertStringIntoSpan("query-q", sql, span)
-		trace.InsertStringIntoSpan("query-db", db, span)
-		trace.InsertStringIntoSpan("query-measurement", measurement, span)
-		trace.InsertStringIntoSpan("query-field", field, span)
-		trace.InsertStringIntoSpan("query-url-path", urlPath, span)
-		trace.InsertStringIntoSpan("query-where", where, span)
+		span.Set("query-space-uid", user.SpaceUid)
+		span.Set("query-source", user.Source)
+		span.Set("query-username", user.Name)
+		span.Set("query-url-path", urlPath)
+		span.Set("query-q", sql)
+		span.Set("query-db", db)
+		span.Set("query-measurement", measurement)
+		span.Set("query-field", field)
+		span.Set("query-url-path", urlPath)
+		span.Set("query-where", where)
 
 		log.Debugf(ctx,
 			"influxdb query: %s, where: %s",
 			urlPath, where,
 		)
+		dec, err := decoder.GetDecoder(i.contentType)
+		if err != nil {
+			log.Errorf(ctx, "get decoder:%s error:%s", i.contentType, err)
+			return nil, err
+		}
 
-		resp, err := i.curl.Request(
+		i.curl.WithDecoder(func(ctx context.Context, reader io.Reader, resp interface{}) (int, error) {
+			dr := resp.(*decoder.Response)
+			return dec.Decode(ctx, reader, dr)
+		})
+
+		size, err := i.curl.Request(
 			ctx, curl.Get,
 			curl.Options{
 				UrlPath: urlPath,
@@ -1124,29 +1093,12 @@ func (i *Instance) LabelValues(ctx context.Context, query *metadata.Query, name 
 				UserName: i.username,
 				Password: i.password,
 			},
+			res,
 		)
-		if err != nil {
-			return nil, err
-		}
-		defer resp.Body.Close()
-		respContentType := resp.Header.Get("Content-type")
-		dec, err := decoder.GetDecoder(respContentType)
-		if err != nil {
-			data, readErr := io.ReadAll(resp.Body)
-			if readErr != nil {
-				log.Errorf(ctx, "get decoder:%s error:%s and read error:%s", respContentType, err, readErr)
-				return nil, err
-			}
-			log.Errorf(ctx, "get decoder:%s error:%s,data in body:%s", respContentType, err, data)
-			return nil, err
-		}
-		res, err := dec.Decode(ctx, resp.Body)
-		if err != nil {
-			log.Errorf(ctx, "decoder:%s decode error:%s", respContentType, err)
-			return nil, err
-		}
+		metric.TsDBRequestBytes(ctx, size, i.InstanceType())
 
-		trace.InsertStringIntoSpan("query-cost", time.Since(startAnaylize).String(), span)
+		span.Set("query-cost", time.Since(startAnaylize).String())
+		span.Set("response-size", size)
 
 		if res.Err != "" {
 			return nil, fmt.Errorf(res.Err)
@@ -1164,7 +1116,7 @@ func (i *Instance) LabelValues(ctx context.Context, query *metadata.Query, name 
 			}
 		}
 
-		trace.InsertIntIntoSpan("resp-num", respNum, span)
+		span.Set("resp-num", respNum)
 	}
 
 	lbs := make([]string, 0, len(lbMap))
@@ -1175,6 +1127,32 @@ func (i *Instance) LabelValues(ctx context.Context, query *metadata.Query, name 
 	return lbs, err
 }
 
-func (i *Instance) Series(ctx context.Context, query *metadata.Query, start, end time.Time, matchers ...*labels.Matcher) storage.SeriesSet {
-	return nil
+func (i *Instance) QuerySeries(ctx context.Context, query *metadata.Query, start, end time.Time) (series []map[string]string, err error) {
+	ss := i.QuerySeriesSet(ctx, query, start, end)
+
+	if ss.Err() != nil {
+		err = ss.Err()
+		return
+	}
+
+	series = make([]map[string]string, 0)
+	for ss.Next() {
+		seriesMap := make(map[string]string)
+		for _, lb := range ss.At().Labels() {
+			seriesMap[lb.Name] = lb.Value
+		}
+		series = append(series, seriesMap)
+	}
+
+	return series, nil
+}
+
+func (i *Instance) DirectLabelNames(ctx context.Context, start, end time.Time, matchers ...*labels.Matcher) ([]string, error) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (i *Instance) DirectLabelValues(ctx context.Context, name string, start, end time.Time, limit int, matchers ...*labels.Matcher) ([]string, error) {
+	//TODO implement me
+	panic("implement me")
 }

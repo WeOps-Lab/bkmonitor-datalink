@@ -11,193 +11,116 @@ package structured
 
 import (
 	"context"
-	"fmt"
-	"strconv"
+	"encoding/json"
 	"testing"
 	"time"
 
-	goRedis "github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 
-	omd "github.com/TencentBlueKing/bkmonitor-datalink/pkg/offline-data-archive/metadata"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/offline-data-archive/policy/stores/shard"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/consul"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/influxdb"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/log"
 	md "github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/mock"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/redis"
-	ir "github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/router/influxdb"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/query/promql"
 )
 
-type m struct {
-	shard []*shard.Shard
-}
-
-func (m *m) PublishShard(ctx context.Context, channelValue interface{}) error {
-	panic("implement me")
-}
-
-func (m *m) SubscribeShard(ctx context.Context) <-chan *goRedis.Message {
-	panic("implement me")
-}
-
-func (m *m) GetShardID(ctx context.Context, sd *shard.Shard) (string, error) {
-	panic("implement me")
-}
-
-func (m *m) GetAllShards(ctx context.Context) map[string]*shard.Shard {
-	panic("implement me")
-}
-
-func (m *m) SetShard(ctx context.Context, k string, sd *shard.Shard) error {
-	panic("implement me")
-}
-
-func (m *m) GetShard(ctx context.Context, k string) (*shard.Shard, error) {
-	panic("implement me")
-}
-
-func (m *m) GetDistributedLock(ctx context.Context, key, val string, expiration time.Duration) (string, error) {
-	panic("implement me")
-}
-
-func (m *m) RenewalLock(ctx context.Context, key string, renewalDuration time.Duration) (bool, error) {
-	panic("implement me")
-}
-
-func (m *m) GetPolicies(ctx context.Context, clusterName, tagRouter string) (map[string]*omd.Policy, error) {
-	panic("implement me")
-}
-
-func (m *m) GetShards(ctx context.Context, clusterName, tagRouter, database string) (map[string]*shard.Shard, error) {
-	panic("implement me")
-}
-
-func (m *m) GetReadShardsByTimeRange(ctx context.Context, clusterName, tagRouter, database, retentionPolicy string, start int64, end int64) ([]*shard.Shard, error) {
-	log.Debugf(ctx, "check offline data archive query: %s %s %s %s %d %d", clusterName, tagRouter, database, retentionPolicy, start, end)
-	var shards = make([]*shard.Shard, 0, len(m.shard))
-	for _, sd := range m.shard {
-		// 验证 meta 字段
-		if sd.Meta.ClusterName != clusterName {
-			continue
-		}
-		if sd.Meta.Database != database {
-			continue
-		}
-		if sd.Meta.TagRouter != tagRouter {
-			continue
-		}
-		if sd.Meta.RetentionPolicy != retentionPolicy {
-			continue
-		}
-		if sd.Meta.TagRouter != tagRouter {
-			continue
-		}
-
-		// 判断是否是过期的 shard，只有过期的 shard 才进行查询
-		if sd.Spec.Expired.Unix() > time.Now().Unix() {
-			continue
-		}
-
-		// 通过时间过滤
-		if sd.Spec.Start.UnixNano() >= start && end < sd.Spec.End.UnixNano() {
-			shards = append(shards, sd)
-		}
-	}
-	return shards, nil
-}
-
 func TestQueryToMetric(t *testing.T) {
-	spaceUid := "test_two_stage"
-	db := "push_gateway_unify_query"
-	measurement := "group"
-	tableID := fmt.Sprintf("%s.%s", db, measurement)
-	field := "unify_query_request_handler_total"
-	field01 := "unify_query_request_handler01_total"
-	dataLabel := "unify_query"
+
+	db := "result_table"
+	tableID := influxdb.ResultTableInfluxDB
+	field := "kube_pod_info"
+	field1 := "kube_node_info"
+	dataLabel := "influxdb"
 	storageID := "2"
-	clusterName := "demo"
+	clusterName := "default"
 
-	storageIdInt, _ := strconv.ParseInt(storageID, 10, 64)
+	mock.Init()
+	ctx := md.InitHashID(context.Background())
+	influxdb.MockSpaceRouter(ctx)
 
-	ctx := context.Background()
-	mock.SetRedisClient(ctx, "test")
-	mock.SetSpaceTsDbMockData(
-		ctx,
-		"query_ts_test.db",
-		"query_ts_test",
-		ir.SpaceInfo{
-			spaceUid: ir.Space{tableID: &ir.SpaceResultTable{TableId: tableID}},
-		},
-		ir.ResultTableDetailInfo{
-			tableID: &ir.ResultTableDetail{
-				Fields:          []string{field, field01},
-				MeasurementType: redis.BKTraditionalMeasurement,
-				DataLabel:       dataLabel,
-				StorageId:       storageIdInt,
-				ClusterName:     clusterName,
-				DB:              db,
-				Measurement:     measurement,
-				TableId:         tableID,
-			},
-		},
-		nil, nil,
-	)
-	router, _ := influxdb.GetSpaceTsDbRouter()
-	ret := router.Print(ctx, "query_ts_test", false)
-	fmt.Println(ret)
+	start := "1741056443"
+	end := "1741060043"
 
 	var testCases = map[string]struct {
-		query  *Query
-		metric *md.QueryMetric
+		spaceUID string
+		query    *Query
+		metric   *md.QueryMetric
 	}{
 		"test table id query": {
 			query: &Query{
 				TableID:       TableID(tableID),
 				FieldName:     field,
 				ReferenceName: "a",
-				Start:         "0",
-				End:           "300",
+				Start:         start,
+				End:           end,
 				Step:          "1m",
 			},
 			metric: &md.QueryMetric{
 				QueryList: md.QueryList{
 					&md.Query{
-						TableID:      tableID,
-						DB:           db,
-						Measurement:  measurement,
-						StorageID:    storageID,
-						ClusterName:  clusterName,
-						Field:        field,
-						Fields:       []string{field},
-						Measurements: []string{measurement},
+						DataSource:     BkMonitor,
+						TableID:        tableID,
+						DB:             db,
+						Measurement:    field,
+						StorageID:      storageID,
+						StorageType:    consul.InfluxDBStorageType,
+						MetricName:     field,
+						ClusterName:    clusterName,
+						Field:          promql.StaticField,
+						Fields:         []string{promql.StaticField},
+						Measurements:   []string{field},
+						Timezone:       "UTC",
+						VmCondition:    `__name__="kube_pod_info_value"`,
+						VmConditionNum: 1,
+						DataLabel:      "influxdb",
 					},
 				},
 				ReferenceName: "a",
 				MetricName:    field,
-				IsCount:       false,
 			},
 		},
 		"test metric query": {
 			query: &Query{
 				FieldName:     field,
 				ReferenceName: "a",
-				Start:         "0",
-				End:           "300",
+				Start:         start,
+				End:           end,
 				Step:          "1m",
 			},
 			metric: &md.QueryMetric{
 				QueryList: md.QueryList{
-					&md.Query{
-						TableID:      tableID,
-						DB:           db,
-						Measurement:  measurement,
-						StorageID:    storageID,
-						ClusterName:  clusterName,
-						Field:        field,
-						Fields:       []string{field},
-						Measurements: []string{measurement},
+					{
+						DataSource:     BkMonitor,
+						TableID:        tableID,
+						DB:             db,
+						StorageType:    consul.InfluxDBStorageType,
+						StorageID:      storageID,
+						MetricName:     field,
+						ClusterName:    clusterName,
+						Field:          promql.StaticField,
+						Fields:         []string{promql.StaticField},
+						Measurement:    field,
+						Measurements:   []string{field},
+						Timezone:       "UTC",
+						VmCondition:    `__name__="kube_pod_info_value"`,
+						VmConditionNum: 1,
+						DataLabel:      "influxdb",
+					},
+					{
+						DataSource:     BkMonitor,
+						StorageType:    consul.VictoriaMetricsStorageType,
+						StorageID:      "2",
+						TableID:        "result_table.vm",
+						MetricName:     field,
+						VmRt:           "2_bcs_prom_computation_result_table",
+						Measurement:    field,
+						Measurements:   []string{field},
+						Field:          promql.StaticField,
+						Fields:         []string{promql.StaticField},
+						Timezone:       "UTC",
+						VmCondition:    `result_table_id="2_bcs_prom_computation_result_table", __name__="kube_pod_info_value"`,
+						VmConditionNum: 2,
+						DataLabel:      "vm",
 					},
 				},
 				ReferenceName: "a",
@@ -205,26 +128,49 @@ func TestQueryToMetric(t *testing.T) {
 				IsCount:       false,
 			},
 		},
-		"test two stage metric query": {
+		"test data label metric query": {
 			query: &Query{
 				TableID:       TableID(dataLabel),
 				FieldName:     field,
 				ReferenceName: "a",
-				Start:         "0",
-				End:           "300",
+				Start:         start,
+				End:           end,
 				Step:          "1m",
 			},
 			metric: &md.QueryMetric{
 				QueryList: md.QueryList{
-					&md.Query{
-						TableID:      tableID,
-						DB:           db,
-						Measurement:  measurement,
-						StorageID:    storageID,
-						ClusterName:  clusterName,
-						Field:        field,
-						Fields:       []string{field},
-						Measurements: []string{measurement},
+					{
+						DataSource:     BkMonitor,
+						TableID:        tableID,
+						DataLabel:      "influxdb",
+						DB:             db,
+						StorageType:    consul.InfluxDBStorageType,
+						StorageID:      storageID,
+						MetricName:     field,
+						ClusterName:    clusterName,
+						Field:          promql.StaticField,
+						Fields:         []string{promql.StaticField},
+						Measurement:    field,
+						Measurements:   []string{field},
+						Timezone:       "UTC",
+						VmCondition:    `__name__="kube_pod_info_value"`,
+						VmConditionNum: 1,
+					},
+					{
+						DataSource:     BkMonitor,
+						StorageType:    consul.VictoriaMetricsStorageType,
+						StorageID:      "2",
+						TableID:        "result_table.vm",
+						MetricName:     field,
+						VmRt:           "2_bcs_prom_computation_result_table",
+						Measurement:    field,
+						Measurements:   []string{field},
+						Field:          promql.StaticField,
+						Fields:         []string{promql.StaticField},
+						Timezone:       "UTC",
+						VmCondition:    `result_table_id="2_bcs_prom_computation_result_table", __name__="kube_pod_info_value"`,
+						VmConditionNum: 2,
+						DataLabel:      "vm",
 					},
 				},
 				ReferenceName: "a",
@@ -235,163 +181,1138 @@ func TestQueryToMetric(t *testing.T) {
 		"test regexp metric query": {
 			query: &Query{
 				TableID:       TableID(tableID),
-				FieldName:     "unify_query_.*_total",
+				FieldName:     "kube_.*",
 				ReferenceName: "a",
-				Start:         "0",
-				End:           "300",
+				Start:         start,
+				End:           end,
 				Step:          "1m",
 				IsRegexp:      true,
 			},
 			metric: &md.QueryMetric{
 				QueryList: md.QueryList{
-					&md.Query{
-						TableID:      tableID,
-						DB:           db,
-						Measurement:  measurement,
-						StorageID:    storageID,
-						ClusterName:  clusterName,
-						Field:        "unify_query_.*_total",
-						Fields:       []string{field, field01},
-						Measurements: []string{measurement},
+					{
+						DataSource:     BkMonitor,
+						TableID:        tableID,
+						DB:             db,
+						StorageType:    consul.InfluxDBStorageType,
+						StorageID:      storageID,
+						MetricName:     "kube_.*",
+						ClusterName:    clusterName,
+						Field:          promql.StaticField,
+						Fields:         []string{promql.StaticField},
+						Measurement:    "kube_.*",
+						Measurements:   []string{field, field1, "kube_node_status_condition"},
+						Timezone:       "UTC",
+						VmCondition:    `__name__=~"kube_.*_value"`,
+						VmConditionNum: 1,
+						DataLabel:      "influxdb",
 					},
 				},
 				ReferenceName: "a",
-				MetricName:    "unify_query_.*_total",
+				MetricName:    "kube_.*",
 				IsCount:       false,
+			},
+		},
+		"test bk data match table id": {
+			query: &Query{
+				DataSource:    BkData,
+				TableID:       "2_table_id",
+				FieldName:     "kube_.*",
+				ReferenceName: "a",
+			},
+			metric: &md.QueryMetric{
+				QueryList: md.QueryList{
+					{
+						DataSource:  BkData,
+						TableID:     "2_table_id",
+						StorageType: consul.BkSqlStorageType,
+						DB:          "2_table_id",
+						MetricName:  "kube_.*",
+						Field:       "kube_.*",
+					},
+				},
+				ReferenceName: "a",
+				MetricName:    "kube_.*",
+			},
+		},
+		"test bk data not match table id": {
+			query: &Query{
+				DataSource:    BkData,
+				TableID:       "3_table_id",
+				FieldName:     "kube_.*",
+				ReferenceName: "a",
+			},
+			metric: &md.QueryMetric{
+				ReferenceName: "a",
+				MetricName:    "kube_.*",
+			},
+		},
+		"test bk data not match table id - 1": {
+			spaceUID: "bkci__2",
+			query: &Query{
+				DataSource:    BkData,
+				TableID:       "2_table_id",
+				FieldName:     "kube_.*",
+				ReferenceName: "a",
+			},
+			metric: &md.QueryMetric{
+				ReferenceName: "a",
+				MetricName:    "kube_.*",
 			},
 		},
 	}
 	for name, c := range testCases {
 		t.Run(name, func(t *testing.T) {
-			ctx = context.Background()
-			metric, err := c.query.ToQueryMetric(ctx, spaceUid)
-			assert.Nil(t, err)
-			assert.Equal(t, 1, len(c.metric.QueryList))
-			if err == nil {
-				assert.Equal(t, c.metric.QueryList[0].TableID, metric.QueryList[0].TableID)
-				assert.Equal(t, c.metric.QueryList[0].Field, metric.QueryList[0].Field)
-				assert.Equal(t, c.metric.QueryList[0].Fields, metric.QueryList[0].Fields)
+			ctx = md.InitHashID(ctx)
+			spaceUID := c.spaceUID
+			if spaceUID == "" {
+				spaceUID = influxdb.SpaceUid
 			}
+
+			metric, err := c.query.ToQueryMetric(ctx, spaceUID)
+			assert.Nil(t, err)
+
+			a, _ := json.Marshal(c.metric)
+			b, _ := json.Marshal(metric)
+
+			assert.JSONEq(t, string(a), string(b))
 		})
 	}
 }
 
-func TestQueryToMetricWithOfflineDataArchiveQuery(t *testing.T) {
-	ctx := context.Background()
+func TestQueryTs_ToQueryReference(t *testing.T) {
+	mock.Init()
+	ctx := md.InitHashID(context.Background())
 
-	mock.SetRedisClient(ctx, "")
+	influxdb.MockSpaceRouter(ctx)
 
-	testCases := map[string]struct {
-		spaceUid      string
-		tableID       string
-		field         string
-		referenceName string
+	for name, tc := range map[string]struct {
+		ts *QueryTs
 
-		clusterName     string
-		tagsKey         []string
-		db              string
-		measurement     string
-		retentionPolicy string
-		storageID       string
-		vmRt            string
-
-		tagRouter         string
-		expectedStorageID string
-		expired           time.Time
-
-		start string
-		end   string
+		isDirectQuery bool
+		expand        *md.VmExpand
+		ref           md.QueryReference
+		promql        string
 	}{
-		"offlineDataArchiveQuery": {
-			spaceUid: "q_test", tableID: "pushgateway_bkmonitor_unify_query.__default__", field: "q_test", referenceName: "a",
-			start: "0", end: "60",
-
-			storageID: "2", clusterName: "cluster_internal", tagsKey: []string{"bk_biz_id"},
-			db: "pushgateway_bkmonitor_unify_query", measurement: "unify_query_request_handler_total", retentionPolicy: "",
-			tagRouter: "bk_biz_id==2", expired: time.Now().Add(-time.Minute),
-
-			expectedStorageID: consul.OfflineDataArchive,
-		},
-		"notOfflineDataArchiveQuery": {
-			spaceUid: "q_test", tableID: "pushgateway_bkmonitor_unify_query.__default__", field: "q_test", referenceName: "a",
-			start: "0", end: "60",
-
-			storageID: "2", clusterName: "cluster_internal", tagsKey: []string{"bk_biz_id"},
-			db: "pushgateway_bkmonitor_unify_query", measurement: "unify_query_request_handler_total", retentionPolicy: "",
-			tagRouter: "bk_biz_id==2", expired: time.Now().Add(time.Minute),
-
-			expectedStorageID: "2",
-		},
-	}
-
-	for name, tc := range testCases {
-		t.Run(name, func(t *testing.T) {
-			stoIdInt, _ := strconv.ParseInt(tc.storageID, 10, 64)
-			mock.SetSpaceTsDbMockData(
-				ctx, "query_ts_test", "query_ts_test",
-				ir.SpaceInfo{
-					tc.spaceUid: ir.Space{
-						tc.tableID: &ir.SpaceResultTable{TableId: tc.tableID},
-					},
-				},
-				ir.ResultTableDetailInfo{
-					tc.tableID: &ir.ResultTableDetail{
-						Fields:          []string{tc.field},
-						MeasurementType: redis.BkSplitMeasurement,
-						StorageId:       stoIdInt,
-						ClusterName:     tc.clusterName,
-						TagsKey:         tc.tagsKey,
-						DB:              tc.db,
-						Measurement:     tc.measurement,
-						VmRt:            tc.vmRt,
-					},
-				},
-				nil, nil,
-			)
-			mockMd := &m{
-				shard: []*shard.Shard{
+		"非单指标单表 - 多 tableID 都查询 vm": {
+			ts: &QueryTs{
+				QueryList: []*Query{
 					{
-						Meta: shard.Meta{
-							ClusterName:     tc.clusterName,
-							Database:        tc.db,
-							RetentionPolicy: tc.retentionPolicy,
-							TagRouter:       tc.tagRouter,
+						TableID:       "system.cpu_detail",
+						FieldName:     "usage",
+						ReferenceName: "a",
+					},
+					{
+						TableID:       "system.disk",
+						FieldName:     "usage",
+						ReferenceName: "b",
+					},
+				},
+				MetricMerge: "a + b",
+			},
+
+			isDirectQuery: true,
+			promql:        "a + b",
+			expand: &md.VmExpand{
+				ResultTableList: []string{"100147_ieod_system_cpu_detail_raw", "100147_ieod_system_disk_raw"},
+				MetricFilterCondition: map[string]string{
+					"a": `bk_biz_id="2", result_table_id="100147_ieod_system_cpu_detail_raw", __name__="usage_value"`,
+					"b": `bk_biz_id="2", result_table_id="100147_ieod_system_disk_raw", __name__="usage_value"`,
+				},
+			},
+			ref: md.QueryReference{
+				"a": {
+					{
+						QueryList: md.QueryList{
+							{
+								DataSource:     BkMonitor,
+								Condition:      "bk_biz_id='2'",
+								Timezone:       "UTC",
+								Fields:         []string{"usage"},
+								TableID:        "system.cpu_detail",
+								DataLabel:      "cpu_detail",
+								MetricName:     "usage",
+								VmRt:           "100147_ieod_system_cpu_detail_raw",
+								VmConditionNum: 3,
+								VmCondition:    `bk_biz_id="2", result_table_id="100147_ieod_system_cpu_detail_raw", __name__="usage_value"`,
+								StorageID:      "2",
+								StorageType:    consul.VictoriaMetricsStorageType,
+								Field:          "usage",
+								AllConditions: md.AllConditions{
+									{
+										{
+											DimensionName: "bk_biz_id",
+											Operator:      ConditionEqual,
+											Value:         []string{"2"},
+										},
+									},
+								},
+							},
 						},
-						Spec: shard.Spec{
-							Start:   time.Unix(0, 0),
-							End:     time.Unix(6000, 0),
-							Expired: tc.expired,
+						MetricName:    "usage",
+						ReferenceName: "a",
+					},
+				},
+				"b": {
+					{
+						QueryList: md.QueryList{
+							{
+								DataSource:     BkMonitor,
+								Condition:      "bk_biz_id='2'",
+								Timezone:       "UTC",
+								Fields:         []string{"usage"},
+								TableID:        "system.disk",
+								DataLabel:      "disk",
+								MetricName:     "usage",
+								VmRt:           "100147_ieod_system_disk_raw",
+								VmConditionNum: 3,
+								VmCondition:    `bk_biz_id="2", result_table_id="100147_ieod_system_disk_raw", __name__="usage_value"`,
+								StorageID:      "2",
+								StorageType:    consul.VictoriaMetricsStorageType,
+								Field:          "usage",
+								AllConditions: md.AllConditions{
+									{
+										{
+											DimensionName: "bk_biz_id",
+											Operator:      ConditionEqual,
+											Value:         []string{"2"},
+										},
+									},
+								},
+							},
+						},
+						MetricName:    "usage",
+						ReferenceName: "b",
+					},
+				},
+			},
+		},
+		"非单指标单表 - 多 tableID 部分查询VM": {
+			ts: &QueryTs{
+				QueryList: []*Query{
+					{
+						TableID:       "system.cpu_summary",
+						FieldName:     "usage",
+						ReferenceName: "a",
+					},
+					{
+						TableID:       "system.disk",
+						FieldName:     "usage",
+						ReferenceName: "b",
+					},
+				},
+				MetricMerge: "a + b",
+			},
+			isDirectQuery: true,
+			promql:        "a + b",
+			expand: &md.VmExpand{
+				ResultTableList: []string{"100147_ieod_system_disk_raw"},
+				MetricFilterCondition: map[string]string{
+					"a": ``,
+					"b": `bk_biz_id="2", result_table_id="100147_ieod_system_disk_raw", __name__="usage_value"`,
+				},
+			},
+			ref: md.QueryReference{
+				"a": {
+					{
+						QueryList: md.QueryList{
+							{
+								DataSource:     BkMonitor,
+								Condition:      "bk_biz_id='2'",
+								Timezone:       "UTC",
+								Fields:         []string{"usage"},
+								TableID:        "system.cpu_summary",
+								DataLabel:      "cpu_summary",
+								MetricName:     "usage",
+								ClusterName:    "default",
+								DB:             "system",
+								Measurement:    "cpu_summary",
+								Measurements:   []string{"cpu_summary"},
+								VmConditionNum: 2,
+								VmCondition:    `bk_biz_id="2", __name__="usage_value"`,
+								StorageID:      "2",
+								StorageType:    consul.InfluxDBStorageType,
+								Field:          "usage",
+								AllConditions: md.AllConditions{
+									{
+										{
+											DimensionName: "bk_biz_id",
+											Operator:      ConditionEqual,
+											Value:         []string{"2"},
+										},
+									},
+								},
+							},
+						},
+						MetricName:    "usage",
+						ReferenceName: "a",
+					},
+				},
+				"b": {
+					{
+						QueryList: md.QueryList{
+							{
+								DataSource:     BkMonitor,
+								Condition:      "bk_biz_id='2'",
+								Timezone:       "UTC",
+								Fields:         []string{"usage"},
+								TableID:        "system.disk",
+								DataLabel:      "disk",
+								MetricName:     "usage",
+								VmRt:           "100147_ieod_system_disk_raw",
+								VmConditionNum: 3,
+								VmCondition:    `bk_biz_id="2", result_table_id="100147_ieod_system_disk_raw", __name__="usage_value"`,
+								StorageID:      "2",
+								StorageType:    consul.VictoriaMetricsStorageType,
+								Field:          "usage",
+								AllConditions: md.AllConditions{
+									{
+										{
+											DimensionName: "bk_biz_id",
+											Operator:      ConditionEqual,
+											Value:         []string{"2"},
+										},
+									},
+								},
+							},
+						},
+						MetricName:    "usage",
+						ReferenceName: "b",
+					},
+				},
+			},
+		},
+		"tableID 未开启 VM 查询 = 查询 InfluxDB": {
+			ts: &QueryTs{
+				QueryList: []*Query{
+					{
+						TableID:       "system.cpu_summary",
+						FieldName:     "usage",
+						ReferenceName: "b",
+					},
+				},
+				MetricMerge: "b",
+			},
+			promql: "b",
+			ref: md.QueryReference{
+				"b": {
+					{
+						QueryList: md.QueryList{
+							{
+								DataSource:     BkMonitor,
+								Condition:      "bk_biz_id='2'",
+								Timezone:       "UTC",
+								Fields:         []string{"usage"},
+								TableID:        "system.cpu_summary",
+								DataLabel:      "cpu_summary",
+								MetricName:     "usage",
+								DB:             "system",
+								Measurement:    "cpu_summary",
+								Measurements:   []string{"cpu_summary"},
+								ClusterName:    "default",
+								VmConditionNum: 2,
+								VmCondition:    `bk_biz_id="2", __name__="usage_value"`,
+								StorageID:      "2",
+								StorageType:    consul.InfluxDBStorageType,
+								Field:          "usage",
+								AllConditions: md.AllConditions{
+									{
+										{
+											DimensionName: "bk_biz_id",
+											Operator:      ConditionEqual,
+											Value:         []string{"2"},
+										},
+									},
+								},
+							},
+						},
+						ReferenceName: "b",
+						MetricName:    "usage",
+					},
+				},
+			},
+		},
+		"bk_inst_id / bk_obj_id 作为条件 = 查询 VM": {
+			ts: &QueryTs{
+				QueryList: []*Query{
+					{
+						TableID:       "system.cpu_detail",
+						FieldName:     "usage",
+						ReferenceName: "b",
+						Conditions: Conditions{FieldList: []ConditionField{
+							{
+								DimensionName: "bk_obj_id",
+								Operator:      Ncontains,
+								Value:         []string{"0"},
+							},
+						}},
+					},
+				},
+				MetricMerge: "b",
+			},
+			promql:        "b",
+			isDirectQuery: true,
+			expand: &md.VmExpand{
+				ResultTableList: []string{"100147_ieod_system_cpu_detail_cmdb"},
+				MetricFilterCondition: map[string]string{
+					"b": `bk_biz_id="2", bk_obj_id!="0", result_table_id="100147_ieod_system_cpu_detail_cmdb", __name__="usage_value"`,
+				},
+			},
+			ref: md.QueryReference{
+				"b": {
+					{
+						QueryList: md.QueryList{
+							{
+								DataSource:     BkMonitor,
+								Condition:      "bk_obj_id!='0' and bk_biz_id='2'",
+								Timezone:       "UTC",
+								Fields:         []string{"usage"},
+								TableID:        "system.cpu_detail",
+								DataLabel:      "cpu_detail",
+								MetricName:     "usage",
+								VmRt:           "100147_ieod_system_cpu_detail_cmdb",
+								VmConditionNum: 4,
+								VmCondition:    `bk_biz_id="2", bk_obj_id!="0", result_table_id="100147_ieod_system_cpu_detail_cmdb", __name__="usage_value"`,
+								StorageID:      "2",
+								StorageType:    consul.VictoriaMetricsStorageType,
+								Field:          "usage",
+								AllConditions: md.AllConditions{
+									{
+										{
+											DimensionName: "bk_biz_id",
+											Operator:      ConditionEqual,
+											Value:         []string{"2"},
+										},
+										{
+											DimensionName: "bk_obj_id",
+											Operator:      Ncontains,
+											Value:         []string{"0"},
+										},
+									},
+								},
+							},
+						},
+						ReferenceName: "b",
+						MetricName:    "usage",
+					},
+				},
+			},
+		},
+		"bk_inst_id / bk_obj_id 作为聚合 = 查询 VM": {
+			ts: &QueryTs{
+				QueryList: []*Query{
+					{
+						TableID:       "system.cpu_detail",
+						FieldName:     "usage",
+						ReferenceName: "b",
+						AggregateMethodList: AggregateMethodList{
+							{
+								Method: "increase",
+								Window: "1m",
+							},
+							{
+								Method: "sum",
+								Dimensions: []string{
+									"bk_inst_id",
+								},
+							},
 						},
 					},
 				},
-			}
-			mock.SetOfflineDataArchiveMetadata(mockMd)
-
-			query := &Query{
-				TableID:       TableID(tc.tableID),
-				FieldName:     tc.field,
-				ReferenceName: tc.referenceName,
-				Start:         tc.start,
-				End:           tc.end,
-				Conditions: Conditions{
-					FieldList: []ConditionField{
-						{
-							DimensionName: "bk_biz_id",
-							Operator:      "contains",
-							Value:         []string{"2"},
+				MetricMerge: "b",
+			},
+			promql:        "sum by (bk_inst_id) (increase(b[1m]))",
+			isDirectQuery: true,
+			expand: &md.VmExpand{
+				ResultTableList: []string{"100147_ieod_system_cpu_detail_cmdb"},
+				MetricFilterCondition: map[string]string{
+					"b": `bk_biz_id="2", result_table_id="100147_ieod_system_cpu_detail_cmdb", __name__="usage_value"`,
+				},
+			},
+			ref: md.QueryReference{
+				"b": {
+					{
+						QueryList: md.QueryList{
+							{
+								DataSource:     BkMonitor,
+								Condition:      "bk_biz_id='2'",
+								Timezone:       "UTC",
+								Fields:         []string{"usage"},
+								TableID:        "system.cpu_detail",
+								DataLabel:      "cpu_detail",
+								MetricName:     "usage",
+								VmRt:           "100147_ieod_system_cpu_detail_cmdb",
+								VmConditionNum: 3,
+								VmCondition:    `bk_biz_id="2", result_table_id="100147_ieod_system_cpu_detail_cmdb", __name__="usage_value"`,
+								StorageID:      "2",
+								StorageType:    consul.VictoriaMetricsStorageType,
+								Field:          "usage",
+								AllConditions: md.AllConditions{
+									{
+										{
+											DimensionName: "bk_biz_id",
+											Operator:      ConditionEqual,
+											Value:         []string{"2"},
+										},
+									},
+								},
+							},
+						},
+						ReferenceName: "b",
+						MetricName:    "usage",
+					},
+				},
+			},
+		},
+		"vm 聚合查询验证 - 1": {
+			ts: &QueryTs{
+				QueryList: []*Query{
+					{
+						TableID:       "system.cpu_detail",
+						FieldName:     "usage",
+						ReferenceName: "a",
+						TimeAggregation: TimeAggregation{
+							Function: "count_over_time",
+							Window:   "1m",
+						},
+						AggregateMethodList: AggregateMethodList{
+							{
+								Method:     "sum",
+								Dimensions: []string{"ip"},
+							},
 						},
 					},
 				},
-			}
+				MetricMerge: "a",
+				Start:       "1718865258",
+				End:         "1718868858",
+				Step:        "1m",
+			},
+			isDirectQuery: true,
+			promql:        `sum by (ip) (count_over_time(a[1m]))`,
+			expand: &md.VmExpand{
+				ResultTableList: []string{"100147_ieod_system_cpu_detail_raw"},
+				MetricFilterCondition: map[string]string{
+					"a": `bk_biz_id="2", result_table_id="100147_ieod_system_cpu_detail_raw", __name__="usage_value"`,
+				},
+			},
+			ref: md.QueryReference{
+				"a": {
+					{
+						QueryList: md.QueryList{
+							{
+								DataSource:     BkMonitor,
+								Condition:      "bk_biz_id='2'",
+								Timezone:       "UTC",
+								Fields:         []string{"usage"},
+								TableID:        "system.cpu_detail",
+								DataLabel:      "cpu_detail",
+								MetricName:     "usage",
+								VmRt:           "100147_ieod_system_cpu_detail_raw",
+								VmConditionNum: 3,
+								VmCondition:    `bk_biz_id="2", result_table_id="100147_ieod_system_cpu_detail_raw", __name__="usage_value"`,
+								StorageID:      "2",
+								StorageType:    consul.VictoriaMetricsStorageType,
+								Field:          "usage",
+								AllConditions: md.AllConditions{
+									{
+										{
+											DimensionName: "bk_biz_id",
+											Operator:      ConditionEqual,
+											Value:         []string{"2"},
+										},
+									},
+								},
+								Aggregates: md.Aggregates{
+									{
+										Name:       "count",
+										Dimensions: []string{"ip"},
+										Window:     time.Minute,
+									},
+								},
+							},
+						},
+						MetricName:    "usage",
+						ReferenceName: "a",
+					},
+				},
+			},
+		},
+		"vm 聚合查询验证 - 2": {
+			ts: &QueryTs{
 
-			metric, err := query.ToQueryMetric(ctx, tc.spaceUid)
+				QueryList: []*Query{
+					{
+						TableID:       "system.cpu_detail",
+						FieldName:     "usage",
+						ReferenceName: "a",
+						TimeAggregation: TimeAggregation{
+							Function: "increase",
+							Window:   "1m",
+						},
+						AggregateMethodList: AggregateMethodList{
+							{
+								Method:     "sum",
+								Dimensions: []string{"ip"},
+							},
+						},
+					},
+				},
+				MetricMerge: "a",
+				Start:       "1718865258",
+				End:         "1718868858",
+				Step:        "1m",
+			},
+			isDirectQuery: true,
+			promql:        `sum by (ip) (increase(a[1m]))`,
+			expand: &md.VmExpand{
+				ResultTableList: []string{"100147_ieod_system_cpu_detail_raw"},
+				MetricFilterCondition: map[string]string{
+					"a": `bk_biz_id="2", result_table_id="100147_ieod_system_cpu_detail_raw", __name__="usage_value"`,
+				},
+			},
+			ref: md.QueryReference{
+				"a": {
+					{
+						QueryList: md.QueryList{
+							{
+								DataSource:     BkMonitor,
+								Condition:      "bk_biz_id='2'",
+								Timezone:       "UTC",
+								Fields:         []string{"usage"},
+								TableID:        "system.cpu_detail",
+								DataLabel:      "cpu_detail",
+								MetricName:     "usage",
+								VmRt:           "100147_ieod_system_cpu_detail_raw",
+								VmConditionNum: 3,
+								VmCondition:    `bk_biz_id="2", result_table_id="100147_ieod_system_cpu_detail_raw", __name__="usage_value"`,
+								StorageID:      "2",
+								StorageType:    consul.VictoriaMetricsStorageType,
+								Field:          "usage",
+								AllConditions: md.AllConditions{
+									{
+										{
+											DimensionName: "bk_biz_id",
+											Operator:      ConditionEqual,
+											Value:         []string{"2"},
+										},
+									},
+								},
+							},
+						},
+						MetricName:    "usage",
+						ReferenceName: "a",
+					},
+				},
+			},
+		},
+		"vm 聚合查询验证 - 3": {
+			ts: &QueryTs{
+				QueryList: []*Query{
+					{
+						DataSource:    BkMonitor,
+						TableID:       "system.cpu_detail",
+						FieldName:     "usage",
+						ReferenceName: "a",
+						TimeAggregation: TimeAggregation{
+							Function: "sum_over_time",
+							Window:   "1m",
+						},
+						AggregateMethodList: AggregateMethodList{
+							{
+								Method:     "sum",
+								Dimensions: []string{"ip", "service"},
+							},
+							{
+								Method: "topk",
+								VArgsList: []interface{}{
+									5,
+								},
+							},
+						},
+					},
+				},
+				MetricMerge: "a",
+				Start:       "1718865258",
+				End:         "1718868858",
+				Step:        "1m",
+			},
+			isDirectQuery: true,
+			promql:        `topk(5, sum by (ip, service) (sum_over_time(a[1m])))`,
+			expand: &md.VmExpand{
+				ResultTableList: []string{"100147_ieod_system_cpu_detail_raw"},
+				MetricFilterCondition: map[string]string{
+					"a": `bk_biz_id="2", result_table_id="100147_ieod_system_cpu_detail_raw", __name__="usage_value"`,
+				},
+			},
+			ref: md.QueryReference{
+				"a": {
+					{
+						QueryList: md.QueryList{
+							{
+								DataSource:     BkMonitor,
+								Condition:      "bk_biz_id='2'",
+								Timezone:       "UTC",
+								Fields:         []string{"usage"},
+								TableID:        "system.cpu_detail",
+								DataLabel:      "cpu_detail",
+								MetricName:     "usage",
+								VmRt:           "100147_ieod_system_cpu_detail_raw",
+								VmConditionNum: 3,
+								VmCondition:    `bk_biz_id="2", result_table_id="100147_ieod_system_cpu_detail_raw", __name__="usage_value"`,
+								StorageID:      "2",
+								StorageType:    consul.VictoriaMetricsStorageType,
+								Field:          "usage",
+								AllConditions: md.AllConditions{
+									{
+										{
+											DimensionName: "bk_biz_id",
+											Operator:      ConditionEqual,
+											Value:         []string{"2"},
+										},
+									},
+								},
+								Aggregates: md.Aggregates{
+									{
+										Name:       "sum",
+										Dimensions: []string{"ip", "service"},
+										Window:     time.Minute,
+									},
+								},
+							},
+						},
+						MetricName:    "usage",
+						ReferenceName: "a",
+					},
+				},
+			},
+		},
+		"非 vm 聚合查询验证 - 1": {
+			ts: &QueryTs{
+				QueryList: []*Query{
+					{
+						DataSource:    BkMonitor,
+						TableID:       "system.cpu_summary",
+						FieldName:     "usage",
+						ReferenceName: "a",
+						TimeAggregation: TimeAggregation{
+							Function: "count_over_time",
+							Window:   "1m",
+						},
+						AggregateMethodList: AggregateMethodList{
+							{
+								Method:     "sum",
+								Dimensions: []string{"ip"},
+							},
+						},
+					},
+				},
+				MetricMerge: "a",
+				Start:       "1718865258",
+				End:         "1718868858",
+				Step:        "1m",
+			},
+			isDirectQuery: false,
+			promql:        `sum by (ip) (last_over_time(a[1m]))`,
+			ref: md.QueryReference{
+				"a": {
+					{
+						QueryList: md.QueryList{
+							{
+								DataSource:     BkMonitor,
+								Condition:      "bk_biz_id='2'",
+								Timezone:       "UTC",
+								Fields:         []string{"usage"},
+								TableID:        "system.cpu_summary",
+								DataLabel:      "cpu_summary",
+								MetricName:     "usage",
+								VmConditionNum: 2,
+								VmCondition:    `bk_biz_id="2", __name__="usage_value"`,
+								StorageID:      "2",
+								DB:             "system",
+								Measurement:    "cpu_summary",
+								Measurements:   []string{"cpu_summary"},
+								ClusterName:    "default",
+								StorageType:    consul.InfluxDBStorageType,
+								Field:          "usage",
+								AllConditions: md.AllConditions{
+									{
+										{
+											DimensionName: "bk_biz_id",
+											Operator:      ConditionEqual,
+											Value:         []string{"2"},
+										},
+									},
+								},
+								Aggregates: md.Aggregates{
+									{
+										Name:       "count",
+										Dimensions: []string{"ip"},
+										Window:     time.Minute,
+									},
+								},
+							},
+						},
+						MetricName:    "usage",
+						ReferenceName: "a",
+					},
+				},
+			},
+		},
+		"非 vm 聚合查询验证 - 2": {
+			ts: &QueryTs{
+				QueryList: []*Query{
+					{
+						TableID:       "system.cpu_summary",
+						FieldName:     "usage",
+						ReferenceName: "a",
+						TimeAggregation: TimeAggregation{
+							Function: "increase",
+							Window:   "1m",
+						},
+						AggregateMethodList: AggregateMethodList{
+							{
+								Method:     "sum",
+								Dimensions: []string{"ip"},
+							},
+						},
+					},
+				},
+				MetricMerge: "a",
+				Start:       "1718865258",
+				End:         "1718868858",
+				Step:        "1m",
+			},
+			isDirectQuery: false,
+			promql:        `sum by (ip) (increase(a[1m]))`,
+			ref: md.QueryReference{
+				"a": {
+					{
+						QueryList: md.QueryList{
+							{
+								DataSource:     BkMonitor,
+								Condition:      "bk_biz_id='2'",
+								Timezone:       "UTC",
+								Fields:         []string{"usage"},
+								TableID:        "system.cpu_summary",
+								DataLabel:      "cpu_summary",
+								MetricName:     "usage",
+								DB:             "system",
+								Measurement:    "cpu_summary",
+								Measurements:   []string{"cpu_summary"},
+								ClusterName:    "default",
+								VmConditionNum: 2,
+								VmCondition:    `bk_biz_id="2", __name__="usage_value"`,
+								StorageID:      "2",
+								StorageType:    consul.InfluxDBStorageType,
+								Field:          "usage",
+								AllConditions: md.AllConditions{
+									{
+										{
+											DimensionName: "bk_biz_id",
+											Operator:      ConditionEqual,
+											Value:         []string{"2"},
+										},
+									},
+								},
+							},
+						},
+						MetricName:    "usage",
+						ReferenceName: "a",
+					},
+				},
+			},
+		},
+		"非 vm 聚合查询验证 - 3": {
+			ts: &QueryTs{
+				QueryList: []*Query{
+					{
+						DataSource:    BkMonitor,
+						TableID:       "system.cpu_summary",
+						FieldName:     "usage",
+						ReferenceName: "a",
+						TimeAggregation: TimeAggregation{
+							Function: "sum_over_time",
+							Window:   "1m",
+						},
+						AggregateMethodList: AggregateMethodList{
+							{
+								Method:     "sum",
+								Dimensions: []string{"ip"},
+							},
+							{
+								Method: "topk",
+								VArgsList: []interface{}{
+									1,
+								},
+							},
+						},
+					},
+				},
+				MetricMerge: "a",
+				Start:       "1718865258",
+				End:         "1718868858",
+				Step:        "1m",
+			},
+			isDirectQuery: false,
+			promql:        `topk(1, sum by (ip) (last_over_time(a[1m])))`,
+			ref: md.QueryReference{
+				"a": {
+					{
+						QueryList: md.QueryList{
+							{
+								DataSource:     BkMonitor,
+								Condition:      "bk_biz_id='2'",
+								Timezone:       "UTC",
+								Fields:         []string{"usage"},
+								TableID:        "system.cpu_summary",
+								MetricName:     "usage",
+								DB:             "system",
+								Measurement:    "cpu_summary",
+								Measurements:   []string{"cpu_summary"},
+								ClusterName:    "default",
+								VmConditionNum: 2,
+								VmCondition:    `bk_biz_id="2", __name__="usage_value"`,
+								StorageID:      "2",
+								StorageType:    consul.InfluxDBStorageType,
+								Field:          "usage",
+								DataLabel:      "cpu_summary",
+								AllConditions: md.AllConditions{
+									{
+										{
+											DimensionName: "bk_biz_id",
+											Operator:      ConditionEqual,
+											Value:         []string{"2"},
+										},
+									},
+								},
+								Aggregates: md.Aggregates{
+									{
+										Name:       "sum",
+										Dimensions: []string{"ip"},
+										Window:     time.Minute,
+									},
+								},
+							},
+						},
+						MetricName:    "usage",
+						ReferenceName: "a",
+					},
+				},
+			},
+		},
+		"es 聚合查询验证 - 4": {
+			ts: &QueryTs{
+				QueryList: []*Query{
+					{
+						DataSource:    BkLog,
+						TableID:       "result_table.es",
+						FieldName:     "usage",
+						ReferenceName: "a",
+						TimeAggregation: TimeAggregation{
+							Function: "sum_over_time",
+							Window:   "1m",
+						},
+						AggregateMethodList: AggregateMethodList{
+							{
+								Method:     "sum",
+								Dimensions: []string{"__ext.container"},
+							},
+							{
+								Method: "topk",
+								VArgsList: []interface{}{
+									1,
+								},
+							},
+						},
+					},
+				},
+				MetricMerge: "a",
+				Start:       "1718865258",
+				End:         "1718868858",
+				Step:        "1m",
+			},
+			isDirectQuery: false,
+			promql:        `topk(1, sum by (__ext__bk_46__container) (last_over_time(a[1m])))`,
+			ref: md.QueryReference{
+				"a": {
+					{
+						QueryList: md.QueryList{
+							{
+								DataSource:     BkLog,
+								Timezone:       "UTC",
+								SourceType:     "bkdata",
+								TableID:        "result_table.es",
+								DataLabel:      "es",
+								DB:             "es_index",
+								MetricName:     "usage",
+								VmConditionNum: 1,
+								VmCondition:    `__name__="usage_value"`,
+								StorageID:      "3",
+								StorageIDs: []string{
+									"3",
+								},
+								Field:       "usage",
+								StorageType: consul.ElasticsearchStorageType,
+								Aggregates: md.Aggregates{
+									{
+										Name:       "sum",
+										Dimensions: []string{"__ext.container"},
+										Window:     time.Minute,
+									},
+								},
+							},
+						},
+						MetricName:    "usage",
+						ReferenceName: "a",
+					},
+				},
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var (
+				ref      md.QueryReference
+				vmExpand *md.VmExpand
+			)
+			ctx = md.InitHashID(ctx)
+
+			md.SetUser(ctx, "", influxdb.SpaceUid, "")
+			ref, err := tc.ts.ToQueryReference(ctx)
 			assert.Nil(t, err)
-			if len(metric.QueryList) > 0 {
-				assert.Equal(t, tc.expectedStorageID, metric.QueryList[0].StorageID)
-			} else {
-				panic("query list length is 0")
+			assert.Equal(t, tc.ref, ref)
+
+			vmExpand = ref.ToVmExpand(ctx)
+			isDirectQuery := md.GetQueryParams(ctx).IsDirectQuery()
+
+			assert.Equal(t, tc.isDirectQuery, isDirectQuery)
+			assert.Equal(t, tc.expand, vmExpand)
+
+			promExprOpt := &PromExprOption{
+				IgnoreTimeAggregationEnable: !isDirectQuery,
 			}
+
+			promql, _ := tc.ts.ToPromExpr(ctx, promExprOpt)
+			assert.Equal(t, tc.promql, promql.String())
 		})
 	}
+}
 
+func TestAggregations(t *testing.T) {
+	for name, c := range map[string]struct {
+		query *Query
+		aggs  md.Aggregates
+	}{
+		"test query with sum count_over_time": {
+			query: &Query{
+				AggregateMethodList: AggregateMethodList{
+					{
+						Method:     "sum",
+						Dimensions: []string{"dim-1"},
+					},
+				},
+				TimeAggregation: TimeAggregation{
+					Function: "count_over_time",
+					Window:   "1m",
+				},
+				Step:     "1m",
+				Timezone: "Asia/ShangHai",
+			},
+			aggs: md.Aggregates{
+				{
+					Name:       "count",
+					Dimensions: []string{"dim-1"},
+					Window:     time.Minute,
+					TimeZone:   "Asia/ShangHai",
+				},
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			aggs, err := c.query.Aggregates()
+			assert.Nil(t, err)
+			assert.Equal(t, c.aggs, aggs)
+		})
+	}
+}
+
+func TestGetMaxWindow(t *testing.T) {
+	tests := []struct {
+		name        string
+		queryList   []*Query
+		expected    time.Duration
+		expectError bool
+	}{
+		{
+			name: "Normal case with multiple windows",
+			queryList: []*Query{
+				{
+					AggregateMethodList: []AggregateMethod{
+						{Window: "5m"},
+						{Window: "10m"},
+					},
+				},
+				{
+					AggregateMethodList: []AggregateMethod{
+						{Window: "15m"},
+						{Window: "20m"},
+					},
+				},
+			},
+			expected:    20 * time.Minute,
+			expectError: false,
+		},
+		{
+			name:        "Empty QueryList",
+			queryList:   []*Query{},
+			expected:    0,
+			expectError: false,
+		},
+		{
+			name: "Invalid Window",
+			queryList: []*Query{
+				{
+					AggregateMethodList: []AggregateMethod{
+						{Window: "invalid"},
+					},
+				},
+			},
+			expected:    0,
+			expectError: true,
+		},
+		{
+			name: "Multiple Windows with one invalid",
+			queryList: []*Query{
+				{
+					AggregateMethodList: []AggregateMethod{
+						{Window: "5m"},
+						{Window: "invalid"},
+					},
+				},
+				{
+					AggregateMethodList: []AggregateMethod{
+						{Window: "15m"},
+						{Window: "20m"},
+					},
+				},
+			},
+			expected:    0,
+			expectError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			q := &QueryTs{
+				QueryList: tt.queryList,
+			}
+			result, err := q.GetMaxWindow()
+			if tt.expectError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+			assert.Equal(t, tt.expected, result)
+		})
+	}
 }

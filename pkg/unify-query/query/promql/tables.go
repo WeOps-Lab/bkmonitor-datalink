@@ -16,9 +16,6 @@ import (
 	"strings"
 
 	prom "github.com/prometheus/prometheus/promql"
-
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/influxdb"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/tsdb/victoriaMetrics"
 )
 
 // Table :
@@ -33,7 +30,7 @@ type Table struct {
 }
 
 // NewTableWithSample
-func NewTableWithSample(index int, sample prom.Sample) *Table {
+func NewTableWithSample(index int, sample prom.Sample, queryRawFormat func(string) string) *Table {
 	var t = new(Table)
 	// header对应的就是列名,promql的数据列是固定的
 	t.Headers = []string{"_time", "_value"}
@@ -47,6 +44,15 @@ func NewTableWithSample(index int, sample prom.Sample) *Table {
 	t.GroupValues = make([]string, 0, len(sample.Metric))
 	// 根据labels获取group信息
 	for _, label := range sample.Metric {
+		if queryRawFormat != nil {
+			label.Name = queryRawFormat(label.Name)
+		}
+
+		// es 查询使用了空格作为占位符，所以这里需要将标签中的空格替换掉
+		if label.Value == " " {
+			label.Value = ""
+		}
+
 		t.GroupKeys = append(t.GroupKeys, label.Name)
 		t.GroupValues = append(t.GroupValues, label.Value)
 	}
@@ -54,12 +60,13 @@ func NewTableWithSample(index int, sample prom.Sample) *Table {
 	t.Name = "series" + strconv.Itoa(index)
 
 	return t
-
 }
 
 // NewTable
-func NewTable(index int, series prom.Series) *Table {
-	var t = new(Table)
+func NewTable(index int, series prom.Series, queryRawFormat func(string) string) *Table {
+	var (
+		t = new(Table)
+	)
 	// header对应的就是列名,promql的数据列是固定的
 	t.Headers = []string{"_time", "_value"}
 	t.Types = []string{"float", "float"}
@@ -80,10 +87,17 @@ func NewTable(index int, series prom.Series) *Table {
 	// 根据labels获取group信息
 	for _, label := range series.Metric {
 		// 过滤随机标签数据
-		if label.Name != influxdb.BKTaskIndex {
-			t.GroupKeys = append(t.GroupKeys, label.Name)
-			t.GroupValues = append(t.GroupValues, label.Value)
+		if queryRawFormat != nil {
+			label.Name = queryRawFormat(label.Name)
 		}
+
+		// es 查询使用了空格作为占位符，所以这里需要将标签中的空格替换掉
+		if label.Value == " " {
+			label.Value = ""
+		}
+
+		t.GroupKeys = append(t.GroupKeys, label.Name)
+		t.GroupValues = append(t.GroupValues, label.Value)
 	}
 
 	t.Name = "series" + strconv.Itoa(index)
@@ -134,62 +148,4 @@ func (t *Tables) Add(table *Table) {
 func (t *Tables) Clear() error {
 	t.Tables = make([]*Table, 0)
 	return nil
-}
-
-func VmSeriesMatrixToTable(index int, series victoriaMetrics.Series) *Table {
-	var t = new(Table)
-
-	// header对应的就是列名,promql的数据列是固定的
-	t.Headers = []string{"_time", "_value"}
-	t.Types = []string{"float", "float"}
-
-	t.Data = make([][]any, len(series.Values))
-	// value 需要转换，prometheus 默认返回统一格式为："values":[[1669888800,"60842146.12999754"],[1669888860,"61027074.58999748"]]
-	// 按照以上格式严格做转换为："values":[[1669888800000,24866023.349999852],[1669888860000,24866774.23000016]]
-	// 其中，时间转换为毫秒以及 int64 类型，值转换为 float64 类型
-	for i, point := range series.Values {
-		// 长度异常
-		if len(point) != 2 {
-			continue
-		}
-		var (
-			nt  int64
-			nv  float64
-			err error
-		)
-
-		// 时间从 float64 转换为 int64
-		switch pt := point[0].(type) {
-		case float64:
-			// 从秒转换为毫秒
-			nt = int64(pt) * 1e3
-		default:
-			continue
-		}
-
-		// 值从 string 转换为 float64
-		switch pv := point[1].(type) {
-		case string:
-			nv, err = strconv.ParseFloat(pv, 64)
-			if err != nil {
-				continue
-			}
-		default:
-			continue
-		}
-
-		t.Data[i] = []interface{}{nt, nv}
-	}
-
-	// group信息与tags对应
-	t.GroupKeys = make([]string, 0, len(series.Metric))
-	t.GroupValues = make([]string, 0, len(series.Metric))
-	// 根据labels获取group信息
-	for k, v := range series.Metric {
-		t.GroupKeys = append(t.GroupKeys, k)
-		t.GroupValues = append(t.GroupValues, v)
-	}
-
-	t.Name = "series" + strconv.Itoa(index)
-	return t
 }

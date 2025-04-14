@@ -11,110 +11,27 @@ package objectsref
 
 import (
 	"sync"
-	"time"
-
-	"github.com/prometheus/client_golang/prometheus"
-
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/common/define"
 )
 
 var (
-	workloadLookupRequestTotal = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Namespace: define.MonitorNamespace,
-			Name:      "workload_lookup_request_total",
-			Help:      "workload lookup request total",
-		},
-	)
-
-	workloadLookupDuration = prometheus.NewHistogram(
-		prometheus.HistogramOpts{
-			Namespace: define.MonitorNamespace,
-			Name:      "workload_lookup_duration_seconds",
-			Help:      "workload lookup duration seconds",
-			Buckets:   define.DefObserveDuration,
-		},
-	)
-
-	clusterVersion = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: define.MonitorNamespace,
-			Name:      "cluster_version",
-			Help:      "kubernetes server version",
-		},
-		[]string{"version"},
-	)
+	resourceMapMut sync.Mutex
+	resourceMap    map[string]int
 )
 
-func init() {
-	prometheus.MustRegister(
-		workloadLookupRequestTotal,
-		workloadLookupDuration,
-		clusterVersion,
-	)
-}
+func GetResourceCount() map[string]int {
+	resourceMapMut.Lock()
+	defer resourceMapMut.Unlock()
 
-type namespaceKind struct {
-	namespace string
-	kind      string
-}
-
-var (
-	nsUpdated     time.Time
-	nkWorkloadMut sync.Mutex
-	nkWorkload    = map[namespaceKind]int{}
-)
-
-func GetWorkloadInfo() (map[string]int, time.Time) {
-	ret := make(map[string]int)
-	nkWorkloadMut.Lock()
-	for k, v := range nkWorkload {
-		ret[k.kind] += v
+	counts := make(map[string]int)
+	for k, v := range resourceMap {
+		counts[k] = v
 	}
-	nkWorkloadMut.Unlock()
-	return ret, nsUpdated
+	return counts
 }
 
-type metricMonitor struct{}
+func SetWorkloadCount(counts map[string]int) {
+	resourceMapMut.Lock()
+	defer resourceMapMut.Unlock()
 
-func newMetricMonitor() *metricMonitor {
-	return &metricMonitor{}
-}
-
-func (mm *metricMonitor) SetWorkloadCount(v int, namespace, kind string) {
-	nkWorkloadMut.Lock()
-	nsUpdated = time.Now()
-	nkWorkload[namespaceKind{namespace: namespace, kind: kind}] = v
-	nkWorkloadMut.Unlock()
-}
-
-func (mm *metricMonitor) ObserveWorkloadLookupDuration(t time.Time) {
-	workloadLookupDuration.Observe(time.Since(t).Seconds())
-}
-
-func (mm *metricMonitor) IncWorkloadRequestCounter() {
-	workloadLookupRequestTotal.Inc()
-}
-
-var (
-	clusterNode          int
-	clusterNodeUpdatedAt time.Time
-)
-
-func GetClusterNodeInfo() (int, time.Time) {
-	return clusterNode, clusterNodeUpdatedAt
-}
-
-func incClusterNodeCount() {
-	clusterNode++
-	clusterNodeUpdatedAt = time.Now()
-}
-
-func decClusterNodeCount() {
-	clusterNode--
-	clusterNodeUpdatedAt = time.Now()
-}
-
-func setClusterVersion(v string) {
-	clusterVersion.WithLabelValues(v).Set(1)
+	resourceMap = counts
 }

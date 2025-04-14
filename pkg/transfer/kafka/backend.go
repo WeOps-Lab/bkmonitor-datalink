@@ -21,7 +21,6 @@ import (
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/transfer/config"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/transfer/define"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/transfer/json"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/transfer/logging"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/transfer/utils"
 )
@@ -67,6 +66,7 @@ type Backend struct {
 	payloadChan           chan define.Payload
 	wg                    sync.WaitGroup
 	producer              Producer
+	dropEmptyMetrics      bool
 
 	Topic     string
 	Key       string
@@ -81,12 +81,7 @@ var NewProducer = func(cluster []string, conf *sarama.Config) (Producer, error) 
 
 // NewKafkaBackend:
 func NewKafkaBackend(ctx context.Context, name string) (*Backend, error) {
-	var (
-		conf = config.FromContext(ctx)
-		err  error
-	)
 	shipper := config.ShipperConfigFromContext(ctx)
-	auth := config.NewAuthInfo(shipper)
 	kafkaConfig := shipper.AsKafkaCluster()
 
 	topic := kafkaConfig.GetTopic()
@@ -94,27 +89,7 @@ func NewKafkaBackend(ctx context.Context, name string) (*Backend, error) {
 	partition := kafkaConfig.GetPartition()
 
 	cluster := fmt.Sprintf("%s:%d", kafkaConfig.GetDomain(), kafkaConfig.GetPort())
-
 	logging.Debugf("prepare to push to cluster: %v, topic: %v", cluster, topic)
-
-	producerConfig, err := NewKafkaProducerConfig(conf)
-	if err != nil {
-		logging.Errorf("create producer failed:%v", err)
-		return nil, err
-	}
-	userName, err := auth.GetUserName()
-	if err != nil {
-		logging.Warnf("%v may not establish connection %v: username", name, define.ErrGetAuth)
-	}
-	passWord, err := auth.GetPassword()
-	if err != nil {
-		logging.Warnf("%v may not establish connection %v: password", name, define.ErrGetAuth)
-	}
-	if userName != "" || passWord != "" && err == nil {
-		producerConfig.Net.SASL.User = userName
-		producerConfig.Net.SASL.Password = passWord
-		producerConfig.Net.SASL.Enable = true
-	}
 
 	ctx, cancelFun := context.WithCancel(ctx)
 	pipeConfig := config.PipelineConfigFromContext(ctx)
@@ -133,7 +108,7 @@ func NewKafkaBackend(ctx context.Context, name string) (*Backend, error) {
 		producer:     nil,
 		Topic:        topic,
 		Partition:    int32(partition),
-	}, err
+	}, nil
 }
 
 func (b *Backend) init() error {
@@ -144,7 +119,8 @@ func (b *Backend) init() error {
 
 	pipelineConfig := config.PipelineConfigFromContext(b.ctx)
 	if pipelineConfig != nil {
-		b.ETLConfig = pipelineConfig.ETLConfig
+		opts := utils.NewMapHelper(pipelineConfig.Option)
+		b.dropEmptyMetrics, _ = opts.GetBool(config.PipelineConfigDropEmptyMetrics)
 	}
 
 	shipper := config.ShipperConfigFromContext(b.ctx)
@@ -155,6 +131,38 @@ func (b *Backend) init() error {
 	if err != nil {
 		logging.Errorf("create producer config err: %v", err)
 		return err
+	}
+
+	auth := config.NewAuthInfo(shipper)
+	username, err := auth.GetUserName()
+	if err != nil {
+		logging.Warnf("%v may not establish connection %v: username", b.Name, define.ErrGetAuth)
+	}
+	password, err := auth.GetPassword()
+	if err != nil {
+		logging.Warnf("%v may not establish connection %v: password", b.Name, define.ErrGetAuth)
+	}
+	if username != "" || password != "" && err == nil {
+		producerConfig.Net.SASL.User = username
+		producerConfig.Net.SASL.Password = password
+		producerConfig.Net.SASL.Enable = true
+
+		// 目前仅支持 sha512/sha256
+		info := utils.NewMapHelper(kafkaConfig.AuthInfo)
+		if mechanisms, ok := info.GetString(optSaslMechanisms); ok {
+			switch mechanisms {
+			case "SCRAM-SHA-512":
+				producerConfig.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
+				producerConfig.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient {
+					return &XDGSCRAMClient{HashGeneratorFcn: SHA512}
+				}
+			case "SCRAM-SHA-256":
+				producerConfig.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA256
+				producerConfig.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient {
+					return &XDGSCRAMClient{HashGeneratorFcn: SHA256}
+				}
+			}
+		}
 	}
 
 	b.producer, err = NewProducer([]string{cluster}, producerConfig)
@@ -246,6 +254,20 @@ func (b *Backend) SendMsg(payload define.Payload) {
 		}
 	}
 
+	// 丢弃空 metrics
+	if b.dropEmptyMetrics {
+		for k, v := range etlRecord.Metrics {
+			if v == nil {
+				delete(etlRecord.Metrics, k)
+			}
+		}
+		if len(etlRecord.Metrics) <= 0 {
+			b.skipStats.Inc()
+			logging.Warnf("skip empty record: %+v", etlRecord)
+			return
+		}
+	}
+
 	// 时间非空
 	if etlRecord.Time != nil {
 		t := payload.GetTime()
@@ -254,15 +276,7 @@ func (b *Backend) SendMsg(payload define.Payload) {
 		b.frontendDeltaObserver.Observe(t.Sub(at).Seconds())
 	}
 
-	switch b.ETLConfig {
-	// 当时自定义时序类型的时候 需要丢弃 dimensions/timestamp 维度 使用 ETLConfig 转换
-	case "bk_standard_v2_time_series":
-		message, err = json.Marshal(etlRecord)
-		// 其余情况使用 payload 自带转换方式
-	default:
-		err = payload.To(&message)
-	}
-
+	err = payload.To(&message)
 	if err != nil {
 		logging.Warnf("%v load %#v error %v", b, payload, err)
 		b.CounterFails.Inc()

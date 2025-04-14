@@ -16,18 +16,20 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jinzhu/gorm"
 	"github.com/pkg/errors"
-	"github.com/spf13/viper"
 
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/config"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/internal/metadata/models"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/store/consul"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/utils/cipher"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/utils/hashconsul"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/utils/jsonx"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/bk-monitor-worker/utils/timex"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/logger"
 )
 
-//go:generate goqueryset -in influxdbhostinfo.go -out qs_influxdbhostinfo.go
+//go:generate goqueryset -in influxdbhostinfo.go -out qs_influxdbhostinfo_gen.go
 
 // InfluxdbHostInfo influxdb host info model
 // gen:qs
@@ -38,11 +40,11 @@ type InfluxdbHostInfo struct {
 	Username        string  `gorm:"size:64" json:"username;"`
 	Password        string  `gorm:"password" json:"password"`
 	Description     string  `gorm:"size:256" json:"description"`
-	Status          bool    `gorm:"default:false" json:"status"`
-	GrpcPort        uint    `gorm:"default:8090" json:"grpc_port"`
-	BackupRateLimit float64 `gorm:"default:0" json:"backup_rate_limit"`
-	ReadRateLimit   float64 `gorm:"default:0" json:"read_rate_limit"`
-	Protocol        string  `gorm:"default:http" json:"protocol"`
+	Status          bool    `gorm:"column:status" json:"status"`
+	GrpcPort        uint    `gorm:"column:grpc_port" json:"grpc_port"`
+	BackupRateLimit float64 `gorm:"column:backup_rate_limit" json:"backup_rate_limit"`
+	ReadRateLimit   float64 `gorm:"column:read_rate_limit" json:"read_rate_limit"`
+	Protocol        string  `gorm:"column:protocol" json:"protocol"`
 }
 
 // TableName 用于设置表的别名
@@ -50,13 +52,29 @@ func (InfluxdbHostInfo) TableName() string {
 	return "metadata_influxdbhostinfo"
 }
 
+// BeforeCreate 配置默认字段
+func (i *InfluxdbHostInfo) BeforeCreate(tx *gorm.DB) error {
+	if i.Protocol == "" {
+		i.Protocol = "http"
+	}
+	if i.GrpcPort == 0 {
+		i.GrpcPort = 8090
+	}
+	return nil
+}
+
 // GetConsulConfig 生成consul配置信息
 func (i InfluxdbHostInfo) GetConsulConfig() map[string]interface{} {
+	pwd, err := cipher.GetDBAESCipher().AESDecrypt(i.Password)
+	if err != nil {
+		logger.Error("GetConsulConfig:get influxdb host info password error", err)
+		return nil
+	}
 	return map[string]interface{}{
 		"domain_name":       i.DomainName,
 		"port":              i.Port,
 		"username":          i.Username,
-		"password":          cipher.AESDecrypt(i.Password),
+		"password":          pwd,
 		"status":            i.Status,
 		"backup_rate_limit": i.BackupRateLimit,
 		"grpc_port":         i.GrpcPort,
@@ -67,7 +85,7 @@ func (i InfluxdbHostInfo) GetConsulConfig() map[string]interface{} {
 
 // ConsulPath 获取host_info的consul根路径
 func (InfluxdbHostInfo) ConsulPath() string {
-	return fmt.Sprintf(models.InfluxdbHostInfoConsulPathTemplate, viper.GetString(consul.ConsulBasePath))
+	return fmt.Sprintf(models.InfluxdbHostInfoConsulPathTemplate, config.StorageConsulPathPrefix, config.BypassSuffixPath)
 }
 
 // ConsulConfigPath 获取具体host的consul配置路径
@@ -77,23 +95,23 @@ func (i InfluxdbHostInfo) ConsulConfigPath() string {
 
 // RefreshConsulClusterConfig 刷新consul中的influxdb主机信息
 func (i InfluxdbHostInfo) RefreshConsulClusterConfig(ctx context.Context) error {
-	consulClient, err := consul.GetInstance(ctx)
+	consulClient, err := consul.GetInstance()
 	if err != nil {
 		return err
 	}
 	// 从数据库中生成consul配置信息
-	config := i.GetConsulConfig()
-	configStr, err := jsonx.MarshalString(config)
+	cfg := i.GetConsulConfig()
+	configStr, err := jsonx.MarshalString(cfg)
 	if err != nil {
 		return err
 	}
 	// 更新consul信息
-	err = consulClient.Put(i.ConsulConfigPath(), configStr, 0)
+	err = hashconsul.PutCas(consulClient, i.ConsulConfigPath(), configStr, 0, nil)
 	if err != nil {
 		logger.Errorf("host: [%s] refresh consul config failed, %v", i.HostName, err)
 		return err
 	}
-	models.PushToRedis(ctx, models.InfluxdbHostInfoKey, i.HostName, configStr, true)
+	models.PushToRedis(ctx, models.InfluxdbHostInfoKey, i.HostName, configStr)
 	return nil
 }
 

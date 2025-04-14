@@ -14,83 +14,78 @@ import (
 	"strconv"
 )
 
-type Params struct {
-	SQL                        string `json:"sql"`
-	BkdataAuthenticationMethod string `json:"bkdata_authentication_method"`
-	BkUsername                 string `json:"bk_username"`
-	BkAppCode                  string `json:"bk_app_code"`
-	PreferStorage              string `json:"prefer_storage"`
-	BkdataDataToken            string `json:"bkdata_data_token"`
-	BkAppSecret                string `json:"bk_app_secret"`
-}
-
 type ParamsQueryRange struct {
 	InfluxCompatible bool   `json:"influx_compatible"`
 	UseNativeOr      bool   `json:"use_native_or"`
 	APIType          string `json:"api_type"`
+	ClusterName      string `json:"cluster_name"`
 	APIParams        struct {
-		Query string `json:"query"`
-		Start int64  `json:"start"`
-		End   int64  `json:"end"`
-		Step  int64  `json:"step"`
+		Query   string `json:"query"`
+		Start   int64  `json:"start"`
+		End     int64  `json:"end"`
+		Step    int64  `json:"step"`
+		NoCache int    `json:"nocache"`
 	} `json:"api_params"`
-	ResultTableGroup      map[string][]string `json:"result_table_group"`
-	MetricFilterCondition map[string]string   `json:"metric_filter_condition"`
-	MetricAliasMapping    map[string]string   `json:"metric_alias_mapping"`
+	ResultTableList       []string          `json:"result_table_list,omitempty"`
+	MetricFilterCondition map[string]string `json:"metric_filter_condition,omitempty"`
 }
 
 type ParamsQuery struct {
 	InfluxCompatible bool   `json:"influx_compatible"`
 	UseNativeOr      bool   `json:"use_native_or"`
 	APIType          string `json:"api_type"`
+	ClusterName      string `json:"cluster_name"`
 	APIParams        struct {
 		Query   string `json:"query"`
 		Time    int64  `json:"time"`
 		Timeout int64  `json:"timeout"`
 	} `json:"api_params"`
-	ResultTableGroup      map[string][]string `json:"result_table_group"`
-	MetricFilterCondition map[string]string   `json:"metric_filter_condition"`
-	MetricAliasMapping    map[string]string   `json:"metric_alias_mapping"`
+	ResultTableList       []string          `json:"result_table_list,omitempty"`
+	MetricFilterCondition map[string]string `json:"metric_filter_condition,omitempty"`
 }
 
 type ParamsSeries struct {
 	InfluxCompatible bool   `json:"influx_compatible"`
 	UseNativeOr      bool   `json:"use_native_or"`
 	APIType          string `json:"api_type"`
+	ClusterName      string `json:"cluster_name"`
 	APIParams        struct {
 		Match string `json:"match[]"`
 		Start int64  `json:"start"`
 		End   int64  `json:"end"`
+		Limit int    `json:"limit"`
 	} `json:"api_params"`
-	ResultTableGroup      map[string][]string `json:"result_table_group"`
-	MetricFilterCondition map[string]string   `json:"metric_filter_condition"`
-	MetricAliasMapping    map[string]string   `json:"metric_alias_mapping"`
+	ResultTableList       []string          `json:"result_table_list,omitempty"`
+	MetricFilterCondition map[string]string `json:"metric_filter_condition,omitempty"`
 }
 
 type ParamsLabelName struct {
 	InfluxCompatible bool   `json:"influx_compatible"`
 	UseNativeOr      bool   `json:"use_native_or"`
 	APIType          string `json:"api_type"`
+	ClusterName      string `json:"cluster_name"`
 	APIParams        struct {
 		Match string `json:"match[]"`
 		Start int64  `json:"start"`
 		End   int64  `json:"end"`
 	} `json:"api_params"`
-	ResultTableGroup      map[string][]string `json:"result_table_group"`
-	MetricFilterCondition map[string]string   `json:"metric_filter_condition"`
-	MetricAliasMapping    map[string]string   `json:"metric_alias_mapping"`
+	ResultTableList       []string          `json:"result_table_list,omitempty"`
+	MetricFilterCondition map[string]string `json:"metric_filter_condition,omitempty"`
 }
 
 type ParamsLabelValues struct {
 	InfluxCompatible bool   `json:"influx_compatible"`
 	UseNativeOr      bool   `json:"use_native_or"`
 	APIType          string `json:"api_type"`
+	ClusterName      string `json:"cluster_name"`
 	APIParams        struct {
 		Label string `json:"label"`
+		Match string `json:"match[]"`
+		Start int64  `json:"start"`
+		End   int64  `json:"end"`
+		Limit int    `json:"limit"`
 	} `json:"api_params"`
-	ResultTableGroup      map[string][]string `json:"result_table_group"`
-	MetricFilterCondition map[string]string   `json:"metric_filter_condition"`
-	MetricAliasMapping    map[string]string   `json:"metric_alias_mapping"`
+	ResultTableList []string `json:"result_table_list,omitempty"`
 }
 
 type Metric map[string]string
@@ -150,10 +145,10 @@ type VmResponse struct {
 		TotalRecords         int         `json:"totalRecords"`
 		Timetaken            float64     `json:"timetaken"`
 		List                 []struct {
-			Data      Data   `json:"data,omitempty""`
+			Data      Data   `json:"data,omitempty"`
 			IsPartial bool   `json:"isPartial,omitempty"`
 			Status    string `json:"status,omitempty"`
-		} `json:"list,omitempty""`
+		} `json:"list,omitempty"`
 		BksqlCallElapsedTime int           `json:"bksql_call_elapsed_time"`
 		Device               string        `json:"device"`
 		ResultTableIds       []string      `json:"result_table_ids"`
@@ -177,10 +172,10 @@ type VmLableValuesResponse struct {
 		TotalRecords         int         `json:"totalRecords"`
 		Timetaken            float64     `json:"timetaken"`
 		List                 []struct {
-			Data      []string `json:"data,omitempty""`
+			Data      []string `json:"data,omitempty"`
 			IsPartial bool     `json:"isPartial,omitempty"`
 			Status    string   `json:"status,omitempty"`
-		} `json:"list,omitempty""`
+		} `json:"list,omitempty"`
 		BksqlCallElapsedTime int           `json:"bksql_call_elapsed_time"`
 		Device               string        `json:"device"`
 		ResultTableIds       []string      `json:"result_table_ids"`
@@ -204,10 +199,10 @@ type VmSeriesResponse struct {
 		TotalRecords         int         `json:"totalRecords"`
 		Timetaken            float64     `json:"timetaken"`
 		List                 []struct {
-			Data      []map[string]string `json:"data,omitempty""`
+			Data      []map[string]string `json:"data,omitempty"`
 			IsPartial bool                `json:"isPartial,omitempty"`
 			Status    string              `json:"status,omitempty"`
-		} `json:"list,omitempty""`
+		} `json:"list,omitempty"`
 		BksqlCallElapsedTime int           `json:"bksql_call_elapsed_time"`
 		Device               string        `json:"device"`
 		ResultTableIds       []string      `json:"result_table_ids"`

@@ -11,15 +11,17 @@ package elasticsearch
 
 import (
 	"context"
-	"crypto/md5"
-	"encoding/hex"
 	"fmt"
 	"io"
+	"strconv"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
+	"github.com/cstockton/go-conv"
 	version "github.com/hashicorp/go-version"
 	"github.com/pkg/errors"
 
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/transfer/bufferpool"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/transfer/config"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/transfer/define"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/transfer/etl"
@@ -41,13 +43,15 @@ type BulkHandler struct {
 }
 
 func (b *BulkHandler) makeRecordID(values map[string]interface{}) string {
-	hash := md5.New()
-	for _, key := range b.uniqueField {
-		_, err := fmt.Fprintf(hash, "%#v", values[key])
-		logging.PanicIf(err)
-	}
+	buf := bufferpool.Get()
+	defer bufferpool.Put(buf)
 
-	return hex.EncodeToString(hash.Sum(nil))
+	for _, key := range b.uniqueField {
+		buf.WriteString(conv.String(values[key]))
+		buf.WriteString("/")
+	}
+	n := xxhash.Sum64(buf.Bytes())
+	return strconv.FormatUint(n, 10)
 }
 
 func (b *BulkHandler) asRecord(etlRecord *define.ETLRecord) (*Record, error) {
@@ -85,10 +89,15 @@ func (b *BulkHandler) asRecord(etlRecord *define.ETLRecord) (*Record, error) {
 // Product
 func (b *BulkHandler) Handle(ctx context.Context, payload define.Payload, killChan chan<- error) (result interface{}, at time.Time, ok bool) {
 	var etlRecord define.ETLRecord
-	err := payload.To(&etlRecord)
-	if err != nil {
-		logging.Warnf("%v error %v dropped payload %+v", b, err, payload)
-		return nil, time.Time{}, false
+	r := payload.GetETLRecord()
+	if r != nil {
+		etlRecord = *r
+	} else {
+		err := payload.To(&etlRecord)
+		if err != nil {
+			logging.Warnf("%v error %v dropped payload %+v", b, err, payload)
+			return nil, time.Time{}, false
+		}
 	}
 
 	return &etlRecord, utils.ParseTimeStamp(*etlRecord.Time), true
@@ -100,13 +109,17 @@ func (b *BulkHandler) flush(ctx context.Context, index string, records Records) 
 	errs := utils.NewMultiErrors()
 	response, err := b.writer.Write(ctx, index, records)
 
+	buf := bufferpool.Get()
+	defer bufferpool.Put(buf)
+
 	var e error
 	var result []byte
 	if response != nil {
 		defer func() {
 			logging.WarnIf("close response error", response.Body.Close())
 		}()
-		result, e = io.ReadAll(response.Body)
+		_, e = io.Copy(buf, response.Body)
+		result = buf.Bytes()
 		errs.Add(e)
 	}
 
@@ -131,16 +144,19 @@ func (b *BulkHandler) flush(ctx context.Context, index string, records Records) 
 		}
 
 		if writeResult.Errors {
-			msg := fmt.Sprintf("backend %v write %d documents to elasticsearch failed, response: %s", b, writeResult.Took, result)
-			logging.MinuteErrorSampling(b.String(), msg)
 			var total int
+			var resultErrors []*ESWriteResultError
 			for _, item := range writeResult.Items {
 				index := item.Index
 				if index.Error != nil {
 					total++
-					cause := index.Error.CausedBy
-					logging.Warnf("backend %v write %v to %v error %v:%v", b, index.ID, index.Index, cause.Type, cause.Reason)
+					resultErrors = append(resultErrors, index.Error)
 				}
+			}
+			if len(resultErrors) > 0 {
+				s, _ := json.Marshal(resultErrors)
+				msg := fmt.Sprintf("backend %v write %d documents to elasticsearch failed, error: %s", b, len(resultErrors), string(s))
+				logging.MinuteErrorSampling(b.String(), msg)
 			}
 			count = len(writeResult.Items) - total // 成功写入的数据量
 		} else {
@@ -179,7 +195,7 @@ func (b *BulkHandler) Flush(ctx context.Context, results []interface{}) (count i
 
 		// 处理跨时间间隔
 		if index != lastIndex && lastIndex != "" {
-			cnt, err := b.flush(ctx, index, records)
+			cnt, err := b.flush(ctx, lastIndex, records)
 			records = records[:0]
 			count += cnt
 			errs.Add(err)

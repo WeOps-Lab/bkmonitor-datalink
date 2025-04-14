@@ -16,7 +16,7 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define/prompb"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/tokenparser"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/utils"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/pipeline"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/receiver"
@@ -24,7 +24,6 @@ import (
 )
 
 const (
-	tokenKey         = "X-BK-TOKEN"
 	routeRemoteWrite = "/prometheus/write"
 )
 
@@ -32,8 +31,11 @@ func init() {
 	receiver.RegisterReadyFunc(define.SourceRemoteWrite, Ready)
 }
 
-func Ready() {
-	receiver.RegisterHttpRoute(define.SourceRemoteWrite, []receiver.RouteWithFunc{
+func Ready(config receiver.ComponentConfig) {
+	if !config.RemoteWrite.Enabled {
+		return
+	}
+	receiver.RegisterRecvHttpRoute(define.SourceRemoteWrite, []receiver.RouteWithFunc{
 		{
 			Method:       http.MethodPost,
 			RelativePath: routeRemoteWrite,
@@ -56,11 +58,8 @@ func (s HttpService) Write(w http.ResponseWriter, req *http.Request) {
 	ip := utils.ParseRequestIP(req.RemoteAddr)
 
 	start := time.Now()
-	token := req.URL.Query().Get(tokenKey)
-	if token == "" {
-		token = req.Header.Get(tokenKey)
-	}
 
+	token := tokenparser.FromHttpRequest(req)
 	r := &define.Record{
 		RecordType:    define.RecordRemoteWrite,
 		RequestType:   define.RequestHttp,
@@ -71,14 +70,14 @@ func (s HttpService) Write(w http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		err = errors.Wrapf(err, "run pre-check failed, code=%d, ip=%s", code, ip)
 		logger.WarnRate(time.Minute, r.Token.Original, err)
-		receiver.WriteResponse(w, define.ContentTypeText, int(code), []byte(err.Error()))
+		receiver.WriteErrResponse(w, define.ContentTypeText, int(code), err)
 		metricMonitor.IncPreCheckFailedCounter(define.RequestHttp, define.RecordRemoteWrite, processorName, r.Token.Original, code)
 		return
 	}
 
-	writeReq, size, err := prompb.DecodeWriteRequest(req.Body)
+	writeReq, size, err := utils.DecodeWriteRequest(req.Body)
 	if err != nil {
-		receiver.WriteResponse(w, define.ContentTypeText, http.StatusBadRequest, []byte(err.Error()))
+		receiver.WriteErrResponse(w, define.ContentTypeText, http.StatusBadRequest, err)
 		metricMonitor.IncDroppedCounter(define.RequestHttp, define.RecordRemoteWrite)
 		logger.Warnf("failed to decode write request, code=%d, ip=%v, error: %s", code, ip, err)
 		return

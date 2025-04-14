@@ -13,6 +13,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
 )
 
 func TestLoadConfigPath(t *testing.T) {
@@ -55,6 +57,13 @@ func TestLoadContentFailed(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestMustLoadContentFailed(t *testing.T) {
+	assert.Panics(t, func() {
+		conf := MustLoadConfigContent("|{}")
+		assert.Nil(t, conf)
+	})
+}
+
 func TestLoadConfigPatterns(t *testing.T) {
 	configs := LoadConfigPatterns([]string{"../example/fixtures/report_v2*.yml", "^.!.!"})
 	assert.Len(t, configs, 2)
@@ -66,10 +75,20 @@ func TestLoadConfigPatterns(t *testing.T) {
 	}
 }
 
-func TestLoadPlatformConfigs(t *testing.T) {
-	config := LoadPlatformConfigs([]string{"../example/fixtures/platform.yml"})
-	assert.NotNil(t, config)
+func TestLoadConfigFromType(t *testing.T) {
+	t.Run("Platform", func(t *testing.T) {
+		config := LoadConfigFromType([]string{"../example/fixtures/platform.yml"}, define.ConfigTypePlatform)
+		assert.NotNil(t, config)
 
-	conf := make(map[string]interface{})
-	assert.NoError(t, config.Unpack(conf))
+		conf := make(map[string]interface{})
+		assert.NoError(t, config.Unpack(conf))
+	})
+
+	t.Run("Privileged", func(t *testing.T) {
+		config := LoadConfigFromType([]string{"../example/fixtures/privileged.yml"}, define.ConfigTypePrivileged)
+		assert.NotNil(t, config)
+
+		conf := make(map[string]interface{})
+		assert.NoError(t, config.Unpack(conf))
+	})
 }

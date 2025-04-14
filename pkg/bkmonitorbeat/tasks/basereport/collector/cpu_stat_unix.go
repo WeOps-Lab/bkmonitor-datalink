@@ -8,7 +8,6 @@
 // specific language governing permissions and limitations under the License.
 
 //go:build aix || darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris || zos
-// +build aix darwin dragonfly freebsd linux netbsd openbsd solaris zos
 
 package collector
 
@@ -49,7 +48,7 @@ func getCPUStatUsage(report *CpuReport) error {
 	defer lastCPUTimeSlice.Unlock()
 
 	// 判断lastPerCPUTimes长度，增加重写避免init方法失效的情况
-	if len(lastCPUTimeSlice.lastPerCPUTimes) <= 0 {
+	if len(lastCPUTimeSlice.lastPerCPUTimes) <= 0 || len(perCPUTimes) != len(lastCPUTimeSlice.lastPerCPUTimes) {
 		lastCPUTimeSlice.lastPerCPUTimes, err = cpu.Times(true)
 		if err != nil {
 			return err
@@ -129,7 +128,7 @@ func queryCpuInfo(r *CpuReport, _ time.Duration, _ time.Duration) (err error) {
 	useDmidecode := false
 	if len(r.Cpuinfo) > 0 {
 		// 取第一个cpu检查，如果发现存在信息为空的情况，则启用dmidecode进行填充
-		if r.Cpuinfo[0].Mhz == 0 || r.Cpuinfo[0].Model == "" {
+		if r.Cpuinfo[0].Mhz == 0 || r.Cpuinfo[0].Model == "" || r.Cpuinfo[0].ModelName == "" {
 			model, mhz = getDMIDecodeCPUInfo()
 			useDmidecode = true
 		}
@@ -142,11 +141,17 @@ func queryCpuInfo(r *CpuReport, _ time.Duration, _ time.Duration) (err error) {
 		return nil
 	}
 
-	// 用dmidecode信息填充所有核
+	// 用dmidecode信息填充所有核 (按需补充信息)
 	for index, info := range r.Cpuinfo {
-		info.Mhz = mhz
-		info.Model = model
-		info.ModelName = model
+		if info.Mhz == 0 {
+			info.Mhz = mhz
+		}
+		if info.Model == "" {
+			info.Model = model
+		}
+		if info.ModelName == "" {
+			info.ModelName = model
+		}
 		r.Cpuinfo[index] = info
 	}
 
@@ -172,20 +177,4 @@ func getDMIDecodeCPUInfo() (model string, mhz float64) {
 		model = processor[0].Version
 	}
 	return
-}
-
-func calcTimeState(t1, t2 cpu.TimesStat) cpu.TimesStat {
-	return cpu.TimesStat{
-		CPU:       t2.CPU,
-		User:      t2.User - t1.User,
-		System:    t2.System - t1.System,
-		Idle:      t2.Idle - t1.Idle,
-		Nice:      t2.Nice - t1.Nice,
-		Iowait:    t2.Iowait - t1.Iowait,
-		Irq:       t2.Irq - t1.Irq,
-		Softirq:   t2.Softirq - t1.Softirq,
-		Steal:     t2.Steal - t1.Steal,
-		Guest:     t2.Guest - t1.Guest,
-		GuestNice: t2.GuestNice - t1.GuestNice,
-	}
 }

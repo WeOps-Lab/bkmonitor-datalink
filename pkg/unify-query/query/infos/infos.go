@@ -11,7 +11,6 @@ package infos
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -19,11 +18,12 @@ import (
 
 	"github.com/influxdata/influxql"
 	"github.com/pkg/errors"
-	oleltrace "go.opentelemetry.io/otel/trace"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/consul"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/influxdb"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/internal/json"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/log"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/metadata"
 	queryMod "github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/query"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/query/promql"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/query/structured"
@@ -43,8 +43,11 @@ const (
 
 // Params
 type Params struct {
-	Metric  string             `json:"metric_name"`
-	TableID structured.TableID `json:"table_id"`
+	DataSource string             `json:"data_source"`
+	TableID    structured.TableID `json:"table_id"`
+	Metric     string             `json:"metric_name"`
+	// IsRegexp 指标是否使用正则查询
+	IsRegexp bool `json:"is_regexp" example:"false"`
 
 	Conditions structured.Conditions `json:"conditions"`
 	Keys       []string              `json:"keys"`
@@ -54,6 +57,8 @@ type Params struct {
 
 	Start string `json:"start_time"`
 	End   string `json:"end_time"`
+
+	Timezone string `json:"timezone,omitempty" example:"Asia/Shanghai"`
 }
 
 func (p *Params) StartTimeUnix() (int64, error) {
@@ -75,15 +80,6 @@ func AnalysisQuery(stmt string) (*Params, error) {
 }
 
 var defaultLimit int
-
-// SetDefaultLimit
-func SetDefaultLimit(limit int) {
-	if limit == 0 {
-		defaultLimit = 1e2
-		return
-	}
-	defaultLimit = limit
-}
 
 // getTime
 func getTime(timestamp string) (time.Time, error) {
@@ -168,7 +164,6 @@ func makeInfluxQLListBySpaceUid(
 		err          error
 		influxQLList []influxdb.SQLInfo
 		limit        int
-		span         oleltrace.Span
 		tsDBs        []*queryMod.TsDBV2
 	)
 
@@ -178,15 +173,15 @@ func makeInfluxQLListBySpaceUid(
 		limit = defaultLimit
 	}
 
-	ctx, span = trace.IntoContext(ctx, trace.TracerName, "make-influxQL-list-by-space-uid")
-	if span != nil {
-		defer span.End()
-	}
+	ctx, span := trace.NewSpan(ctx, "make-influxQL-list-by-space-uid")
+	defer span.End(&err)
 
+	user := metadata.GetUser(ctx)
 	tsDBs, err = structured.GetTsDBList(ctx, &structured.TsDBOption{
-		SpaceUid:  spaceUid,
-		TableID:   params.TableID,
-		FieldName: params.Metric,
+		SpaceUid:    spaceUid,
+		TableID:     params.TableID,
+		FieldName:   params.Metric,
+		IsSkipSpace: user.IsSkipSpace(),
 	})
 	if err != nil {
 		return nil, err
@@ -250,7 +245,6 @@ func makeInfluxQLListBySpaceUid(
 				sqlInfo, err = generateSQL(ctx, infoType, db, measurement, field, newWhereList, params.Slimit, limit)
 				sqlInfo.ClusterID = storageID
 				sqlInfo.MetricName = metricName
-				trace.InsertStringIntoSpan(fmt.Sprintf("query-info-sql-info-sql-%s", measurement), sqlInfo.SQL, span)
 				if err != nil {
 					return influxQLList, err
 				}
@@ -283,7 +277,6 @@ func makeInfluxQLListBySpaceUid(
 			sqlInfo, err = generateSQL(ctx, infoType, db, measurement, field, newWhereList, params.Slimit, limit)
 			sqlInfo.ClusterID = storageID
 			sqlInfo.MetricName = metricName
-			trace.InsertStringIntoSpan(fmt.Sprintf("query-info-sql-info-sql-%s", measurement), sqlInfo.SQL, span)
 			if err != nil {
 				return influxQLList, err
 			}
@@ -303,13 +296,11 @@ func makeInfluxQLList(
 		influxQLList []influxdb.SQLInfo
 		limit        int
 		whereList    = promql.NewWhereList()
-		span         oleltrace.Span
 	)
 
-	ctx, span = trace.IntoContext(ctx, trace.TracerName, "make-influxQL-list")
-	if span != nil {
-		defer span.End()
-	}
+	ctx, span := trace.NewSpan(ctx, "make-influxQL-list")
+	defer span.End(&err)
+
 	if params.Limit > 0 {
 		limit = params.Limit
 	} else {
@@ -320,10 +311,14 @@ func makeInfluxQLList(
 		return nil, err
 	}
 	if len(condition) != 0 {
-		whereList.Append(
-			promql.AndOperator, promql.NewTextWhere(
-				promql.MakeOrExpression(structured.ConvertToPromBuffer(condition)),
-			))
+		influxdbCondition := structured.ConvertToPromBuffer(condition)
+		if len(influxdbCondition) > 0 {
+			whereList.Append(
+				promql.AndOperator, promql.NewTextWhere(
+					promql.MakeOrExpression(influxdbCondition),
+				))
+		}
+
 	}
 	// 增加时间维度查询，秒级转纳秒
 	if params.Start != "" && params.End != "" {
@@ -411,7 +406,6 @@ func makeInfluxQLList(
 				sqlInfo, err = generateSQL(ctx, infoType, db, measurement, field, newWhereList, params.Slimit, limit)
 				sqlInfo.ClusterID = tableID.ClusterID
 				sqlInfo.MetricName = metricName
-				trace.InsertStringIntoSpan(fmt.Sprintf("query-info-sql-info-sql-%s", measurement), sqlInfo.SQL, span)
 				if err != nil {
 					return influxQLList, err
 				}
@@ -443,18 +437,11 @@ func makeInfluxQLList(
 			sqlInfo, err = generateSQL(ctx, infoType, db, measurement, field, newWhereList, params.Slimit, limit)
 			sqlInfo.ClusterID = tableID.ClusterID
 			sqlInfo.MetricName = metricName
-			trace.InsertStringIntoSpan(fmt.Sprintf("query-info-sql-info-sql-%s", measurement), sqlInfo.SQL, span)
 			if err != nil {
 				return influxQLList, err
 			}
 			influxQLList = append(influxQLList, sqlInfo)
 		}
-
-		trace.InsertStringIntoSpan("query-info-info-type", string(infoType), span)
-		trace.InsertStringIntoSpan("query-info0db", db, span)
-		trace.InsertIntIntoSpan("query-info-slimit", params.Slimit, span)
-		trace.InsertIntIntoSpan("query-info-limit", limit, span)
-		trace.InsertIntIntoSpan("query-info-default-limit", defaultLimit, span)
 	}
 
 	return influxQLList, err

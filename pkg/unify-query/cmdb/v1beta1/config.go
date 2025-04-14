@@ -20,23 +20,16 @@ var configData = &Config{
 			},
 		},
 		{
+			Name: "datasource",
+			Index: cmdb.Index{
+				"bk_data_id",
+			},
+		},
+		{
 			Name: "node",
 			Index: cmdb.Index{
 				"bcs_cluster_id",
 				"node",
-			},
-		},
-		{
-			Name: "cluster",
-			Index: cmdb.Index{
-				"bcs_cluster_id",
-			},
-		},
-		{
-			Name: "namespace",
-			Index: cmdb.Index{
-				"bcs_cluster_id",
-				"namespace",
 			},
 		},
 		{
@@ -45,6 +38,14 @@ var configData = &Config{
 				"bcs_cluster_id",
 				"namespace",
 				"pod",
+			},
+		},
+		{
+			Name: "job",
+			Index: cmdb.Index{
+				"bcs_cluster_id",
+				"namespace",
+				"job",
 			},
 		},
 		{
@@ -63,18 +64,95 @@ var configData = &Config{
 				"deployment",
 			},
 		}, {
+			Name: "deamonset",
+			Index: cmdb.Index{
+				"bcs_cluster_id",
+				"namespace",
+				"deamonset",
+			},
+		},
+		{
 			Name: "statefulset",
 			Index: cmdb.Index{
 				"bcs_cluster_id",
 				"namespace",
 				"statefulset",
 			},
-		}, {
-			Name: "deamonset",
+		},
+		{
+			Name: "service",
 			Index: cmdb.Index{
 				"bcs_cluster_id",
 				"namespace",
-				"deamonset",
+				"service",
+			},
+		},
+		{
+			Name: "ingress",
+			Index: cmdb.Index{
+				"bcs_cluster_id",
+				"namespace",
+				"ingress",
+			},
+		},
+		{
+			Name: "k8s_address",
+			Index: cmdb.Index{
+				"bcs_cluster_id",
+				"address",
+			},
+		},
+		{
+			Name: "domain",
+			Index: cmdb.Index{
+				"bcs_cluster_id",
+				"domain",
+			},
+		},
+		{
+			Name: "apm_service",
+			Index: cmdb.Index{
+				"apm_application_name",
+				"apm_service_name",
+			},
+		},
+		{
+			Name: "apm_service_instance",
+			Index: cmdb.Index{
+				"apm_application_name",
+				"apm_service_name",
+				"apm_service_instance_name",
+			},
+		},
+		{
+			Name: "bklogconfig",
+			Index: cmdb.Index{
+				"bklogconfig_namespace",
+				"bklogconfig_name",
+			},
+		},
+		{
+			Name: "business",
+			Index: cmdb.Index{
+				"biz_id",
+			},
+		},
+		{
+			Name: "set",
+			Index: cmdb.Index{
+				"set_id",
+			},
+		},
+		{
+			Name: "module",
+			Index: cmdb.Index{
+				"module_id",
+			},
+		},
+		{
+			Name: "host",
+			Index: cmdb.Index{
+				"host_id",
 			},
 		},
 	},
@@ -91,6 +169,11 @@ var configData = &Config{
 		},
 		{
 			Resources: []cmdb.Resource{
+				"job", "pod",
+			},
+		},
+		{
+			Resources: []cmdb.Resource{
 				"pod", "replicaset",
 			},
 		},
@@ -101,12 +184,82 @@ var configData = &Config{
 		},
 		{
 			Resources: []cmdb.Resource{
-				"pod", "deamonset",
+				"deamonset", "pod",
 			},
 		},
 		{
 			Resources: []cmdb.Resource{
-				"pod", "deployment",
+				"deployment", "replicaset",
+			},
+		},
+		{
+			Resources: []cmdb.Resource{
+				"pod", "service",
+			},
+		},
+		{
+			Resources: []cmdb.Resource{
+				"datasource", "pod",
+			},
+		},
+		{
+			Resources: []cmdb.Resource{
+				"datasource", "node",
+			},
+		},
+		{
+			Resources: []cmdb.Resource{
+				"ingress", "service",
+			},
+		},
+		{
+			Resources: []cmdb.Resource{
+				"k8s_address", "service",
+			},
+		},
+		{
+			Resources: []cmdb.Resource{
+				"domain", "service",
+			},
+		},
+		{
+			Resources: []cmdb.Resource{
+				"apm_service_instance", "system",
+			},
+		},
+		{
+			Resources: []cmdb.Resource{
+				"apm_service_instance", "pod",
+			},
+		},
+		{
+			Resources: []cmdb.Resource{
+				"apm_service", "apm_service_instance",
+			},
+		},
+		{
+			Resources: []cmdb.Resource{
+				"bklogconfig", "datasource",
+			},
+		},
+		{
+			Resources: []cmdb.Resource{
+				"business", "set",
+			},
+		},
+		{
+			Resources: []cmdb.Resource{
+				"module", "set",
+			},
+		},
+		{
+			Resources: []cmdb.Resource{
+				"host", "module",
+			},
+		},
+		{
+			Resources: []cmdb.Resource{
+				"host", "system",
 			},
 		},
 	},

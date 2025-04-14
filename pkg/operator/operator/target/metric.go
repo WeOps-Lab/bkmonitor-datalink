@@ -24,15 +24,22 @@ import (
 	"gopkg.in/yaml.v2"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/common/define"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/common/feature"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/common/httpx"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/common/utils"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/configs"
 )
 
 const (
-	relabelRuleWorkload = "v1/workload"
-	relabelRuleNode     = "v1/node"
+	relabelV1RuleWorkload  = "v1/workload"
+	relabelV2RuleWorkload  = "v2/workload"
+	relabelV3RuleWorkload  = "v3/workload"
+	relabelV1RuleNode      = "v1/node"
+	relabelV1RuleLabelJoin = "v1/labeljoin"
 )
 
 func IsBuiltinLabels(k string) bool {
-	for _, label := range ConfBuiltinLabels {
+	for _, label := range configs.G().BuiltinLabels {
 		if k == label {
 			return true
 		}
@@ -56,13 +63,13 @@ type MetricTarget struct {
 	Meta                   define.MonitorMeta
 	RelabelRule            string
 	RelabelIndex           string
+	NormalizeMetricName    bool
 	Address                string
 	NodeName               string
 	Scheme                 string
 	DataID                 int
 	Namespace              string
 	MaxTimeout             string
-	MinPeriod              string
 	Period                 string
 	Timeout                string
 	Path                   string
@@ -81,6 +88,10 @@ type MetricTarget struct {
 	Mask                   string
 	TaskType               string
 	DisableCustomTimestamp bool
+	LabelJoinMatcher       *feature.LabelJoinMatcherSpec
+	NodeLabelsFunc         func(string) map[string]string
+
+	hash uint64 // 缓存 hash 避免重复计算
 }
 
 func (t *MetricTarget) FileName() string {
@@ -93,42 +104,112 @@ func (t *MetricTarget) FileName() string {
 
 // RemoteRelabelConfig 返回采集器 workload 工作负载信息
 func (t *MetricTarget) RemoteRelabelConfig() *yaml.MapItem {
-	switch t.RelabelRule {
-	case relabelRuleWorkload:
-		// index >= 0 表示 annotations 中指定了 index label
-		if idx := toMonitorIndex(t.RelabelIndex); idx >= 0 && idx != t.Meta.Index {
-			return nil
-		}
-		return &yaml.MapItem{
-			Key:   "metric_relabel_remote",
-			Value: fmt.Sprintf("http://%s:8080/workload/node/%s", ConfServiceName, t.NodeName),
+	var annotationsRule, labelsRule []string
+	var kind string
+	if t.LabelJoinMatcher != nil {
+		annotationsRule = t.LabelJoinMatcher.Annotations
+		labelsRule = t.LabelJoinMatcher.Labels
+		kind = t.LabelJoinMatcher.Kind
+	}
+
+	var path string
+	host := fmt.Sprintf("http://%s:%d", configs.G().ServiceName, configs.G().HTTP.Port)
+	params := map[string]string{}
+
+	rules := utils.SplitTrim(t.RelabelRule, ",")
+	for _, rule := range rules {
+		switch rule {
+		case relabelV1RuleWorkload:
+			// index >= 0 表示 annotations 中指定了 index label
+			if idx := toMonitorIndex(t.RelabelIndex); idx >= 0 && idx != t.Meta.Index {
+				continue
+			}
+			if len(path) == 0 {
+				path = fmt.Sprintf("/workload/node/%s", t.NodeName)
+			}
+
+		case relabelV2RuleWorkload:
+			if idx := toMonitorIndex(t.RelabelIndex); idx >= 0 && idx != t.Meta.Index {
+				continue
+			}
+			var podName string
+			for _, label := range t.Labels {
+				if label.Name == "pod_name" {
+					podName = label.Value
+					break
+				}
+			}
+			// v2 需要保证有 podname 才下发
+			if len(podName) > 0 {
+				if len(path) == 0 {
+					path = fmt.Sprintf("/workload/node/%s", t.NodeName)
+				}
+				params["podName"] = podName
+			}
+
+		case relabelV3RuleWorkload:
+			if idx := toMonitorIndex(t.RelabelIndex); idx >= 0 && idx != t.Meta.Index {
+				continue
+			}
+			if len(path) == 0 {
+				path = fmt.Sprintf("/workload/node/%s", t.NodeName)
+			}
+			params["container_info"] = "true"
+
+		case relabelV1RuleLabelJoin:
+			if idx := toMonitorIndex(t.RelabelIndex); idx >= 0 && idx != t.Meta.Index {
+				continue
+			}
+			if len(path) == 0 {
+				path = "/labeljoin"
+			} else {
+				params["rules"] = "labeljoin" // 兼容混合 workload+labeljoin 混合场景
+			}
+			params["kind"] = kind
+			params["annotations"] = strings.Join(annotationsRule, ",")
+			params["labels"] = strings.Join(labelsRule, ",")
 		}
 	}
-	return nil
+
+	if len(path) == 0 {
+		return nil
+	}
+
+	u := host + path
+	p := httpx.WindParams(params)
+	if len(p) > 0 {
+		u = u + "?q=" + p
+	}
+	return &yaml.MapItem{
+		Key:   "metric_relabel_remote",
+		Value: u,
+	}
 }
 
-func (t *MetricTarget) Hash() uint64 {
+func fnvHash(b []byte) uint64 {
 	h := fnv.New64a()
-	b, _ := t.YamlBytes()
 	h.Write(b)
 	return h.Sum64()
 }
 
-func (t *MetricTarget) YamlBytes() ([]byte, error) {
-	cfg := make(yaml.MapSlice, 0)
-	if t.Period == "" {
-		t.Period = ConfDefaultPeriod
-	}
-	if t.Timeout == "" {
-		t.Timeout = t.Period
+func (t *MetricTarget) Hash() uint64 {
+	if t.hash != 0 {
+		return t.hash
 	}
 
+	// 理论上不应该出现
+	_, _ = t.YamlBytes()
+	return t.hash
+}
+
+func (t *MetricTarget) YamlBytes() ([]byte, error) {
+	cfg := make(yaml.MapSlice, 0)
 	cfg = append(cfg, yaml.MapItem{Key: "type", Value: "metricbeat"})
 	cfg = append(cfg, yaml.MapItem{Key: "name", Value: t.Address + t.Path})
 	cfg = append(cfg, yaml.MapItem{Key: "version", Value: "1"})
 	cfg = append(cfg, yaml.MapItem{Key: "dataid", Value: t.DataID})
-	cfg = append(cfg, yaml.MapItem{Key: "max_timeout", Value: ConfMaxTimeout})
-	cfg = append(cfg, yaml.MapItem{Key: "min_period", Value: ConfMinPeriod})
+	cfg = append(cfg, yaml.MapItem{Key: "max_timeout", Value: "100s"})
+	cfg = append(cfg, yaml.MapItem{Key: "min_period", Value: "3s"})
 
 	task := make(yaml.MapSlice, 0)
 	task = append(task, yaml.MapItem{Key: "task_id", Value: t.generateTaskID()})
@@ -149,6 +230,7 @@ func (t *MetricTarget) YamlBytes() ([]byte, error) {
 		module = append(module, *remoteRelabel)
 	}
 	module = append(module, yaml.MapItem{Key: "disable_custom_timestamp", Value: t.DisableCustomTimestamp})
+	module = append(module, yaml.MapItem{Key: "normalize_metric_name", Value: t.NormalizeMetricName})
 
 	address := t.Address
 	if !strings.HasPrefix(address, "http://") && !strings.HasPrefix(address, "https://") {
@@ -157,7 +239,7 @@ func (t *MetricTarget) YamlBytes() ([]byte, error) {
 	module = append(module, yaml.MapItem{Key: "hosts", Value: []string{address}})
 	if len(t.Params) != 0 {
 		params := make(yaml.MapSlice, 0)
-		keys := make([]string, 0)
+		keys := make([]string, 0, len(t.Params))
 		for key := range t.Params {
 			keys = append(keys, key)
 		}
@@ -228,15 +310,44 @@ func (t *MetricTarget) YamlBytes() ([]byte, error) {
 	lbs = append(lbs, yaml.MapItem{Key: "bk_monitor_name", Value: t.Meta.Name})
 	lbs = append(lbs, yaml.MapItem{Key: "bk_monitor_namespace", Value: t.Meta.Namespace})
 
-	if t.RelabelRule == relabelRuleNode {
+	lbsExist := func(s string, items []yaml.MapItem) bool {
+		for i := 0; i < len(items); i++ {
+			k, ok := items[i].Key.(string)
+			if ok && k == s {
+				return true
+			}
+		}
+		return false
+	}
+
+	if t.RelabelRule == relabelV1RuleNode {
 		lbs = append(lbs, yaml.MapItem{Key: "node", Value: t.NodeName})
+
+		// 当且仅当 matcherKind 为 Node 时进行 node 维度补充
+		if t.LabelJoinMatcher != nil && t.LabelJoinMatcher.Kind == feature.LabelJoinMatcherKindNode && t.NodeLabelsFunc != nil {
+			nodeLabels := t.NodeLabelsFunc(t.NodeName)
+			// 只补充 annotation 声明的维度
+			for _, name := range t.LabelJoinMatcher.Labels {
+				value, ok := nodeLabels[name]
+				if ok && !lbsExist(name, lbs) {
+					lbs = append(lbs, yaml.MapItem{Key: utils.NormalizeName(name), Value: value})
+				}
+			}
+		}
 	}
 
 	lbs = append(lbs, sortMap(t.ExtraLabels)...)
 	task = append(task, yaml.MapItem{Key: "labels", Value: []yaml.MapSlice{lbs}})
 	task = append(task, yaml.MapItem{Key: "module", Value: module})
 	cfg = append(cfg, yaml.MapItem{Key: "tasks", Value: []yaml.MapSlice{task}})
-	return yaml.Marshal(cfg)
+
+	b, err := yaml.Marshal(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	t.hash = fnvHash(b) // 提前缓存
+	return b, nil
 }
 
 func (t *MetricTarget) generateTaskID() uint64 {
@@ -264,7 +375,7 @@ func avoidOverflow(num uint64) uint64 {
 
 func sortMap(origin map[string]string) []yaml.MapItem {
 	result := make(yaml.MapSlice, 0, len(origin))
-	keys := make([]string, 0)
+	keys := make([]string, 0, len(origin))
 	for key := range origin {
 		keys = append(keys, key)
 	}

@@ -19,19 +19,10 @@ const (
 	UnknownNode      = "unknown"
 
 	ReSyncPeriod = 5 * time.Minute
-
-	ActionAdd            = "add"
-	ActionDelete         = "delete"
-	ActionUpdate         = "update"
-	ActionCreateOrUpdate = "createOrUpdate"
-	ActionSkip           = "skip"
-
-	EnvNodeName  = "NODE_NAME"
-	EnvPodName   = "POD"
-	EnvNamespace = "NAMESPACE"
 )
 
-type CheckFunc func(string) (string, bool)
+// ConfigFilePath 主配置文件路径
+var ConfigFilePath string
 
 // MonitorMeta 描述了监控类型的元数据信息，目前类型有 serviceMonitor, podMonitor, probe
 type MonitorMeta struct {

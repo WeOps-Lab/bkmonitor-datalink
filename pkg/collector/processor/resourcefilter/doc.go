@@ -47,6 +47,23 @@ processor:
               - "resource.net.host.name"
               - "resource.net.host.ip"
               - "resource.net.host.port"
+
+    # FromCache Action
+    - name: "resource_filter/from_cache"
+      config:
+        from_cache:
+          key: "resource.net.host.ip|resource.client.ip"
+          cache:
+            url: http://localhost:8080/pods
+            interval: "1m"
+            timeout: "1m"
+
+    # FromRecord Action
+    - name: "resource_filter/from_record"
+      config:
+        from_record:
+          - source: "request.client.ip"
+            destination: "resource.client.ip"
 */
 
 package resourcefilter

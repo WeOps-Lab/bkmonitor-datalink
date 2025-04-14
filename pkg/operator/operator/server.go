@@ -10,20 +10,25 @@
 package operator
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/pprof"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"gopkg.in/yaml.v2"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/libgse/beat"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/common/define"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/common/httpx"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/common/utils"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/configs"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/operator/discover"
+	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/operator/discover/shareddiscovery"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/operator/operator/objectsref"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/logger"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/pprofsnapshot"
@@ -46,8 +51,8 @@ type checkNamespace struct {
 
 func (c *Operator) checkNamespaceRoute() checkNamespace {
 	return checkNamespace{
-		AllowNamespaces: ConfTargetNamespaces,
-		DenyNamespaces:  ConfDenyTargetNamespaces,
+		AllowNamespaces: configs.G().TargetNamespaces,
+		DenyNamespaces:  configs.G().DenyTargetNamespaces,
 	}
 }
 
@@ -56,8 +61,8 @@ func (c *Operator) CheckNamespaceRoute(w http.ResponseWriter, r *http.Request) {
 	writeResponse(w, c.checkNamespaceRoute())
 }
 
-func (c *Operator) checkMonitorBlacklistRoute() []MonitorBlacklistMatchRule {
-	return ConfMonitorBlacklistMatchRules
+func (c *Operator) checkMonitorBlacklistRoute() []configs.MonitorBlacklistMatchRule {
+	return configs.G().MonitorBlacklistMatchRules
 }
 
 // CheckMonitorBlacklistRoute 检查黑名单规则
@@ -85,8 +90,11 @@ func (c *Operator) checkDataIdRoute() []checkDataId {
 }
 
 // CheckScrapeRoute 查看拉取指标信息
-func (c *Operator) CheckScrapeRoute(w http.ResponseWriter, _ *http.Request) {
-	writeResponse(w, c.scrapeAll())
+func (c *Operator) CheckScrapeRoute(w http.ResponseWriter, r *http.Request) {
+	worker := r.URL.Query().Get("workers")
+	i, _ := strconv.Atoi(worker)
+
+	writeResponse(w, c.scrapeAllStats(r.Context(), i))
 }
 
 // CheckScrapeNamespaceMonitorRoute 根据命名空间查看拉取指标信息
@@ -103,7 +111,19 @@ func (c *Operator) CheckScrapeNamespaceMonitorRoute(w http.ResponseWriter, r *ht
 		return
 	}
 
-	ch := c.scrapeForce(namespace, monitor)
+	worker, _ := strconv.Atoi(r.URL.Query().Get("workers"))
+	topn, _ := strconv.Atoi(r.URL.Query().Get("topn"))
+	endpoint := r.URL.Query().Get("endpoint")
+
+	analyze := r.URL.Query().Get("analyze") // 分析指标
+	if analyze == "true" {
+		ret := c.scrapeAnalyze(r.Context(), namespace, monitor, endpoint, worker, topn)
+		b, _ := json.Marshal(ret)
+		w.Write(b)
+		return
+	}
+
+	ch := c.scrapeLines(r.Context(), namespace, monitor, endpoint, worker)
 	const batch = 1000
 	n := 0
 	for line := range ch {
@@ -122,26 +142,16 @@ func (c *Operator) CheckDataIdRoute(w http.ResponseWriter, _ *http.Request) {
 	writeResponse(w, c.checkDataIdRoute())
 }
 
-func (c *Operator) checkActiveDiscoverRoute() []define.MonitorMeta {
-	var ret []define.MonitorMeta
-	c.discoversMut.Lock()
-	for _, dis := range c.discovers {
-		ret = append(ret, dis.MonitorMeta())
-	}
-	c.discoversMut.Unlock()
-	return ret
-}
-
 func (c *Operator) CheckActiveDiscoverRoute(w http.ResponseWriter, _ *http.Request) {
-	writeResponse(w, c.checkActiveDiscoverRoute())
+	writeResponse(w, c.getAllDiscover())
 }
 
 func (c *Operator) CheckActiveChildConfigRoute(w http.ResponseWriter, _ *http.Request) {
-	writeResponse(w, c.recorder.getActiveConfigFile())
+	writeResponse(w, c.recorder.getActiveConfigFiles())
 }
 
 func (c *Operator) CheckActiveSharedDiscoveryRoute(w http.ResponseWriter, _ *http.Request) {
-	writeResponse(w, discover.GetActiveSharedDiscovery())
+	writeResponse(w, shareddiscovery.AllDiscovery())
 }
 
 func (c *Operator) CheckMonitorResourceRoute(w http.ResponseWriter, _ *http.Request) {
@@ -149,92 +159,93 @@ func (c *Operator) CheckMonitorResourceRoute(w http.ResponseWriter, _ *http.Requ
 }
 
 const (
-	formatOperatorVersionMsg = `
+	formatOperatorVersion = `
 [√] check operator version
 - Description: bkmonitor-operator 版本信息
 %s
 `
-	formatKubernetesVersionSuccessMsg = `
+	formatHelmChartsVersion = `
+[√] check helmcharts version
+- Description: helmcharts 版本信息
+%s
+`
+	formatKubernetesVersionSuccess = `
 [√] check kubernetes version
 - Description: kubernetes 集群版本为 %s
 `
-	formatKubernetesVersionFailedMsg = `
+	formatKubernetesVersionFailed = `
 [x] check kubernetes version
 - Description: 无法正确获取 kubernetes 集群版本
 `
-	formatClusterInfoSuccessMsg = `
+	formatClusterInfoSuccess = `
 [√] check cluster information
 - Description: 集群信息
 %s
 `
-	formatClusterInfoFailedMsg = `
+	formatClusterInfoFailed = `
 [x] check cluster information
 - Description: 无法正确获取集群信息，错误信息 %s
 `
-	formatCheckDataIDFailedMsg = `
+	formatCheckDataIDFailed = `
 [x] check dataids
 - Description: 期待 dataids 数量应大于等于 3 个，目前发现 %d 个
-- Suggestion: dataid 是由 metadata 组件注入，请确定接入流程是否规范。同时检查 metadata 日志，确定是否出现异常（必要时携带日志联系开发或者运维同学）
-  * operator 从启动到监听 dataids 资源可能存在约 20s 的延迟
-  * 监控后台为传统部署，日志路径为 /data/bkee/logs/bkmonitorv3/kernel_metadata.log
-  * 监控后台为容器部署，请查看 bkmonitor-alarm-cron-worker pod 的日志
+- Suggestion: dataid 由 metadata 组件注入，请确定接入流程是否规范。
+  * operator 从启动到监听 dataids 资源可能存在约 30s 的延迟
 `
-	formatCheckDataIDSuccessMsg = `
+	formatCheckDataIDSuccess = `
 [√] check dataids
 - Description: 期待 dataids 数量应大于等于 3 个，目前发现 %d 个
 %s
 `
-	formatDryRunMsg = `
+	formatCheckDryRun = `
 [√] check dryrun
 - Description: %s
 `
-	formatCheckNamespaceMsg = `
+	formatCheckNamespaceSuccess = `
 [√] check namespaces
 - Description: 监测 namespace 白名单列表 %v，namespace 黑名单列表 %v
 - Suggestion: 请检查所需监控资源是否位于监测命名空间列表下，黑名单只在白名单列表为空时生效
-  * 如若发现所需命名空间没有在监测列表中，请修改 values.yaml 中的 denyTargetNamespaces 或者 targetNamespaces，并 'helm upgrade' 到集群中
+  * 如若发现所需命名空间没有在监测列表中，请更新 targetNamespaces 配置字段
 `
-	formatCheckNamespaceFailedMsg = `
+	formatCheckNamespaceFailed = `
 [x] check namespaces
 - Description: 监测 namespace 白名单列表 %v，namespace 黑名单列表 %v
 - Suggestion: 黑名单列表只在白名单列表为空时生效
 `
-	formatCheckMonitorBlacklistMsg = `
+	formatCheckMonitorBlacklist = `
 [√] check monitor blacklist rules
 - Description: monitor name 黑名单匹配规则，此规则优先级最高
 %s
 `
-	formatWorkloadMsg = `
-[√] check workload
-- Description: 集群各类型工作负载数量如下，最近一次更新时间 %v
+	formatResource = `
+[√] check resource
+- Description: 集群各类型资源数量
 %s
 `
-	formatMonitorEndpointMsg = `
+	formatMonitorEndpoint = `
 [√] check endpoint
-- Description: operator 监听 monitor endpoints 数量
+- Description: operator 匹配 %d 个 monitor，共有 %d 个 endpoints
 %s
 `
-	formatScrapeMsg = `
+	formatScrapeStats = `
 [√] check scrape stats
-- Description: 总共发现 %d 个 monitor 资源，抓取数据行数为 %d，采集共出现 %d 次错误，更新时间 %s
-- Suggestion: 错误可能由 forwardLocal 导致（可忽略），可过滤 'scrape error' 关键字查看详细错误信息。部分指标会有黑白名单机制，此抓取数据不做任何过滤
+- Description: 总共发现 %d 个 monitor 资源，抓取数据行数为 %d，采集共出现 %d 次错误
+- Suggestion: 错误可能由 forwardLocal 导致（可忽略），可过滤 'scrape error' 关键字查看详细错误信息。
+* 部分指标会有黑白名单机制，此抓取数据不做任何过滤。
 * TOP%d 数据量如下，详细情况可访问 /check/scrape 路由。%s
 %s
 `
-	formatListNodeMsg = `
-[√] check nodes
-- Description: 获取集群节点列表成功，节点数量为 %d，最近一次更新时间 %v
+	formatHandleSecretFailed = `
+[x] check kubernetes secrets operation
+- Description: 操作 secrets 资源曾出现错误
+- Suggestion: 请检查 apiserver 是否处于异常状态，考虑重启 Pod %s/%s
+  * Log: %s
 `
-	formatHandledSecretFailedMsg = `
-[x] check kubernetes secrets handled
-- Description: 操作 secrets 资源出现错误
-- Suggestion: 请检查 apiserver 是否处于异常状态，最近一次操作时间 %v，考虑重启/删除 ${bkm-operator-pod}
+	formatHandleSecretSuccess = `
+[√] check kubernetes secrets operation
+- Description: 操作 secrets 资源未出现错误
 `
-	formatHandledSecretSuccessMsg = `
-[√] check kubernetes secrets handled
-- Description: 操作 secrets 资源未出现错误，最近一次操作时间 %v
-`
-	formatMonitorResourcesMsg = `
+	formatMonitorResources = `
 [√] check monitor resources
 - Description: 通过 '%s' 关键字匹配到以下监控资源。
 * 监测到 ServiceMonitor/PodMonitor/Probe 资源以及对应的采集目标，请检查资源数量是否一致
@@ -242,33 +253,13 @@ const (
 * 生成的 bkmonitorbeat 采集配置文件
 %s
 `
-	formatCheckNamespaceWithoutKeywordMsg = `
+	formatMonitorResourceNoKeyword = `
 [√] check monitor resources
 - Description: 无 'monitor' 请求参数，无资源匹配。
 `
-	formatCheckHangHandledSuccessMsg = `
-[√] check kubernetes event handled
-- Description: Kubernetes 监听事件处理无卡住情况，接收事件数 %d，处理事件数 %d
-`
-	formatCheckHangHandledFailedMsg = `
-[x] check kubernetes event handled
-- Description: Kubernetes 监听事件处理出现卡住情况，接收事件数 %d，处理事件数 %d，考虑重启/删除 ${bkm-operator-pod}
-`
-	formatOperatorLogMsg = `
-[o] bkmonitor-operator logs
-- Description: 使用 'kubectl logs -n ${.Release.Namespace} ${bkm-operator-pod}' 查看是否有 ERROR 信息
-- Suggestion: 检查 ERROR 日志是否有明显的报错信息，必要时携带日志联系开发或者运维同学
-`
-	formatBkmonitorbeatTroubleshootingMsg = `
-[o] bkmonitorbeat troubleshooting
-- Description: 如若上述检查无发现异常问题，则考虑排查 bkmonitorbeat 本身的采集是否出现异常
-- Suggestion: 使用 strace 命令抓取 bkmonitorbeat write syscall 数据
-  1）根据上述检查得到采集任务所在节点，并使用 'kubectl get pods -n ${.Release.Namespace} -owide' 确定对应的 bkmonitorbeat pod
-  2）使用 'kubectl logs -n ${.Release.Namespace} ${bkm-operator-pod}' 查看是否有 ERROR 信息
-  3）使用 'kubectl exec it -n ${.Release.Namespace} ${bkmonitorbeat-pod}' 命令查看 bkmonitorbeat 所在进程 pid
-  4）使用 'kubectl exec' 执行 'strace -p ${pid} -s 1024000 -f -e write 2>&1 > /tmp/bkmonitorbeat.strace' 等待一分钟导出 strace 数据
-  5）过滤 *.strace 文件查看是否有采集任务指标对应的关键字，判断数据是否有写入到 gse sockets，如若有写到 gse 则说明 bkmonitorbeat 本身没问题，需要排查链路问题
-  6）链路排查可按照二进制部署排查思路 kafka -> transfer -> influxdb-proxy -> influxdb（必要时携带日志联系开发或者运维同学）
+	formatLogContent = `
+[-] bkmonitor-operator logs
+- Description: 使用 'kubectl logs -n %s %s' 查看是否有关键 ERROR 信息。
 `
 )
 
@@ -276,85 +267,98 @@ const (
 //
 // 检查 kubernetes 版本信息
 // 检查 bkmonitor-operator 版本信息
+// 检查 helmcharts 版本信息
 // 检查 dataids 是否符合预期
 // 检查集群信息
 // 检查 dryrun 标识是否打开
 // 检查监测命名空间是否符合预期
 // 检查黑名单匹配规则
-// 检查集群负载情况
+// 检查集群资源情况
 // 检查采集指标数据量
-// 检查节点列表
 // 检查处理 secrets 是否有问题
-// 检查操作事件是否有卡住情况
 // 检查给定关键字监测资源
 func (c *Operator) CheckRoute(w http.ResponseWriter, r *http.Request) {
-	buf := &bytes.Buffer{}
-	var b []byte
+	writef := func(format string, a ...interface{}) {
+		w.Write([]byte(fmt.Sprintf(format, a...)))
+	}
+
+	metaEnv := configs.G().MetaEnv
 
 	// 检查 kubernetes 版本信息
-	if objectsref.KubernetesServerVersion == "" {
-		buf.WriteString(formatKubernetesVersionFailedMsg)
+	if kubernetesVersion == "" {
+		writef(formatKubernetesVersionFailed)
 	} else {
-		buf.WriteString(fmt.Sprintf(formatKubernetesVersionSuccessMsg, objectsref.KubernetesServerVersion))
+		writef(formatKubernetesVersionSuccess, kubernetesVersion)
 	}
 
 	// 检查 bkmonitor-operator 版本信息
-	b, _ = json.MarshalIndent(c.buildInfo, "", "  ")
-	buf.WriteString(fmt.Sprintf(formatOperatorVersionMsg, string(b)))
+	b, _ := json.MarshalIndent(c.buildInfo, "", "  ")
+	writef(formatOperatorVersion, string(b))
+
+	// 检查 helmcharts 版本信息
+	eles := c.helmchartsController.GetByNamespace(configs.G().MonitorNamespace)
+	b, _ = json.MarshalIndent(eles, "", "  ")
+	writef(formatHelmChartsVersion, string(b))
 
 	// 检查 dataids 是否符合预期
 	dataids := c.checkDataIdRoute()
 	n := len(dataids)
 	if n < 3 {
-		w.Write([]byte(fmt.Sprintf(formatCheckDataIDFailedMsg, n)))
+		w.Write([]byte(fmt.Sprintf(formatCheckDataIDFailed, n)))
 		return
 	}
 	b, _ = json.MarshalIndent(dataids, "", "  ")
-	buf.WriteString(fmt.Sprintf(formatCheckDataIDSuccessMsg, n, string(b)))
+	writef(formatCheckDataIDSuccess, n, string(b))
 
 	// 检查集群信息
 	clusterInfo, err := c.dw.GetClusterInfo()
 	if err != nil {
-		w.Write([]byte(fmt.Sprintf(formatClusterInfoFailedMsg, err.Error())))
+		w.Write([]byte(fmt.Sprintf(formatClusterInfoFailed, err.Error())))
 		return
 	}
 	b, _ = json.MarshalIndent(clusterInfo, "", "  ")
-	buf.WriteString(fmt.Sprintf(formatClusterInfoSuccessMsg, string(b)))
+	writef(formatClusterInfoSuccess, string(b))
 
 	// 检查 dryrun 标识是否打开
-	if ConfDryRun {
-		buf.WriteString(fmt.Sprintf(formatDryRunMsg, "dryrun 模式，operator 不会调度采集任务"))
+	if configs.G().DryRun {
+		writef(formatCheckDryRun, "dryrun 模式，operator 不会调度采集任务")
 	} else {
-		buf.WriteString(fmt.Sprintf(formatDryRunMsg, "非 dryrun 模式，operator 正常调度采集任务"))
+		writef(formatCheckDryRun, "非 dryrun 模式，operator 正常调度采集任务")
 	}
 
 	// 检查监测命名空间是否符合预期
 	namespaces := c.checkNamespaceRoute()
 	if len(namespaces.DenyNamespaces) > 0 && len(namespaces.AllowNamespaces) > 0 {
-		buf.WriteString(fmt.Sprintf(formatCheckNamespaceFailedMsg, namespaces.AllowNamespaces, namespaces.DenyNamespaces))
+		writef(formatCheckNamespaceFailed, namespaces.AllowNamespaces, namespaces.DenyNamespaces)
 	} else {
-		buf.WriteString(fmt.Sprintf(formatCheckNamespaceMsg, namespaces.AllowNamespaces, namespaces.DenyNamespaces))
+		writef(formatCheckNamespaceSuccess, namespaces.AllowNamespaces, namespaces.DenyNamespaces)
 	}
 
 	// 检查黑名单匹配规则
 	blacklist := c.checkMonitorBlacklistRoute()
 	b, _ = json.MarshalIndent(blacklist, "", "  ")
-	buf.WriteString(fmt.Sprintf(formatCheckMonitorBlacklistMsg, string(b)))
+	writef(formatCheckMonitorBlacklist, string(b))
 
-	// 检查集群负载情况
-	workloadInfo, workloadUpdated := objectsref.GetWorkloadInfo()
-	b, _ = json.MarshalIndent(workloadInfo, "", "  ")
-	buf.WriteString(fmt.Sprintf(formatWorkloadMsg, workloadUpdated.Format(time.RFC3339), string(b)))
+	// 检查集群资源数量
+	resourceInfo := objectsref.GetResourceCount()
+	b, _ = json.MarshalIndent(resourceInfo, "", "  ")
+	writef(formatResource, string(b))
 
 	// 检查 Endpoint 数量
-	counts := c.recorder.getMonitorActiveConfigCount()
-	b, _ = json.MarshalIndent(counts, "", "  ")
-	buf.WriteString(fmt.Sprintf(formatMonitorEndpointMsg, string(b)))
+	endpoints := c.recorder.getEndpoints(true)
+	b, _ = json.MarshalIndent(endpoints, "", "  ")
+	var total int
+	for _, v := range endpoints {
+		total += v
+	}
+	writef(formatMonitorEndpoint, len(endpoints), total, string(b))
 
 	// 检查采集指标数据量
 	onScrape := r.URL.Query().Get("scrape")
+	worker := r.URL.Query().Get("workers")
+	i, _ := strconv.Atoi(worker)
 	if onScrape == "true" {
-		stats := c.scrapeAll()
+		stats := c.scrapeAllStats(r.Context(), i)
 		n = 5
 		if n > stats.MonitorCount {
 			n = stats.MonitorCount
@@ -365,32 +369,14 @@ func (c *Operator) CheckRoute(w http.ResponseWriter, r *http.Request) {
 		if stats.LinesTotal > 3000000 {
 			warning = "数据行数已超过 300w 警戒线，请重点关注数据库负载！"
 		}
-		scrapeUpdated := c.scrapeUpdated.Format(time.RFC3339)
-		buf.WriteString(fmt.Sprintf(formatScrapeMsg, stats.MonitorCount, stats.LinesTotal, stats.ErrorsTotal, scrapeUpdated, n, warning, string(b)))
+		writef(formatScrapeStats, stats.MonitorCount, stats.LinesTotal, stats.ErrorsTotal, n, warning, string(b))
 	}
-
-	// 检查节点列表
-	nodeCount, nodeUpdated := objectsref.GetClusterNodeInfo()
-	buf.WriteString(fmt.Sprintf(formatListNodeMsg, nodeCount, nodeUpdated.Format(time.RFC3339)))
 
 	// 检查处理 secrets 是否有问题
-	if c.mm.handledSecretFailed <= 0 || c.mm.handledSecretSuccessTime.After(c.mm.handledSecretFailedTime) {
-		buf.WriteString(fmt.Sprintf(formatHandledSecretSuccessMsg, c.mm.handledSecretSuccessTime.Format(time.RFC3339)))
+	if c.mm.secretFailedCounter <= 0 {
+		writef(formatHandleSecretSuccess)
 	} else {
-		buf.WriteString(fmt.Sprintf(formatHandledSecretFailedMsg, c.mm.handledSecretFailedTime.Format(time.RFC3339)))
-	}
-
-	// 检查操作事件是否有卡住情况
-	for i := 0; i < 2; i++ {
-		if c.mm.handledK8sEvent == c.mm.receivedK8sEvent {
-			break
-		}
-		time.Sleep(2 * time.Second)
-	}
-	if c.mm.handledK8sEvent != c.mm.receivedK8sEvent {
-		buf.WriteString(fmt.Sprintf(formatCheckHangHandledFailedMsg, c.mm.receivedK8sEvent, c.mm.handledK8sEvent))
-	} else {
-		buf.WriteString(fmt.Sprintf(formatCheckHangHandledSuccessMsg, c.mm.receivedK8sEvent, c.mm.handledK8sEvent))
+		writef(formatHandleSecretFailed, metaEnv.Namespace, metaEnv.PodName, c.mm.secretLastError)
 	}
 
 	// 检查给定关键字监测资源
@@ -402,23 +388,34 @@ func (c *Operator) CheckRoute(w http.ResponseWriter, r *http.Request) {
 				monitorResources = append(monitorResources, mr)
 			}
 		}
-		monitorResourcesContent, _ := json.MarshalIndent(monitorResources, "", "  ")
+
+		var monitorResourcesBytes []byte
+		if len(monitorResources) > 0 {
+			monitorResourcesBytes, _ = json.MarshalIndent(monitorResources, "", "  ")
+		} else {
+			monitorResourcesBytes = []byte("\n[!] NotMatch: 未匹配到任何 monitor 资源\n")
+		}
 
 		var childConfigs []ConfigFileRecord
-		for _, cf := range c.recorder.getActiveConfigFile() {
+		for _, cf := range c.recorder.getActiveConfigFiles() {
 			if strings.Contains(cf.Service, monitorKeyword) {
 				childConfigs = append(childConfigs, cf)
 			}
 		}
-		childConfigsContent, _ := json.MarshalIndent(childConfigs, "", "  ")
-		buf.WriteString(fmt.Sprintf(formatMonitorResourcesMsg, monitorKeyword, monitorResourcesContent, childConfigsContent))
+
+		var childConfigsBytes []byte
+		if len(childConfigs) > 0 {
+			childConfigsBytes, _ = json.MarshalIndent(childConfigs, "", "  ")
+		} else {
+			childConfigsBytes = []byte("\n[!] NotMatch: 未匹配到任何采集配置")
+		}
+
+		writef(formatMonitorResources, monitorKeyword, monitorResourcesBytes, childConfigsBytes)
 	} else {
-		buf.WriteString(formatCheckNamespaceWithoutKeywordMsg)
+		writef(formatMonitorResourceNoKeyword)
 	}
 
-	buf.WriteString(formatOperatorLogMsg)
-	buf.WriteString(formatBkmonitorbeatTroubleshootingMsg)
-	w.Write(buf.Bytes())
+	writef(formatLogContent, metaEnv.Namespace, metaEnv.PodName)
 }
 
 func (c *Operator) AdminLoggerRoute(w http.ResponseWriter, r *http.Request) {
@@ -445,8 +442,11 @@ func (c *Operator) AdminReloadRoute(w http.ResponseWriter, r *http.Request) {
 	case <-timer.C:
 		w.Write([]byte(`{"status": "failed"}`))
 		w.WriteHeader(http.StatusInternalServerError)
+		return
+
 	case beat.ReloadChan <- true:
 		w.Write([]byte(`{"status": "success"}`))
+		return
 	}
 }
 
@@ -464,7 +464,7 @@ func (c *Operator) AdminDispatchRoute(w http.ResponseWriter, r *http.Request) {
 func (c *Operator) ClusterInfoRoute(w http.ResponseWriter, _ *http.Request) {
 	clusterInfo, err := c.dw.GetClusterInfo()
 	if err != nil {
-		w.Write([]byte(fmt.Sprintf(`{"msg": "%s"}`, err.Error())))
+		w.Write([]byte(fmt.Sprintf(`{"msg": "%s"}`, err)))
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
@@ -480,19 +480,117 @@ func (c *Operator) WorkloadRoute(w http.ResponseWriter, _ *http.Request) {
 	writeResponse(w, c.objectsController.WorkloadsRelabelConfigs())
 }
 
+func (c *Operator) PodsRoute(w http.ResponseWriter, r *http.Request) {
+	info, err := c.dw.GetClusterInfo()
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(fmt.Sprintf(`{"msg": "no bcs_cluster_id found: %s"}`, err)))
+		return
+	}
+
+	// 无此参数默认按 0 处理
+	rv, _ := strconv.Atoi(r.URL.Query().Get("resourceVersion"))
+	type podsResponse struct {
+		Action    string `json:"action"`
+		ClusterID string `json:"cluster"`
+		Name      string `json:"name"`
+		Namespace string `json:"namespace"`
+		IP        string `json:"ip"`
+	}
+
+	all := r.URL.Query().Get("all") // all 则返回所有 pods 不进行任何过滤
+
+	// 只返回已经就绪的 Pod
+	podEvents, lastRv := c.objectsController.FetchPodEvents(rv)
+	nodes := c.objectsController.NodeIPs()
+	var ret []podsResponse
+	for _, podEvent := range podEvents {
+		_, ok := nodes[podEvent.IP]
+		if !ok || all == "true" {
+			ret = append(ret, podsResponse{
+				Action:    string(podEvent.Action),
+				ClusterID: info.BcsClusterID,
+				Name:      podEvent.Name,
+				Namespace: podEvent.Namespace,
+				IP:        podEvent.IP,
+			})
+		}
+	}
+
+	type R struct {
+		Pods            []podsResponse `json:"pods"`
+		ResourceVersion int            `json:"resourceVersion"`
+	}
+	writeResponse(w, R{Pods: ret, ResourceVersion: lastRv})
+}
+
 func (c *Operator) WorkloadNodeRoute(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	nodeName := vars["node"]
-	writeResponse(w, c.objectsController.WorkloadsRelabelConfigsByNodeName(nodeName))
+
+	query := httpx.UnwindParams(r.URL.Query().Get("q"))
+	var cfgs []objectsref.RelabelConfig
+
+	// 补充 container 维度信息（兼容 windows 系统）
+	containerFlag := query.Get("container_info")
+	if containerFlag == "true" {
+		cfgs = append(cfgs, c.objectsController.ContainersRelabelConfigs(nodeName)...)
+	}
+
+	// 补充 workload 维度信息
+	podName := query.Get("podName")
+	annotations := utils.SplitTrim(query.Get("annotations"), ",")
+	labels := utils.SplitTrim(query.Get("labels"), ",")
+	cfgs = append(cfgs, c.objectsController.WorkloadsRelabelConfigsByPodName(nodeName, podName, annotations, labels)...)
+
+	// kind/rules 是为了让 workload 同时能够支持其他 labeljoin 等其他规则
+	kind := query.Get("kind")
+	rules := query.Get("rules")
+	if rules == "labeljoin" {
+		switch kind {
+		case "Pod":
+			cfgs = append(cfgs, c.objectsController.PodsRelabelConfigs(annotations, labels)...)
+		}
+	}
+
+	writeResponse(w, cfgs)
+}
+
+func (c *Operator) LabelJoinRoute(w http.ResponseWriter, r *http.Request) {
+	query := httpx.UnwindParams(r.URL.Query().Get("q"))
+	kind := query.Get("kind")
+	annotations := utils.SplitTrim(query.Get("annotations"), ",")
+	labels := utils.SplitTrim(query.Get("labels"), ",")
+
+	switch kind {
+	case "Pod":
+		writeResponse(w, c.objectsController.PodsRelabelConfigs(annotations, labels))
+	default:
+		writeResponse(w, nil)
+	}
 }
 
 func (c *Operator) RelationMetricsRoute(w http.ResponseWriter, _ *http.Request) {
-	var lines []byte
-	lines = append(lines, objectsref.RelationToPromFormat(c.objectsController.GetNodeRelation())...)
-	lines = append(lines, objectsref.RelationToPromFormat(c.objectsController.GetPodRelation())...)
-	lines = append(lines, objectsref.RelationToPromFormat(c.objectsController.GetReplicasetRelation())...)
+	c.objectsController.WriteNodeRelations(w)
+	c.objectsController.WriteServiceRelations(w)
+	c.objectsController.WritePodRelations(w)
+	c.objectsController.WriteReplicasetRelations(w)
+	c.objectsController.WriteDataSourceRelations(w)
+}
 
-	w.Write(lines)
+func (c *Operator) RuleMetricsRoute(w http.ResponseWriter, _ *http.Request) {
+	if configs.G().EnablePromRule {
+		lines := c.promsliController.RuleMetrics()
+		w.Write(lines)
+	}
+}
+
+func (c *Operator) ConfigsRoute(w http.ResponseWriter, _ *http.Request) {
+	b, _ := yaml.Marshal(configs.G())
+
+	w.Write([]byte("# " + define.ConfigFilePath))
+	w.Write([]byte("\n"))
+	w.Write(b)
 }
 
 func (c *Operator) IndexRoute(w http.ResponseWriter, _ *http.Request) {
@@ -510,15 +608,18 @@ func (c *Operator) IndexRoute(w http.ResponseWriter, _ *http.Request) {
 * GET /cluster_info
 * GET /workload
 * GET /workload/node/{node}
+* GET /pods?resourceVersion=N&all=true|false
 * GET /relation/metrics
+* GET /rule/metrics
+* GET /configs
 
 # Check Routes
 --------------
-* GET /check?monitor=${monitor}&scrape=true|false
+* GET /check?monitor=${monitor}&scrape=true|false&workers=N
 * GET /check/dataid
-* GET /check/scrape
-* GET /check/scrape/{namespace}
-* GET /check/scrape/{namespace}/{monitor}
+* GET /check/scrape?workers=N
+* GET /check/scrape/{namespace}?workers=N&analyze=true|false&topn=M&endpoint={endpoint}
+* GET /check/scrape/{namespace}/{monitor}?workers=N&analyze=true|false&topn=M&endpoint={endpoint}
 * GET /check/namespace
 * GET /check/monitor_blacklist
 * GET /check/active_discover
@@ -553,7 +654,11 @@ func (c *Operator) ListenAndServe() error {
 	router.HandleFunc("/cluster_info", c.ClusterInfoRoute)
 	router.HandleFunc("/workload", c.WorkloadRoute)
 	router.HandleFunc("/workload/node/{node}", c.WorkloadNodeRoute)
+	router.HandleFunc("/pods", c.PodsRoute)
+	router.HandleFunc("/labeljoin", c.LabelJoinRoute)
 	router.HandleFunc("/relation/metrics", c.RelationMetricsRoute)
+	router.HandleFunc("/rule/metrics", c.RuleMetricsRoute)
+	router.HandleFunc("/configs", c.ConfigsRoute)
 
 	// check 路由
 	router.HandleFunc("/check", c.CheckRoute)
@@ -576,7 +681,9 @@ func (c *Operator) ListenAndServe() error {
 	router.HandleFunc("/debug/pprof/trace", pprof.Trace)
 	router.HandleFunc("/debug/pprof/{other}", pprof.Index)
 
-	addr := ":8080"
+	httpConfig := configs.G().HTTP
+
+	addr := fmt.Sprintf("%s:%d", httpConfig.Host, httpConfig.Port)
 	c.srv = &http.Server{
 		Handler:      router,
 		Addr:         addr,

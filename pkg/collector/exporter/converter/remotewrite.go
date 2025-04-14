@@ -11,9 +11,9 @@ package converter
 
 import (
 	"github.com/elastic/beats/libbeat/common"
+	"github.com/prometheus/prometheus/prompb"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define"
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/define/prompb"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/collector/internal/utils"
 )
 
@@ -38,16 +38,16 @@ func (c remoteWriteConverter) ToDataID(record *define.Record) int32 {
 }
 
 func (c remoteWriteConverter) Convert(record *define.Record, f define.GatherFunc) {
-	rwData, ok := record.Data.(*define.RemoteWriteData)
-	if !ok {
-		return
-	}
-
+	rwData := record.Data.(*define.RemoteWriteData)
 	dataId := c.ToDataID(record)
 	events := make([]define.Event, 0)
 	for i := 0; i < len(rwData.Timeseries); i++ {
 		ts := rwData.Timeseries[i]
 		name, dims := c.extractNameDimensions(ts.GetLabels())
+		target, ok := dims["target"]
+		if !ok {
+			target = define.Identity()
+		}
 		samples := ts.GetSamples()
 		for j := 0; j < len(samples); j++ {
 			sample := samples[j]
@@ -58,8 +58,8 @@ func (c remoteWriteConverter) Convert(record *define.Record, f define.GatherFunc
 
 			pm := promMapper{
 				Metrics:    common.MapStr{name: sample.GetValue()},
-				Target:     define.Identity(),
-				Timestamp:  sample.GetTimestampMs(),
+				Target:     target,
+				Timestamp:  sample.GetTimestamp(),
 				Dimensions: utils.CloneMap(dims),
 			}
 			events = append(events, c.ToEvent(record.Token, dataId, pm.AsMapStr()))
@@ -70,7 +70,7 @@ func (c remoteWriteConverter) Convert(record *define.Record, f define.GatherFunc
 	}
 }
 
-func (c remoteWriteConverter) extractNameDimensions(labels []*prompb.LabelPair) (string, map[string]string) {
+func (c remoteWriteConverter) extractNameDimensions(labels []prompb.Label) (string, map[string]string) {
 	dims := make(map[string]string)
 	var name string
 	for _, label := range labels {

@@ -15,11 +15,9 @@ import (
 	"sync"
 
 	"github.com/spf13/viper"
-	"github.com/uptrace/opentelemetry-go-extra/otelzap"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
-	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/config"
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/unify-query/eventbus"
 )
 
@@ -37,17 +35,17 @@ func setDefaultConfig() {
 func setLogLevel(level string) {
 	switch level {
 	case "debug":
-		LoggerLevel.SetLevel(zap.DebugLevel)
+		loggerLevel.SetLevel(zap.DebugLevel)
 	case "info":
-		LoggerLevel.SetLevel(zap.InfoLevel)
+		loggerLevel.SetLevel(zap.InfoLevel)
 	case "warning":
-		LoggerLevel.SetLevel(zap.WarnLevel)
+		loggerLevel.SetLevel(zap.WarnLevel)
 	case "error":
-		LoggerLevel.SetLevel(zap.ErrorLevel)
+		loggerLevel.SetLevel(zap.ErrorLevel)
 	case "fatal":
-		LoggerLevel.SetLevel(zap.FatalLevel)
+		loggerLevel.SetLevel(zap.FatalLevel)
 	default:
-		LoggerLevel.SetLevel(zap.InfoLevel)
+		loggerLevel.SetLevel(zap.InfoLevel)
 	}
 }
 
@@ -66,11 +64,11 @@ func initLogConfig() {
 	if viper.GetString(PathConfigPath) == "" {
 		writeSyncer = zapcore.Lock(os.Stdout)
 	} else {
-		if Syncer, err = NewReopenableWriteSyncer(viper.GetString(PathConfigPath)); err != nil {
+		if syncer, err = NewReopenableWriteSyncer(viper.GetString(PathConfigPath)); err != nil {
 			fmt.Printf("failed to create syncer for->[%s]", err)
 			return
 		}
-		writeSyncer = Syncer
+		writeSyncer = syncer
 	}
 	// 配置日志格式
 	encoder = zapcore.NewConsoleEncoder(zapcore.EncoderConfig{
@@ -87,25 +85,12 @@ func initLogConfig() {
 		EncodeCaller:   zapcore.ShortCallerEncoder,
 	})
 
-	ZapLogger = zap.New(
-		zapcore.NewCore(encoder, writeSyncer, LoggerLevel),
-		zap.AddCaller(), zap.AddCallerSkip(1),
-	)
-	// 追加两个option：调用来源、Error级别增加调用栈
-	OtLogger = otelzap.New(ZapLogger,
-		otelzap.WithTraceIDField(true),
-		otelzap.WithCaller(true),
-		otelzap.WithStackTrace(true),
-		otelzap.WithMinLevel(zapcore.InfoLevel),
-		otelzap.WithErrorStatusLevel(zapcore.WarnLevel),
-	)
-
-	if OtLogger == nil {
-		fmt.Printf("failed to build logger for it still is nil, log may disabled.")
-		return
+	DefaultLogger = &Logger{
+		logger: zap.New(
+			zapcore.NewCore(encoder, writeSyncer, loggerLevel),
+			zap.AddCaller(), zap.AddCallerSkip(2),
+		),
 	}
-
-	OtLogger.Info("logger config success.I am on duty now!")
 }
 
 // init
@@ -128,9 +113,6 @@ func init() {
 // InitTestLogger 加载单元测试日志配置
 func InitTestLogger() {
 	// 加载配置
-	once.Do(func() {
-		viper.Set(LevelConfigPath, "debug")
-		config.InitConfig()
-		initLogConfig()
-	})
+	viper.Set(LevelConfigPath, "warn")
+	initLogConfig()
 }
