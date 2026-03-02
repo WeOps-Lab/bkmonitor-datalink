@@ -153,9 +153,8 @@ type Client interface {
 // GatherURL 测试链接并设置结果事件，url为请求的链接，proxyHost和proxyIP为需要代理的host和ip
 func (g *Gather) GatherURL(ctx context.Context, event *Event, step *configs.HTTPTaskStepConfig, url, host string) bool {
 	var (
-		ok    bool
-		count int
-		err   error
+		ok  bool
+		err error
 	)
 
 	conf := g.GetConfig().(*configs.HTTPTaskConfig)
@@ -203,15 +202,14 @@ func (g *Gather) GatherURL(ctx context.Context, event *Event, step *configs.HTTP
 	defer responseRd.Close()
 
 	if step.Response != "" {
-		// 读取响应内容字符串
-		body := g.bufferBuilder.GetBuffer(conf.BufferSize)
-		count, err = responseRd.Read(body)
-		if err != nil && err != io.EOF {
+		// 读取响应内容字符串，使用 io.ReadAll 确保读取完整的 chunked 响应
+		// io.LimitReader 限制最大读取字节数，防止内存溢出
+		body, err := io.ReadAll(io.LimitReader(responseRd, int64(conf.BufferSize)))
+		if err != nil {
 			logger.Debugf("task(%d): %v read response error: %v", conf.TaskID, url, err)
 			event.FailFromError(err)
 			return false
 		}
-		body = body[:count]
 		// 根据返回编码转码为utf8
 		decoder := utils.NewDecoder(event.Charset)
 		if decoder != nil {
