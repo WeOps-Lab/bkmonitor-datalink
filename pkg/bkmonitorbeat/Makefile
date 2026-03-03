@@ -1,7 +1,7 @@
 RELEASE_PATH ?= build
 BUILD_NO ?= 0
 NAME = bkmonitorbeat
-VERSION = $(shell git describe --tags --always)
+VERSION ?= 3.29.1659-weops.1.0.1
 COMMIT_ID = $(shell git rev-parse HEAD)
 
 .PHONY: lint
