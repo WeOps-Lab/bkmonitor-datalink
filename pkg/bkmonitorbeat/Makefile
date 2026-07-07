@@ -1,7 +1,7 @@
 RELEASE_PATH ?= build
 BUILD_NO ?= 0
 NAME = bkmonitorbeat
-VERSION ?= 3.29.1659-weops.1.0.2
+VERSION ?= 3.29.1659-weops.1.0.5
 COMMIT_ID = $(shell git rev-parse HEAD)
 GO ?= go
 GO_BUILD_TAGS ?= basetask basescheduler bkmonitorbeat

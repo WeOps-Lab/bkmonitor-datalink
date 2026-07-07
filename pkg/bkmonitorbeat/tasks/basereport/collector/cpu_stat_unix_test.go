@@ -68,6 +68,35 @@ func TestQueryCpuInfoUnix(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+func TestParseDMIDecodeCPUInfoFallbackToManufacturerAndFamily(t *testing.T) {
+	output := `
+Processor Information
+	Family: ARMv8
+	Manufacturer: Phytium
+	Version: <BAD INDEX>
+	Max Speed: 2200 MHz
+	Current Speed: 2200 MHz
+`
+
+	model, mhz := parseDMIDecodeCPUInfo(output)
+	assert.Equal(t, "Phytium ARMv8", model)
+	assert.Equal(t, 2200.0, mhz)
+}
+
+func TestParseDMIDecodeCPUInfoPrefersVersion(t *testing.T) {
+	output := `
+Processor Information
+	Family: Xeon
+	Manufacturer: Intel
+	Version: Intel(R) Xeon(R) Gold 6248R CPU @ 3.00GHz
+	Max Speed: 3000 MHz
+`
+
+	model, mhz := parseDMIDecodeCPUInfo(output)
+	assert.Equal(t, "Intel(R) Xeon(R) Gold 6248R CPU @ 3.00GHz", model)
+	assert.Equal(t, 3000.0, mhz)
+}
+
 func TestCalcTimeState(t *testing.T) {
 	t1, err := cpu.Times(false)
 	assert.NoError(t, err)

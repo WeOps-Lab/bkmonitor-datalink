@@ -13,11 +13,13 @@ package collector
 
 import (
 	"fmt"
+	"os/exec"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/shirou/gopsutil/v3/cpu"
-	"github.com/yumaojun03/dmidecode"
 
 	"github.com/TencentBlueKing/bkmonitor-datalink/pkg/utils/logger"
 )
@@ -113,7 +115,7 @@ func getCPUStatUsage(report *CpuReport) error {
 }
 
 // queryCpuInfo: 查询获取机器的CPU信息
-func queryCpuInfo(r *CpuReport, _ time.Duration, _ time.Duration) (err error) {
+func queryCpuInfo(r *CpuReport, _ time.Duration, timeout time.Duration) (err error) {
 	if r.Cpuinfo, err = cpu.Info(); err != nil {
 		logger.Errorf("failed to get cpu info for: %v", err)
 		return err
@@ -129,7 +131,7 @@ func queryCpuInfo(r *CpuReport, _ time.Duration, _ time.Duration) (err error) {
 	if len(r.Cpuinfo) > 0 {
 		// 取第一个cpu检查，如果发现存在信息为空的情况，则启用dmidecode进行填充
 		if r.Cpuinfo[0].Mhz == 0 || r.Cpuinfo[0].Model == "" || r.Cpuinfo[0].ModelName == "" {
-			model, mhz = getDMIDecodeCPUInfo()
+			model, mhz = getDMIDecodeCPUInfo(timeout)
 			useDmidecode = true
 		}
 	} else {
@@ -159,22 +161,88 @@ func queryCpuInfo(r *CpuReport, _ time.Duration, _ time.Duration) (err error) {
 	return nil
 }
 
-func getDMIDecodeCPUInfo() (model string, mhz float64) {
+func getDMIDecodeCPUInfo(timeout time.Duration) (model string, mhz float64) {
 	model = "unknown"
 	mhz = -1
-	dmi, err := dmidecode.New()
+
+	output, err := runDMIDecodeCommand(timeout)
 	if err != nil {
-		logger.Errorf("init dmidecoder error:%s", err)
+		logger.Errorf("run dmidecode error:%s", err)
 		return
 	}
-	processor, err := dmi.Processor()
-	if err != nil {
-		logger.Errorf("get dmi processor error:%s", err)
+
+	return parseDMIDecodeCPUInfo(string(output))
+}
+
+func runDMIDecodeCommand(timeout time.Duration) ([]byte, error) {
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+
+	cmd := exec.Command("dmidecode", "-t", "processor")
+	timer := time.AfterFunc(timeout, func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	})
+	defer timer.Stop()
+
+	return cmd.CombinedOutput()
+}
+
+func parseDMIDecodeCPUInfo(output string) (model string, mhz float64) {
+	model = "unknown"
+	mhz = -1
+
+	var version string
+	var manufacturer string
+	var family string
+
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "Version:"):
+			version = strings.TrimSpace(strings.TrimPrefix(line, "Version:"))
+		case strings.HasPrefix(line, "Manufacturer:"):
+			manufacturer = strings.TrimSpace(strings.TrimPrefix(line, "Manufacturer:"))
+		case strings.HasPrefix(line, "Family:"):
+			family = strings.TrimSpace(strings.TrimPrefix(line, "Family:"))
+		case strings.HasPrefix(line, "Current Speed:"):
+			if speed := parseMHzValue(strings.TrimSpace(strings.TrimPrefix(line, "Current Speed:"))); speed > 0 {
+				mhz = speed
+			}
+		case strings.HasPrefix(line, "Max Speed:"):
+			if mhz < 0 {
+				if speed := parseMHzValue(strings.TrimSpace(strings.TrimPrefix(line, "Max Speed:"))); speed > 0 {
+					mhz = speed
+				}
+			}
+		}
+	}
+
+	if version != "" && version != "<BAD INDEX>" && version != "Unknown" {
+		model = version
 		return
 	}
-	if len(processor) > 0 {
-		mhz = float64(processor[0].MaxSpeed)
-		model = processor[0].Version
+
+	model = strings.TrimSpace(strings.Join([]string{manufacturer, family}, " "))
+	if model == "" {
+		model = "unknown"
 	}
+
 	return
+}
+
+func parseMHzValue(raw string) float64 {
+	fields := strings.Fields(raw)
+	if len(fields) == 0 {
+		return -1
+	}
+
+	speed, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil {
+		return -1
+	}
+
+	return speed
 }
